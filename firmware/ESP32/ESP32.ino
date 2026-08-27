@@ -65,6 +65,7 @@ void saveStockToNVS();
 void saveRuntimeState();
 void initStockDefaults();
 void initRobotArmPins();
+void syncTime();
 
 // ==================================================
 // 1. 저장소(storage) 설정
@@ -997,6 +998,32 @@ void ensureWiFi() {
 }
 
 // ==================================================
+// 10-1. NTP 시간 동기화 (TLS 인증서 유효기간 검증에 필요)
+// ==================================================
+
+void syncTime() {
+  configTime(9 * 3600, 0, "pool.ntp.org", "time.google.com");   // KST(UTC+9)
+  Serial.print("[TIME] NTP 동기화 중");
+
+  time_t now = time(nullptr);
+  unsigned long start = millis();
+  while (now < 8 * 3600 * 2 && millis() - start < 15000) {   // 1970년 근처면 아직 미동기화
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+  Serial.println();
+
+  if (now >= 8 * 3600 * 2) {
+    Serial.print("[TIME] 동기화 완료: ");
+    Serial.print(ctime(&now));
+  } else {
+    Serial.println("[TIME] 동기화 실패 - 인증서 검증이 실패할 수 있음");
+  }
+}
+
+
+// ==================================================
 // 11. MQTT (HiveMQ) - 주문 push 수신
 // ==================================================
 // [중요] 콜백 안에서는 JSON 파싱과 큐 적재만 한다.
@@ -1090,6 +1117,7 @@ void setup() {
   initRobotArmPins();
   initPersistence();     // NVS에서 재고/큐/상태 복원 (없으면 기본값 생성)
   connectWiFi();
+  syncTime();  
 
   secureClient.setInsecure();
   delay(1000);
