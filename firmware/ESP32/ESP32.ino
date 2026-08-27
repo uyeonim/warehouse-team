@@ -25,9 +25,13 @@ struct IdRing;
 // 실행 흐름
 //   MQTT 콜백  : JSON 파싱 + 큐 적재만 (네트워크 I/O 없음)
 //   loop()     : serviceDispatch()가 상태머신을 돌린다
-//                IDLE -> (큐에서 주문 꺼냄) -> RUNNING -> (모든 태스크 완료) -> WAITING_LOAD 또는 IDLE
+//                IDLE -> RUNNING(배출 단계 -> 픽업 단계) -> WAITING_LOAD 또는 IDLE
 //                WAITING_LOAD는 AGV의 cnt_load 신호로 IDLE로 돌아간다
-//   워커 태스크: 로봇암 1대당 1개. 같은 팔을 쓰는 선반은 순차, 다른 팔은 병렬
+//   배출 단계  : 항목 1개당 태스크 1개. 아두이노 5대에 동시에 HTTP 요청 (전 레일 동시 배출)
+//                전부 끝나면 메인 루프가 재고 차감 + cnt_stock 즉시 업로드
+//                하나라도 실패하면 cnt_dispense partial(detail=실패 레일 전부) 후 주문 중단 (픽업 안 함)
+//   픽업 단계  : 로봇암 1대당 태스크 1개. 같은 팔을 쓰는 선반은 순차, 다른 팔은 병렬
+//                픽업이 하나 실패하면 그 팔의 나머지 픽업은 중단
 //   NVS        : 재고 + 큐 + 상태 + 중복방지 ID를 주문 단위로 저장 (플래시 수명 보호)
 //
 // 외부 인터페이스(변경 금지)
@@ -38,7 +42,7 @@ struct IdRing;
 // ==================================================
 // 파일럿 단계에서는 storage 0,1만 enabled=true. 나머지는 배선 후 true로만 바꾸면 된다.
 // 로봇암 1대가 선반 여러 개를 커버하면 그 선반들은 동시에 픽업할 수 없으므로
-// 병렬 처리 단위는 "로봇암"이다. 파일럿(0,1 모두 armId 0)에서는 그룹이 하나라 실제로는 순차다.
+// 픽업 단계의 병렬 처리 단위는 "로봇암"이다. 파일럿(0,1 모두 armId 0)에서는 그룹이 하나라 실제로는 순차다.
 
 struct Storage {
   const char* name;
@@ -101,10 +105,11 @@ const int LOW_STOCK_THRESHOLD = 1;
 const int CARTRIDGE_CAPACITY  = 7;    // 테스트값. 바꾼 뒤에는 FACTORYRESET 필요
 const int TOTAL_PER_RAIL      = 300;  // 레일당 예비재고 총량(임시값)
 
-// 배출
+// 배출 / 픽업
 const int  MAX_JOBS                 = 8;
-const int  DISPENSE_TASK_STACK      = 8192;
-const int  DISPENSE_TASK_PRIO       = 1;
+const int  DISPENSE_TASK_STACK      = 8192;   // HTTPClient + 문자열 연결
+const int  PICK_TASK_STACK          = 4096;   // GPIO + 로그만
+const int  TASK_PRIO                = 1;
 const int  SAME_ARM_GAP_MS          = 300;
 const int  DISPENSE_RETRY_DELAY_MS  = 500;
 const unsigned long SLOW_WARN_MS    = 25000;
@@ -212,17 +217,21 @@ struct PendingReplace {
   int rail;
 };
 
+enum JobFail { FAIL_NONE = 0, FAIL_NO_STOCK, FAIL_DISPENSE, FAIL_PICKUP };
+
 // 한 주문의 배출 항목 하나 (키캡 1글자 또는 board 1개)
 struct DispenseJob {
   int    storageId;
   int    rail;
   char   letter;      // 아두이노 URL/로그용 (board는 'B')
-  bool   inStock;     // 계획 시점에 재고가 있었는지. false면 요청 없이 실패로 집계
   String jobId;       // 멱등키. 재시도해도 같은 값
-  volatile bool success;
+  JobFail fail;       // 메인 루프에서만 기록 (cnt_dispense detail용)
+  volatile bool dispensed;   // ① 아두이노 배출 성공
+  volatile bool picked;      // ② 로봇암 픽업 성공
+  volatile bool done;        // 배출 단계 태스크 종료 표시
 };
 
-// 로봇암 1대에 배정된 Job 묶음. 태스크 1개가 순차 처리한다.
+// 로봇암 1대에 배정된 Job 묶음 (픽업 단계). 태스크 1개가 순차 처리한다.
 struct DispenseGroup {
   int  armId;
   int  jobIdx[MAX_JOBS];
@@ -240,6 +249,9 @@ enum DispatchState {
   DISPATCH_WAITING_LOAD = 2,  // AGV의 cnt_load 신호 대기 중
 };
 
+// RUNNING 안의 세부 단계. NVS에는 저장하지 않는다 (재부팅 시 RUNNING이면 어느 단계든 partial 처리).
+enum DispatchPhase { PHASE_DISPENSE = 0, PHASE_PICK = 1 };
+
 WiFiClientSecure secureClient;       // Mobius용 (메인 루프 전용, 의도적으로 setInsecure 유지)
 WiFiClientSecure mqttSecureClient;   // HiveMQ용 (루트 CA 검증)
 PubSubClient     mqttClient(mqttSecureClient);
@@ -249,6 +261,7 @@ int stock[NUM_STORAGES][MAX_RAILS];
 int totalPool[NUM_STORAGES][MAX_RAILS];
 
 DispatchState dispatchState = DISPATCH_IDLE;
+DispatchPhase dispatchPhase = PHASE_DISPENSE;
 String        currentOrderId = "";
 
 RingQueue<PendingOrder,   ORDER_QUEUE_SIZE>   orderQueue;
@@ -271,13 +284,15 @@ void printStock();
 void saveStockToNVS();
 void saveRuntimeState();
 void syncStockToMobius();
-void notifyDispenseStatus(const String& orderId, const char* status);
+void notifyDispenseStatus(const String& orderId, const char* status, bool withErrors = false);
 bool triggerDispense(const DispenseJob& job);
 bool triggerRobotArm(int storageId);
 void processOrder(const String& conData);
 void processReplaceRequest(const String& conData);
 void processLoadConfirmation(const String& conData);
 void beginDispatch(const PendingOrder& o);
+void finishDispensePhase();
+void finalizeDispatch();
 void printStorageStatus();
 
 // ==================================================
@@ -422,14 +437,14 @@ bool loadStockFromNVS() {
 }
 
 void saveRuntimeState() {
-  DynamicJsonDocument doc(RUNTIME_STATE_DOC_SIZE);   
+  DynamicJsonDocument doc(RUNTIME_STATE_DOC_SIZE);
 
   doc["st"]  = (int)dispatchState;
   doc["cur"] = currentOrderId;
 
   // 중복방지 ID를 큐보다 먼저 쓴다. 풀이 넘치면 뒤에 넣은 큐 꼬리부터 잘리므로
   // 상태머신과 중복방지는 항상 온전하게 남고, 유실은 최신 주문 몇 건으로 한정된다.
-  recentOrderIds.save(doc, "ro", "roi");   
+  recentOrderIds.save(doc, "ro", "roi");
   recentLoadIds.save(doc, "rl", "rli");
 
   JsonArray q = doc.createNestedArray("q");
@@ -444,7 +459,7 @@ void saveRuntimeState() {
 
   String s;
   serializeJson(doc, s);
-  if (doc.overflowed()) {                 
+  if (doc.overflowed()) {
     int savedQ = doc["q"].as<JsonArray>().size();
     Serial.println("[NVS] !! 상태 저장 용량 초과 - 큐 " + String(orderQueue.count) + "건 중 " +
                    String(savedQ) + "건만 저장됨, RUNTIME_STATE_DOC_SIZE 키울 것");
@@ -488,6 +503,7 @@ bool loadRuntimeState() {
 
 void resetRuntimeState() {
   dispatchState  = DISPATCH_IDLE;
+  dispatchPhase  = PHASE_DISPENSE;
   currentOrderId = "";
   orderQueue.clear();
   replaceQueue.clear();
@@ -543,12 +559,13 @@ void initPersistence() {
 }
 
 // 배출 도중 재부팅되면 NVS에 RUNNING이 남는다. 실물은 나갔는데 재고 차감은 안 됐을 수 있다.
+// 어느 레일에서 끊겼는지는 알 수 없으므로 detail 없이 partial만 올린다.
 void recoverInterruptedDispatch() {
   if (dispatchState != DISPATCH_RUNNING) return;
 
   Serial.println();
   Serial.println("[복구] 이전 배출이 완료되지 않은 채 재부팅됨: " + currentOrderId);
-  Serial.println("[복구] 실물 배출분과 저장된 재고가 어긋났을 수 있음 - 선반 실물 확인 권장");
+  Serial.println("[복구] 실물 배출분과 저장된 재고가 어긋났을 수 있음 - 선반/배출구 실물 확인 권장");
 
   notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS);
   dispatchState = DISPATCH_IDLE;   // 어느 단계에서 끊겼는지 알 수 없으므로 대기 없이 큐 재개
@@ -556,8 +573,9 @@ void recoverInterruptedDispatch() {
 }
 
 // ==================================================
-// 9. 배출 실행 (워커 태스크)
+// 9. 워커 태스크 (배출 단계 / 픽업 단계)
 // ==================================================
+// 전역 재고·NVS는 여기서 절대 건드리지 않는다. 결과는 job 플래그에만 쓴다.
 
 // 한 번 실패하면 잠깐 쉬고 한 번 더 시도한다. (템플릿이라 사용 지점보다 앞에 있어야 함)
 template <typename F>
@@ -568,47 +586,52 @@ bool attemptTwice(F action, const String& retryLog) {
   return action();
 }
 
-// 한 항목 = ①아두이노 배출 -> ②로봇암 픽업. 단계별로 따로 재시도한다.
-// 배출은 job_id 멱등 처리 덕분에 재요청해도 실물이 두 번 안 나가고,
-// 픽업 실패는 이미 나온 물건을 다시 집는 것이라 배출 없이 픽업만 재시도한다.
+// [배출 단계] 항목 1개당 태스크 1개. 아두이노가 선반마다 따로라 병렬로 쏴도 충돌 없다.
+// (MBTI 한 주문은 선반당 최대 1개라 같은 아두이노에 두 요청이 겹치지 않는다)
+// 배출은 job_id 멱등 처리 덕분에 재요청해도 실물이 두 번 안 나간다.
 // ※ 아두이노는 같은 job_id가 다시 오면 서보를 돌리지 않고 200을 돌려줘야 한다.
-bool runDispenseJob(DispenseJob& job) {
-  bool dispensed = attemptTwice(
+void dispenseTask(void* param) {
+  int j = (int)(intptr_t)param;
+  DispenseJob& job = dispenseJobs[j];
+
+  job.dispensed = attemptTwice(
     [&]() { return triggerDispense(job); },
     "[RETRY] " + job.jobId + " 배출 실패 - 동일 job_id로 1회 재시도");
-  if (!dispensed) {
-    Serial.println("[DISPENSE] " + job.jobId + " 배출 최종 실패");
-    return false;
-  }
+  if (!job.dispensed) Serial.println("[DISPENSE] " + job.jobId + " 배출 최종 실패");
 
-  bool picked = attemptTwice(
-    [&]() { return triggerRobotArm(job.storageId); },
-    "[RETRY] " + job.jobId + " 픽업 실패 - 배출 없이 픽업만 1회 재시도");
-  if (!picked) {
-    Serial.println("[ARM] " + job.jobId + " 픽업 최종 실패 - 배출구에 물건이 남아있을 수 있음, 확인 필요");
-  }
-  return picked;
+  Serial.println("[TASK] dispense " + String(j) + " 스택 여유: " +
+                 String(uxTaskGetStackHighWaterMark(NULL)) + " bytes");
+  job.done = true;
+  vTaskDelete(NULL);
 }
 
-// 그룹(로봇암 1대) 하나를 담당하는 태스크
-void dispenseWorkerTask(void* param) {
+// [픽업 단계] 로봇암 1대당 태스크 1개. 같은 팔은 순차, 다른 팔은 병렬.
+// 픽업 실패는 이미 나온 물건을 다시 집는 것이라 배출 없이 픽업만 재시도한다.
+// 한 번 최종 실패하면 그 팔의 나머지 픽업은 시도하지 않는다 (배출구 상태를 알 수 없으므로).
+void pickWorkerTask(void* param) {
   int g = (int)(intptr_t)param;
   DispenseGroup& group = dispenseGroups[g];
 
   for (int i = 0; i < group.jobCount; i++) {
     DispenseJob& job = dispenseJobs[group.jobIdx[i]];
-    job.success = runDispenseJob(job);
+    job.picked = attemptTwice(
+      [&]() { return triggerRobotArm(job.storageId); },
+      "[RETRY] " + job.jobId + " 픽업 실패 - 1회 재시도");
+    if (!job.picked) {
+      Serial.println("[ARM] " + job.jobId + " 픽업 최종 실패 - 배출구에 물건이 남아있을 수 있음, 이 팔의 나머지 픽업 중단");
+      break;
+    }
     if (i < group.jobCount - 1) vTaskDelay(pdMS_TO_TICKS(SAME_ARM_GAP_MS));
   }
 
-  Serial.println("[TASK] group " + String(g) + " 스택 여유: " +
+  Serial.println("[TASK] pick group " + String(g) + " 스택 여유: " +
                  String(uxTaskGetStackHighWaterMark(NULL)) + " bytes");
   group.done = true;
   vTaskDelete(NULL);
 }
 
 // ==================================================
-// 10. 배출 계획 (메인 루프)
+// 10. 배출 계획 / 단계 전이 (메인 루프)
 // ==================================================
 
 // 배출 항목 하나를 Job으로 등록. 비활성 저장소는 파일럿 범위 밖이라 집계에서도 제외한다.
@@ -630,26 +653,29 @@ void addDispenseJob(int storageId, int rail, char letter) {
   job.storageId = storageId;
   job.rail      = rail;
   job.letter    = letter;
-  job.inStock   = stock[storageId][rail] > 0;
   job.jobId     = currentOrderId + "_" + String(dispenseJobCount);
-  job.success   = false;
+  job.fail      = (stock[storageId][rail] > 0) ? FAIL_NONE : FAIL_NO_STOCK;
+  job.dispensed = false;
+  job.picked    = false;
+  job.done      = false;
 
   Serial.println("[DISPENSE] " + tag + " -> " + storages[storageId].name +
-                 " rail " + String(rail) + " (" + railLabel(storageId, rail) + ")");
-  if (!job.inStock) {
-    Serial.println("[DISPENSE] " + tag + " 재고 없음, 배출 취소 (실패로 집계)");
-  }
-
+                 " rail " + String(rail) + " (" + railLabel(storageId, rail) + ")" +
+                 (job.fail == FAIL_NO_STOCK ? "  !! 재고 없음" : ""));
   dispenseJobCount++;
 }
 
-// Job을 로봇암 기준으로 묶는다. 같은 팔은 한 그룹에서 순차 처리된다.
+bool allJobsDone() {
+  for (int j = 0; j < dispenseJobCount; j++) {
+    if (!dispenseJobs[j].done) return false;
+  }
+  return true;
+}
+
+// Job을 로봇암 기준으로 묶는다 (픽업 단계용). 같은 팔은 한 그룹에서 순차 처리된다.
 void buildDispenseGroups() {
   dispenseGroupCount = 0;
-
   for (int j = 0; j < dispenseJobCount; j++) {
-    if (!dispenseJobs[j].inStock) continue;
-
     int armId  = storages[dispenseJobs[j].storageId].armId;
     int target = -1;
     for (int g = 0; g < dispenseGroupCount; g++) {
@@ -674,12 +700,26 @@ bool allGroupsDone() {
   return true;
 }
 
+// 주문을 닫고 다음 상태를 정한다. 바구니에 뭔가 들어갔으면 AGV를 기다리고, 아니면 바로 다음 주문.
+void closeDispatch(int pickedCount) {
+  if (pickedCount > 0) {
+    dispatchState = DISPATCH_WAITING_LOAD;
+    Serial.println("[DISPATCH] AGV cnt_load 신호 대기 중");
+  } else {
+    dispatchState = DISPATCH_IDLE;
+    Serial.println("[DISPATCH] 바구니에 실린 항목 없음 - AGV 대기 없이 다음 주문 진행");
+  }
+  dispenseJobCount   = 0;
+  dispenseGroupCount = 0;
+  saveRuntimeState();
+}
+
 void beginDispatch(const PendingOrder& o) {
   currentOrderId   = o.orderId;
   dispenseJobCount = 0;
 
   Serial.println();
-  Serial.println("[DISPATCH] " + o.orderId + " 배출 시작 | keycap=" + o.keycap +
+  Serial.println("[DISPATCH] " + o.orderId + " 배출 계획 | keycap=" + o.keycap +
                  " | colors=" + o.colorsStr + " | board=" + o.boardColor);
 
   for (int i = 0; i < o.keycap.length(); i++) {
@@ -695,74 +735,143 @@ void beginDispatch(const PendingOrder& o) {
     addDispenseJob(STORAGE_BOARD, resolveRail(STORAGE_BOARD, 'B', colorIdx), 'B');
   }
 
-  buildDispenseGroups();
+  // 배출할 게 없으면 (전부 비활성/매핑 실패) 실패로 닫는다
+  if (dispenseJobCount == 0) {
+    Serial.println("[DISPATCH] 배출 가능한 항목 없음 - " + String(DISPENSE_FAIL_STATUS) + " 처리");
+    notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS);
+    closeDispatch(0);
+    return;
+  }
+
+  // 재고가 하나라도 없으면 아무것도 배출하지 않는다 (배출구에 고아 부품이 남지 않게).
+  // 플랫폼이 재고 0 주문을 막더라도 cnt_stock 유실 등으로 어긋날 수 있어 여기서 한 번 더 막는다.
+  bool anyNoStock = false;
+  for (int j = 0; j < dispenseJobCount; j++) {
+    if (dispenseJobs[j].fail == FAIL_NO_STOCK) {
+      anyNoStock = true;
+      Serial.println("[DISPATCH] " + locationName(dispenseJobs[j].storageId, dispenseJobs[j].rail) + " 재고 없음");
+    }
+  }
+  if (anyNoStock) {
+    Serial.println("[DISPATCH] 주문 전체 중단, 배출 안 함");
+    notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS, true);
+    closeDispatch(0);
+    return;
+  }
 
   dispatchState   = DISPATCH_RUNNING;
+  dispatchPhase   = PHASE_DISPENSE;
   dispatchStartMs = millis();
   lastSlowWarnMs  = dispatchStartMs;
   saveRuntimeState();   // 이 시점 이후 재부팅되면 부팅 시 RUNNING이 남아 미완료로 감지된다
 
-  for (int g = 0; g < dispenseGroupCount; g++) {
+  Serial.println("[DISPATCH] 배출 단계 시작 - " + String(dispenseJobCount) + "개 레일 동시 배출 (heap " +
+                 String(ESP.getFreeHeap()) + " bytes)");
+
+  for (int j = 0; j < dispenseJobCount; j++) {
     char taskName[24];
-    snprintf(taskName, sizeof(taskName), "dispense_%d", g);
-    BaseType_t ok = xTaskCreatePinnedToCore(dispenseWorkerTask, taskName, DISPENSE_TASK_STACK,
-                                            (void*)(intptr_t)g, DISPENSE_TASK_PRIO, NULL, tskNO_AFFINITY);
+    snprintf(taskName, sizeof(taskName), "dispense_%d", j);
+    BaseType_t ok = xTaskCreatePinnedToCore(dispenseTask, taskName, DISPENSE_TASK_STACK,
+                                            (void*)(intptr_t)j, TASK_PRIO, NULL, tskNO_AFFINITY);
     if (ok != pdPASS) {
-      Serial.println("[DISPATCH] 워커 태스크 생성 실패 (group " + String(g) + ") - 해당 그룹 실패 처리");
-      dispenseGroups[g].done = true;
+      Serial.println("[DISPATCH] 배출 태스크 생성 실패 (job " + String(j) + ") - 실패 처리");
+      dispenseJobs[j].done = true;   // dispensed는 false로 남아 실패로 집계
     }
   }
-
-  Serial.println("[DISPATCH] 로봇암 " + String(dispenseGroupCount) + "대가 병렬 처리 (총 " +
-                 String(dispenseJobCount) + "개 항목, 같은 팔 담당분은 순차)");
 
   notifyDispenseStatus(currentOrderId, "started");   // 태스크를 띄운 뒤 보내야 POST 대기가 배출을 늦추지 않는다
 }
 
-void finalizeDispatch() {
-  int successCount = 0;
+// 배출 단계 종료. 재고를 즉시 반영하고, 하나라도 실패했으면 여기서 주문을 닫는다.
+void finishDispensePhase() {
+  int dispensedCount = 0;
+  int failCount = 0;
   for (int j = 0; j < dispenseJobCount; j++) {
-    if (dispenseJobs[j].success) {
+    if (dispenseJobs[j].dispensed) {
       reduceStock(dispenseJobs[j].storageId, dispenseJobs[j].rail);
-      successCount++;
+      dispensedCount++;
+    } else {
+      dispenseJobs[j].fail = FAIL_DISPENSE;
+      failCount++;
     }
   }
-  int targetCount = dispenseJobCount;
 
+  // 실물이 나간 순간 재고가 줄었으므로 픽업 결과와 무관하게 지금 반영한다
   saveStockToNVS();
   printStock();
   syncStockToMobius();
 
-  Serial.println("[DISPATCH] " + currentOrderId + " 결과 " + String(successCount) + "/" +
-                 String(targetCount) + " (소요 " + String(millis() - dispatchStartMs) + "ms)");
+  Serial.println("[DISPATCH] 배출 단계 결과 " + String(dispensedCount) + "/" + String(dispenseJobCount) +
+                 " (소요 " + String(millis() - dispatchStartMs) + "ms)");
 
-  bool allOk = (targetCount > 0) && (successCount == targetCount);
-  notifyDispenseStatus(currentOrderId, allOk ? "done" : DISPENSE_FAIL_STATUS);
-
-  // 배출된 게 하나도 없으면 AGV가 실을 바구니도 없으니 대기하지 않는다 (큐 정지 방지)
-  if (successCount > 0) {
-    dispatchState = DISPATCH_WAITING_LOAD;
-    Serial.println("[DISPATCH] AGV cnt_load 신호 대기 중");
-  } else {
-    dispatchState = DISPATCH_IDLE;
-    Serial.println("[DISPATCH] 배출 성공 항목 없음 - AGV 대기 없이 다음 주문 진행");
+  if (failCount > 0) {
+    Serial.println("[DISPATCH] 배출 실패 " + String(failCount) + "건 - 주문 전체 중단, 픽업 생략");
+    if (dispensedCount > 0) {
+      Serial.println("[DISPATCH] !! 이미 배출된 " + String(dispensedCount) + "개가 배출구에 남아 있음 - 수동 회수 필요");
+    }
+    notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS, true);
+    closeDispatch(0);   // 바구니에 실린 게 없으니 AGV를 기다리지 않는다
+    return;
   }
 
-  dispenseJobCount   = 0;
-  dispenseGroupCount = 0;
-  saveRuntimeState();
+  // 전부 배출됨 -> 픽업 단계
+  buildDispenseGroups();
+  dispatchPhase = PHASE_PICK;
+
+  for (int g = 0; g < dispenseGroupCount; g++) {
+    char taskName[24];
+    snprintf(taskName, sizeof(taskName), "pick_%d", g);
+    BaseType_t ok = xTaskCreatePinnedToCore(pickWorkerTask, taskName, PICK_TASK_STACK,
+                                            (void*)(intptr_t)g, TASK_PRIO, NULL, tskNO_AFFINITY);
+    if (ok != pdPASS) {
+      Serial.println("[DISPATCH] 픽업 태스크 생성 실패 (group " + String(g) + ") - 해당 그룹 실패 처리");
+      dispenseGroups[g].done = true;
+    }
+  }
+
+  Serial.println("[DISPATCH] 픽업 단계 시작 - 로봇암 " + String(dispenseGroupCount) +
+                 "대 (같은 팔 담당분은 순차)");
+}
+
+// 픽업 단계 종료. 재고는 배출 단계에서 이미 반영됐으므로 여기서는 건드리지 않는다.
+void finalizeDispatch() {
+  int pickedCount = 0;
+  int failCount = 0;
+  for (int j = 0; j < dispenseJobCount; j++) {
+    if (dispenseJobs[j].picked) {
+      pickedCount++;
+    } else {
+      dispenseJobs[j].fail = FAIL_PICKUP;
+      failCount++;
+    }
+  }
+
+  Serial.println("[DISPATCH] " + currentOrderId + " 픽업 결과 " + String(pickedCount) + "/" +
+                 String(dispenseJobCount) + " (총 소요 " + String(millis() - dispatchStartMs) + "ms)");
+
+  if (failCount == 0) {
+    notifyDispenseStatus(currentOrderId, "done");
+  } else {
+    Serial.println("[DISPATCH] 픽업 실패 " + String(failCount) + "건");
+    notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS, true);
+  }
+
+  closeDispatch(pickedCount);
 }
 
 // 상태머신 한 스텝. loop()에서 매번 호출된다.
 void serviceDispatch() {
   switch (dispatchState) {
     case DISPATCH_RUNNING:
-      if (allGroupsDone()) {
-        finalizeDispatch();
-      } else if (millis() - lastSlowWarnMs > SLOW_WARN_MS) {
+      if (dispatchPhase == PHASE_DISPENSE) {
+        if (allJobsDone()) { finishDispensePhase(); break; }
+      } else {
+        if (allGroupsDone()) { finalizeDispatch(); break; }
+      }
+      if (millis() - lastSlowWarnMs > SLOW_WARN_MS) {
         lastSlowWarnMs = millis();
-        Serial.println("[DISPATCH] 배출이 " + String((millis() - dispatchStartMs) / 1000) +
-                       "초째 진행 중 - 아두이노 응답 지연 확인 필요");
+        Serial.println("[DISPATCH] " + String(dispatchPhase == PHASE_DISPENSE ? "배출" : "픽업") + " 단계가 " +
+                       String((millis() - dispatchStartMs) / 1000) + "초째 진행 중 - 응답 지연 확인 필요");
       }
       break;
 
@@ -793,7 +902,7 @@ void serviceReplaceQueue() {
 // ==================================================
 // 11. 아두이노 / 로봇암 트리거 (워커 태스크에서 호출)
 // ==================================================
-// 전역 재고·NVS는 여기서 절대 건드리지 않는다. HTTPClient는 함수 안에서 생성해 태스크 간 안전하다.
+// HTTPClient는 함수 안에서 생성해 태스크 간 안전하다.
 
 bool triggerDispense(const DispenseJob& job) {
   if (WiFi.status() != WL_CONNECTED) {
@@ -907,14 +1016,31 @@ bool postToMobius(const char* container, const String& con, const String& what) 
   return ok;
 }
 
-// cnt_dispense: {"order_id":..., "status":"started"|"done"|DISPENSE_FAIL_STATUS}
-void notifyDispenseStatus(const String& orderId, const char* status) {
-  StaticJsonDocument<256> doc;
+// cnt_dispense (창고팀 내부용 detail):
+//   {"order_id":..., "status":"started"|"done"|"partial", "detail":[{"storage_id":n,"rail":n}, ...]}
+//   detail = 실패한 레일 전부 (1~5개). 실패가 없으면(started/done) 필드 자체를 생략한다.
+void notifyDispenseStatus(const String& orderId, const char* status, bool withErrors) {
+  StaticJsonDocument<512> doc;
   doc["order_id"] = orderId;
   doc["status"]   = status;
+
+  String what = "cnt_dispense 업로드 " + orderId + " (status=" + status;
+
+  if (withErrors) {
+    JsonArray detail = doc.createNestedArray("detail");
+    for (int j = 0; j < dispenseJobCount; j++) {
+      const DispenseJob& job = dispenseJobs[j];
+      if (job.fail == FAIL_NONE) continue;
+      JsonObject e = detail.createNestedObject();
+      e["storage_id"] = job.storageId;
+      e["rail"]       = job.rail;
+      what += ", " + railLabel(job.storageId, job.rail);
+    }
+  }
+
   String con;
   serializeJson(doc, con);
-  postToMobius(CNT_DISPENSE_NAME, con, "cnt_dispense 업로드 " + orderId + " (status=" + status + ")");
+  postToMobius(CNT_DISPENSE_NAME, con, what + ")");
 }
 
 // cnt_stock: {"keycap":{글자:{색상:n}}, "board":{색상:n}}  비활성 저장소는 0으로 표기
@@ -1166,13 +1292,18 @@ void printSystemStatus() {
   printStorageStatus();
   printStock();
   Serial.println("현재 주문: " + (currentOrderId.length() > 0 ? currentOrderId : "(없음)"));
-  Serial.println("배출 상태: " + String(dispatchState == DISPATCH_RUNNING ? "진행 중" : "대기"));
+  String stateStr = "대기";
+  if (dispatchState == DISPATCH_RUNNING) {
+    stateStr = (dispatchPhase == PHASE_DISPENSE) ? "배출 단계 진행 중" : "픽업 단계 진행 중";
+  }
+  Serial.println("배출 상태: " + stateStr);
   Serial.println("MQTT 연결: " + String(mqttClient.connected() ? "연결됨" : "끊김"));
   Serial.println("AGV cnt_load 대기 중: " + String(dispatchState == DISPATCH_WAITING_LOAD ? "예" : "아니오"));
   Serial.println("대기열(큐)에 쌓인 주문: " + String(orderQueue.count) + "개");
   Serial.println("대기 중인 교체 요청: " + String(replaceQueue.count) + "개");
   Serial.println("NVS 스키마 버전: " + String(prefs.getInt("schema", 0)));
   Serial.println("NVS 여유 엔트리: " + String(prefs.freeEntries()));
+  Serial.println("Free heap: " + String(ESP.getFreeHeap()) + " bytes");
 }
 
 // 재고를 건드리지 않고 실물만 배출한다. job_id에 millis()를 섞어 멱등 캐시에 걸리지 않게 한다.
@@ -1192,9 +1323,11 @@ void runTestDispense(char letter) {
   job.storageId = storageId;
   job.rail      = rail;
   job.letter    = letter;
-  job.inStock   = true;
   job.jobId     = "test_" + String(millis());
-  job.success   = false;
+  job.fail      = FAIL_NONE;
+  job.dispensed = false;
+  job.picked    = false;
+  job.done      = false;
 
   if (triggerDispense(job)) triggerRobotArm(storageId);
 }
@@ -1257,7 +1390,7 @@ void setup() {
 
   printStorageStatus();
   Serial.println("[SYSTEM] MQTT 구독 기반 주문 수신 - 36레일(색상 반영) 구조, AGV cnt_load 큐 방식");
-  Serial.println("[SYSTEM] 배출: 로봇암별 병렬 처리 + 논블로킹 상태머신, 상태는 NVS에 영속 저장");
+  Serial.println("[SYSTEM] 배출: 전 레일 동시 배출 -> 즉시 cnt_stock -> 로봇암 픽업. 하나라도 실패 시 주문 중단");
   Serial.println("[SYSTEM] MQTT는 TLS 인증서 검증 적용 (HiveMQ 루트 CA)");
   Serial.println("[SYSTEM] 명령: STATUS, TEST E/I/N/S, FACTORYRESET");
 }
