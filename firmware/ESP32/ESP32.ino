@@ -19,10 +19,10 @@ struct DispenseGroup;
 // [2026-08-27 리팩토링 요약]
 //  1) order_id 중복 처리 방지 (MQTT QoS1 재전송 대비)
 //  2) board 배출을 키캡과 동일한 배출 경로로 편입 -> cnt_dispense 성공 판정에 포함
-//  3) 아두이노 동시 배출 + MQTT 콜백 논블로킹화
+//  3) 로봇암 단위 동시 배출 + MQTT 콜백 논블로킹화
 //     - MQTT 콜백은 파싱/큐 적재만 하고 즉시 리턴 (네트워크 I/O 없음)
 //     - 실제 배출은 loop()의 상태머신(serviceDispatch)이 구동
-//     - 배출 HTTP 요청은 아두이노(IP) 단위로 FreeRTOS 태스크를 띄워 병렬 실행
+//     - 배출은 로봇암 단위로 FreeRTOS 태스크를 띄워 병렬 실행 (같은 팔은 순차)
 //  4) NVS(Preferences) 영속화
 //     - 재고/예비재고, 주문 큐, AGV 대기 상태, 중복방지 ID를 플래시에 저장
 //     - 재부팅해도 복원되며, 배출 도중 재부팅된 경우 경고 + partial 보고
@@ -31,9 +31,21 @@ struct DispenseGroup;
 //  5) cnt_dispense_start 폐지 (플랫폼팀 요청)
 //     - cnt_dispense 한 컨테이너에 status="started"/"done"으로 통합
 //     - config.h의 CNT_DISPENSE_START_NAME 정의는 이제 사용하지 않음 (삭제 가능)
+//
+// [2026-08-27 수정 (검토 반영, 1차)]
+//  a) MQTT 재연결을 비블로킹으로 변경 - 브로커 장애 시에도 loop()가 계속 돌아
+//     serviceDispatch/finalizeDispatch가 정상 실행됨
+//  b) 워커 태스크 스택 6144 -> 8192 (스택 오버플로 리부팅 예방)
+//  c) 중복방지 링버퍼 인덱스를 NVS에 함께 저장 -> 재부팅 후에도 시간 순서 유지
+//
+// [2026-08-27 수정 (검토 반영, 2차)]
+//  d) MQTT 인증서 검증 활성화: mqttSecureClient.setInsecure() -> setCACert(HIVEMQ_ROOT_CA)
+//     (Mobius용 secureClient는 의도적으로 setInsecure() 유지)
+//  e) syncTime() 대기시간을 15초로 복원 - 인증서 검증을 켰으므로 NTP 동기화가 필수가 됨
+//  f) tryConnectMQTT()에 시간 미동기화 가드 추가 - NTP 실패 시 원인을 로그로 바로 알 수 있게 함
 // ==================================================
 
-WiFiClientSecure secureClient;       // Mobius(COSS) 통신용 (메인 루프 전용)
+WiFiClientSecure secureClient;       // Mobius(COSS) 통신용 (메인 루프 전용, 의도적으로 setInsecure() 유지)
 
 WiFiClientSecure mqttSecureClient;   // MQTT(HiveMQ) 통신용, Mobius용과 분리
 PubSubClient mqttClient(mqttSecureClient);
@@ -66,6 +78,9 @@ void saveRuntimeState();
 void initStockDefaults();
 void initRobotArmPins();
 void syncTime();
+bool tryConnectMQTT();
+void connectMQTTBlocking();
+void ensureMQTT();
 
 // ==================================================
 // 1. 저장소(storage) 설정
@@ -81,6 +96,7 @@ void syncTime();
 // [중요] 로봇암 1대가 선반 여러 개를 커버하면 그 선반들은 동시에 픽업할 수 없다.
 //        그래서 병렬 처리 단위를 "아두이노"가 아니라 "로봇암"으로 잡는다.
 //        같은 armId끼리는 순차, 다른 armId끼리는 병렬로 실행된다.
+//        파일럿(storage 0,1 모두 armId 0)에서는 그룹이 하나뿐이라 실제로는 순차 실행이다.
 //
 // 나중에 로봇암1을 둘로 쪼개면(EI/NS용 1대 + FT/JP용 1대)
 // storage 2,3의 armId를 2로 바꾸고 robotArms[2].enabled를 켜면 끝.
@@ -114,6 +130,8 @@ Storage storages[NUM_STORAGES] = {
 // ---------- 로봇암 ----------
 // DONE 핀은 입력 전용이라 ESP32의 입력 전용 GPIO(34~39)를 써도 된다.
 // Magic Box 출력이 3.3V라 레벨시프터 없이 직결 가능.
+// ※ 34~39는 내부 풀업/풀다운이 없으므로 외부 풀다운 저항(10kΩ)을 반드시 달 것.
+// ※ Magic Box 쪽 DONE 펄스는 최소 100ms 이상 유지하도록 블록코딩할 것 (10ms 폴링).
 
 #define ARM1_DONE_PIN 34
 #define ARM2_DONE_PIN 35
@@ -152,7 +170,7 @@ const char storageLetterPairs[4][2] = {
 //   "schema" : 저장 포맷 버전 (구조가 바뀌면 올려서 옛 데이터 무시)
 //   "stock"  : 로드된 재고 배열 통째 (putBytes)
 //   "pool"   : 예비재고 배열 통째 (putBytes)
-//   "state"  : 큐 + AGV 대기상태 + 중복방지 ID (JSON 문자열)
+//   "state"  : 큐 + AGV 대기상태 + 중복방지 ID(+인덱스) (JSON 문자열)
 //
 // 키 이름은 NVS 제약상 15자 이내여야 한다.
 
@@ -491,6 +509,8 @@ bool loadStockFromNVS() {
 
 // 큐 + AGV 대기상태 + 중복방지 ID + 배출진행 여부를 한 덩어리로 저장
 // (여러 키로 쪼개서 쓰면 그만큼 플래시 쓰기 횟수가 늘어나므로 한 번에 묶음)
+// [2026-08-27 수정] 링버퍼는 빈 칸까지 배열 순서 그대로 저장하고 인덱스(roi/rli)도 함께 저장한다.
+//   -> 복원 후에도 "다음에 덮어쓸 칸"이 유지되어 가장 오래된 ID부터 밀려나는 동작이 보장됨
 void saveRuntimeState() {
   DynamicJsonDocument doc(2560);
 
@@ -508,15 +528,13 @@ void saveRuntimeState() {
     e["b"] = orderQueue[idx].boardColor;
   }
 
+  doc["roi"] = recentOrderIdx;
   JsonArray ro = doc.createNestedArray("ro");
-  for (int i = 0; i < RECENT_ID_SIZE; i++) {
-    if (recentOrderIds[i].length() > 0) ro.add(recentOrderIds[i]);
-  }
+  for (int i = 0; i < RECENT_ID_SIZE; i++) ro.add(recentOrderIds[i]);
 
+  doc["rli"] = recentLoadIdx;
   JsonArray rl = doc.createNestedArray("rl");
-  for (int i = 0; i < RECENT_ID_SIZE; i++) {
-    if (recentLoadIds[i].length() > 0) rl.add(recentLoadIds[i]);
-  }
+  for (int i = 0; i < RECENT_ID_SIZE; i++) rl.add(recentLoadIds[i]);
 
   String s;
   serializeJson(doc, s);
@@ -548,24 +566,25 @@ bool loadRuntimeState() {
     queueCount++;
   }
 
+  // [2026-08-27 수정] 배열을 칸 번호 그대로 복원하고 인덱스는 저장된 값을 사용
   for (int i = 0; i < RECENT_ID_SIZE; i++) {
     recentOrderIds[i] = "";
     recentLoadIds[i]  = "";
   }
 
-  recentOrderIdx = 0;
+  int i = 0;
   for (JsonVariant v : doc["ro"].as<JsonArray>()) {
-    if (recentOrderIdx >= RECENT_ID_SIZE) break;
-    recentOrderIds[recentOrderIdx++] = v.as<String>();
+    if (i >= RECENT_ID_SIZE) break;
+    recentOrderIds[i++] = v.as<String>();
   }
-  recentOrderIdx %= RECENT_ID_SIZE;
+  recentOrderIdx = (doc["roi"] | 0) % RECENT_ID_SIZE;
 
-  recentLoadIdx = 0;
+  i = 0;
   for (JsonVariant v : doc["rl"].as<JsonArray>()) {
-    if (recentLoadIdx >= RECENT_ID_SIZE) break;
-    recentLoadIds[recentLoadIdx++] = v.as<String>();
+    if (i >= RECENT_ID_SIZE) break;
+    recentLoadIds[i++] = v.as<String>();
   }
-  recentLoadIdx %= RECENT_ID_SIZE;
+  recentLoadIdx = (doc["rli"] | 0) % RECENT_ID_SIZE;
 
   return true;
 }
@@ -624,10 +643,10 @@ void initPersistence() {
 // 8. 배출 작업(Job) / 그룹(Group) 정의 - 동시 배출용
 // ==================================================
 // 한 주문은 최대 5개 항목(키캡 4 + board 1)을 배출한다.
-// 각 항목을 Job으로 만들고, 같은 아두이노(IP)로 가는 Job들을 하나의 Group으로 묶는다.
+// 각 항목을 Job으로 만들고, 같은 로봇암을 쓰는 Job들을 하나의 Group으로 묶는다.
 // Group 단위로 FreeRTOS 태스크를 띄우므로:
-//   - 서로 다른 아두이노 -> 완전 병렬 실행 (전체 소요시간 = 가장 느린 보드 1대 기준)
-//   - 같은 아두이노 -> 태스크 내부에서 순차 실행 (동시 요청으로 보드가 꼬이는 것 방지)
+//   - 서로 다른 로봇암 -> 완전 병렬 실행
+//   - 같은 로봇암     -> 태스크 내부에서 순차 실행 (한 팔이 동시에 두 곳을 집을 수 없음)
 
 const int MAX_JOBS = 8;
 
@@ -661,14 +680,17 @@ DispatchState dispatchState = DISPATCH_IDLE;
 unsigned long dispatchStartMs = 0;
 unsigned long lastSlowWarnMs  = 0;
 
-const int  DISPENSE_TASK_STACK   = 6144;   // HTTPClient 사용을 고려한 스택 크기
+// [2026-08-27 수정] 6144 -> 8192. HTTPClient + String 로그 연결을 감안한 여유분.
+//   태스크 종료 직전에 [TASK] 스택 여유 로그가 찍히니 1000 아래로 내려가면 더 키울 것.
+const int  DISPENSE_TASK_STACK   = 8192;
 const int  DISPENSE_TASK_PRIO    = 1;      // Arduino loopTask와 동일 우선순위
-const int  SAME_BOARD_GAP_MS     = 300;    // 같은 아두이노에 연속 요청 시 간격
+const int  SAME_BOARD_GAP_MS     = 300;    // 같은 팔에 연속 요청 시 간격
 const unsigned long SLOW_WARN_MS = 25000;  // 이 시간 넘게 안 끝나면 경고 로그
 
 // 한 항목 처리 = ①아두이노 서보 배출 -> ②로봇암 픽업
 // 두 단계를 따로 재시도한다. 배출은 job_id 멱등 처리 덕분에 재요청해도 실물이 두 번 안 나가고,
 // 픽업 실패는 이미 배출된 물건을 다시 집는 것이라 배출 없이 픽업만 재시도하면 된다.
+// ※ 아두이노 쪽에서 같은 job_id가 다시 오면 서보를 돌리지 않고 200을 돌려주는 처리가 반드시 있어야 한다.
 bool runDispenseJob(DispenseJob& job) {
   // --- 1단계: 배출 ---
   bool dispensed = triggerDispense(job.storageId, job.rail, job.letter, 1, job.jobId);
@@ -714,6 +736,10 @@ void dispenseWorkerTask(void* param) {
       vTaskDelay(pdMS_TO_TICKS(SAME_BOARD_GAP_MS));
     }
   }
+
+  // [2026-08-27 수정] 스택 사용량 확인용 (남은 바이트 수). 운영 안정화 후 지워도 됨.
+  Serial.println("[TASK] group " + String(g) + " 스택 여유: " +
+                 String(uxTaskGetStackHighWaterMark(NULL)) + " bytes");
 
   group.done = true;
   vTaskDelete(NULL);
@@ -846,7 +872,7 @@ void beginDispatch(const PendingOrder& o) {
   dispatchInterrupted = true;
   saveRuntimeState();
 
-  // 워커 태스크 기동 (아두이노 대수만큼 병렬)
+  // 워커 태스크 기동 (로봇암 대수만큼 병렬)
   for (int g = 0; g < dispenseGroupCount; g++) {
     char taskName[24];
     snprintf(taskName, sizeof(taskName), "dispense_%d", g);
@@ -998,8 +1024,11 @@ void ensureWiFi() {
 }
 
 // ==================================================
-// 10-1. NTP 시간 동기화 (TLS 인증서 유효기간 검증에 필요)
+// 10-1. NTP 시간 동기화
 // ==================================================
+// MQTT(HiveMQ) TLS 인증서 검증에 필요한 시각 정보를 받아온다.
+// [2026-08-27] 인증서 검증(setCACert)을 켰으므로 이제 필수 단계다.
+//   시계가 안 맞으면 인증서 유효기간 검사가 실패해 MQTT 연결 자체가 안 된다.
 
 void syncTime() {
   configTime(9 * 3600, 0, "pool.ntp.org", "time.google.com");   // KST(UTC+9)
@@ -1018,10 +1047,9 @@ void syncTime() {
     Serial.print("[TIME] 동기화 완료: ");
     Serial.print(ctime(&now));
   } else {
-    Serial.println("[TIME] 동기화 실패 - 인증서 검증이 실패할 수 있음");
+    Serial.println("[TIME] 동기화 실패 - MQTT 인증서 검증에 필요, 실패 시 MQTT 연결이 안 됨");
   }
 }
-
 
 // ==================================================
 // 11. MQTT (HiveMQ) - 주문 push 수신
@@ -1052,29 +1080,55 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-void connectMQTT() {
-  while (!mqttClient.connected()) {
-    Serial.print("[MQTT] 브로커 연결 시도...");
-    String clientId = "esp32-warehouse-" + String(random(0xffff), HEX);
+// [2026-08-27 수정] 한 번만 시도하고 결과를 돌려준다 (블로킹 없음)
+// [2026-08-27 수정, 2차] 시간 미동기화면 인증서 검증이 실패할 게 뻔하므로
+//   연결 시도 자체를 생략하고 원인을 로그로 바로 알 수 있게 한다.
+bool tryConnectMQTT() {
+  if (time(nullptr) < 8 * 3600 * 2) {
+    Serial.println("[MQTT] 시간 미동기화 - 인증서 검증 불가, NTP 대기 중");
+    return false;
+  }
 
-    if (mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD)) {
-      Serial.println(" 성공");
-      mqttClient.subscribe(MQTT_TOPIC);
-      mqttClient.subscribe(MQTT_REPLACE_TOPIC);
-      mqttClient.subscribe(MQTT_LOAD_TOPIC);
-      Serial.println("[MQTT] 구독 시작: " + String(MQTT_TOPIC) + ", " + String(MQTT_REPLACE_TOPIC) + ", " + String(MQTT_LOAD_TOPIC));
-    } else {
-      Serial.print(" 실패, rc=");
-      Serial.print(mqttClient.state());
-      Serial.println(" | 3초 후 재시도");
-      delay(3000);
-    }
+  Serial.print("[MQTT] 브로커 연결 시도...");
+  String clientId = "esp32-warehouse-" + String(random(0xffff), HEX);
+
+  if (mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD)) {
+    Serial.println(" 성공");
+    mqttClient.subscribe(MQTT_TOPIC);
+    mqttClient.subscribe(MQTT_REPLACE_TOPIC);
+    mqttClient.subscribe(MQTT_LOAD_TOPIC);
+    Serial.println("[MQTT] 구독 시작: " + String(MQTT_TOPIC) + ", " +
+                   String(MQTT_REPLACE_TOPIC) + ", " + String(MQTT_LOAD_TOPIC));
+    return true;
+  }
+
+  Serial.print(" 실패, rc=");
+  Serial.println(mqttClient.state());
+  return false;
+}
+
+// [2026-08-27 수정] setup 전용: 부팅 시에는 최대 30초까지만 기다린다
+void connectMQTTBlocking() {
+  unsigned long start = millis();
+  while (!tryConnectMQTT() && millis() - start < 30000) {
+    delay(3000);
+  }
+  if (!mqttClient.connected()) {
+    Serial.println("[MQTT] 초기 연결 실패 - loop에서 계속 재시도");
   }
 }
 
+// [2026-08-27 수정] loop 전용: 끊겨 있으면 3초에 한 번만 시도하고 바로 리턴
+//   브로커가 죽어 있어도 loop()가 계속 돌아가므로 serviceDispatch/finalizeDispatch가 정상 실행된다.
 void ensureMQTT() {
+  static unsigned long lastRetry = 0;
+
   if (!mqttClient.connected()) {
-    connectMQTT();
+    if (millis() - lastRetry >= 3000) {
+      lastRetry = millis();
+      tryConnectMQTT();
+    }
+    return;
   }
   mqttClient.loop();   // 콜백 처리를 위해 반드시 주기적으로 호출해야 함
 }
@@ -1117,26 +1171,27 @@ void setup() {
   initRobotArmPins();
   initPersistence();     // NVS에서 재고/큐/상태 복원 (없으면 기본값 생성)
   connectWiFi();
-  syncTime();  
+  syncTime();             // MQTT 인증서 검증에 필요 (필수)
 
-  secureClient.setInsecure();
+  secureClient.setInsecure();   // Mobius 통신은 의도적으로 검증 생략 유지
   delay(1000);
 
   recoverInterruptedDispatch();
   syncStockToMobius();
 
   // ===== MQTT(HiveMQ) 연결 설정 =====
-  mqttSecureClient.setInsecure();          // 인증서 검증 생략(프로토타입 단계)
+  mqttSecureClient.setCACert(HIVEMQ_ROOT_CA);   // HiveMQ 루트 CA(ISRG Root X1)로 인증서 검증
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(512);           // 기본 256바이트라 주문 JSON 담기게 확장
-  connectMQTT();
+  connectMQTTBlocking();                   // 최대 30초 대기 후 loop에 위임
   // ===================================
 
   printStorageStatus();
 
   Serial.println("[SYSTEM] MQTT 구독 기반 주문 수신 - 36레일(색상 반영) 구조, AGV cnt_load 큐 방식");
-  Serial.println("[SYSTEM] 배출: 아두이노별 병렬 처리 + 논블로킹 상태머신, 상태는 NVS에 영속 저장");
+  Serial.println("[SYSTEM] 배출: 로봇암별 병렬 처리 + 논블로킹 상태머신, 상태는 NVS에 영속 저장");
+  Serial.println("[SYSTEM] MQTT는 TLS 인증서 검증 적용 (HiveMQ 루트 CA)");
   Serial.println("[SYSTEM] 명령: STATUS, TEST E/I/N/S, FACTORYRESET");
 }
 
@@ -1145,7 +1200,7 @@ void loop() {
   checkSerialCommand();
 
   if (WiFi.status() == WL_CONNECTED) {
-    ensureMQTT();       // 배출 중에도 매 루프 호출되므로 새 메시지가 밀리지 않음
+    ensureMQTT();       // 비블로킹 - 브로커 장애 시에도 아래 serviceDispatch가 계속 돈다
   }
 
   serviceDispatch();    // 배출 진행/완료 감지 및 다음 주문 시작
@@ -1202,6 +1257,7 @@ void checkSerialCommand() {
     printStock();
     Serial.println("현재 주문: " + (currentOrderId.length() > 0 ? currentOrderId : "(없음)"));
     Serial.println("배출 상태: " + String(dispatchState == DISPATCH_RUNNING ? "진행 중" : "대기"));
+    Serial.println("MQTT 연결: " + String(mqttClient.connected() ? "연결됨" : "끊김"));
     Serial.println("AGV cnt_load 대기 중: " + String(waitingForLoad ? "예" : "아니오"));
     Serial.println("대기열(큐)에 쌓인 주문: " + String(queueCount) + "개");
     Serial.println("대기 중인 교체 요청: " + String(replaceCount) + "개");
@@ -1476,8 +1532,7 @@ void processOrder(String conData) {
 // ==================================================
 // 19. 아두이노에 배출 요청 전송
 // ==================================================
-// 아두이노가 배출 + 로봇암 트리거까지 로컬로 처리하고
-// 그 결과를 HTTP 응답(200)으로 돌려줌.
+// 아두이노가 서보 배출을 로컬로 처리하고 그 결과를 HTTP 응답(200)으로 돌려줌.
 //
 // ※ 이 함수는 배출 워커 태스크에서 호출된다.
 //    HTTPClient 인스턴스를 함수 내부에서 생성하므로 여러 태스크가 동시에 호출해도 안전하다.
@@ -1511,7 +1566,7 @@ bool triggerDispense(int storageId, int rail, char letter, int count, const Stri
 
   HTTPClient http;
   http.setConnectTimeout(3000);
-  http.setTimeout(8000);   // 로봇암 픽업까지 포함해서 응답 올 수 있어 여유있게
+  http.setTimeout(8000);
   http.begin(url);
 
   int httpCode = http.GET();
@@ -1536,10 +1591,10 @@ bool triggerDispense(int storageId, int rail, char letter, int count, const Stri
 //
 // 배선:
 //   ESP32 armStartPin (출력) -> Magic Box EIO 입력   : 선반마다 별도 핀
-//   Magic Box EIO 출력       -> ESP32 donePin (입력) : 로봇암마다 1개
+//   Magic Box EIO 출력       -> ESP32 donePin (입력) : 로봇암마다 1개 (+ 외부 풀다운 10kΩ)
 //
 // Magic Box 블록코딩 쪽에서는 "어느 입력이 켜졌는지"로 집을 위치를 분기하고,
-// 동작이 끝나면 DONE 출력을 잠깐 올려주면 된다.
+// 동작이 끝나면 DONE 출력을 100ms 이상 올려주면 된다.
 //
 // ※ 이 함수는 워커 태스크에서 호출된다. 로봇암 1대당 태스크가 1개뿐이라
 //   같은 DONE 핀을 두 태스크가 동시에 읽는 상황은 발생하지 않는다.
@@ -1607,7 +1662,7 @@ bool triggerRobotArm(int storageId) {
 //
 // ※ 플랫폼팀은 started/done 두 가지만 다루겠다고 했으므로,
 //   실패 상태를 별도 값("partial")으로 보낼지 "done"으로 통일할지는 확인 필요.
-//   확인되면 아래 DISPENSE_FAIL_STATUS 한 줄만 바꾸면 전체 반영된다.
+//   확인되면 위쪽 DISPENSE_FAIL_STATUS 한 줄만 바꾸면 전체 반영된다.
 
 void notifyDispenseStatus(String orderId, const char* status) {
   if (WiFi.status() != WL_CONNECTED) {
@@ -1646,7 +1701,7 @@ void notifyDispenseStatus(String orderId, const char* status) {
 }
 
 // ==================================================
-// 22. cnt_stock 재고 동기화 (색상별 세부 구조 반영, 2026-08-26 확정)
+// 21. cnt_stock 재고 동기화 (색상별 세부 구조 반영, 2026-08-26 확정)
 // ==================================================
 // 공식 스펙(cnt_stock)에 맞춰 keycap.{글자}.{색상}, board.{색상} 형태로 전송.
 // 파일럿 단계라 E/I/N/S만 실제 재고값, 나머지(F/T/J/P/board)는
