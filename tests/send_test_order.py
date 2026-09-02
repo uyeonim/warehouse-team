@@ -28,14 +28,14 @@ headers = {
 }
 
 def random_keycap():
-    axis1 = random.choice(["E", "I"])
+    axis1 = random.choice(["E", "E"])
     axis2 = random.choice(["N", "S"])
     axis3 = random.choice(["F", "T"])
     axis4 = random.choice(["J", "P"])
     return axis1 + axis2 + axis3 + axis4
 
 BOARD_COLORS = ["red", "black", "blue", "brown"]
-KEYCAP_COLORS = ["r", "y", "b", "g"]
+KEYCAP_COLORS = ["r", "r", "r", "r"]
 
 def random_order():
     return {

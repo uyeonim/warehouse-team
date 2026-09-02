@@ -8,7 +8,16 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+// config.h에 없으면 기본값 사용 (원격 복구 명령 토픽)
+#ifndef MQTT_CMD_TOPIC
+#define MQTT_CMD_TOPIC "warehouse/cmd"
+#endif
+
 // Arduino IDE가 자동 생성하는 프로토타입에서 아래 타입을 참조하므로 미리 선언한다.
+// ※ 이 블록 앞에는 전처리기 지시문(#include/#define) 외의 실제 코드가 있으면 안 된다.
+//    Arduino가 자동 프로토타입을 "코드가 시작되는 첫 지점" 바로 앞에 끼워 넣기 때문에,
+//    그 지점이 이 블록보다 앞서면 구조체가 정의되기 전에 프로토타입이 생성돼 컴파일 에러가 난다.
+//    (SET_LOOP_TASK_STACK_SIZE 같은 매크로 호출도 "실제 코드"로 취급되므로 반드시 아래쪽에 둘 것)
 struct Storage;
 struct RobotArm;
 struct PendingOrder;
@@ -23,19 +32,23 @@ struct IdRing;
 // Mobius -> Flask -> HiveMQ(MQTT) -> ESP32(이 코드) -> 아두이노(서보) / Magic Box(로봇암)
 //
 // 실행 흐름
-//   MQTT 콜백  : JSON 파싱 + 큐 적재만 (네트워크 I/O 없음)
+//   MQTT 콜백  : JSON 파싱 + 큐 적재만. 단, 주문 유효성 검증(미정의 글자/색상)은 여기서 먼저 한다
 //   loop()     : serviceDispatch()가 상태머신을 돌린다
 //                IDLE -> RUNNING(배출 단계 -> 픽업 단계) -> WAITING_LOAD 또는 IDLE
-//                WAITING_LOAD는 AGV의 cnt_load 신호로 IDLE로 돌아간다
+//                WAITING_LOAD는 AGV의 cnt_load 신호(또는 skip_load 명령)로 IDLE로 돌아간다
+//                NEEDS_CONFIRM은 재부팅 복구 후 사람 확인 대기 상태. resume 명령으로만 IDLE로 간다
 //   배출 단계  : 항목 1개당 태스크 1개. 아두이노 5대에 동시에 HTTP 요청 (전 레일 동시 배출)
 //                전부 끝나면 메인 루프가 재고 차감 + cnt_stock 즉시 업로드
 //                하나라도 실패하면 cnt_dispense partial(detail=실패 레일 전부) 후 주문 중단 (픽업 안 함)
 //   픽업 단계  : 로봇암 1대당 태스크 1개. 같은 팔을 쓰는 선반은 순차, 다른 팔은 병렬
 //                픽업이 하나 실패하면 그 팔의 나머지 픽업은 중단
-//   NVS        : 재고 + 큐 + 상태 + 중복방지 ID를 주문 단위로 저장 (플래시 수명 보호)
+//   재전송     : cnt_dispense는 NVS 영속 FIFO 큐로 재전송 (주문 상태 이벤트라 유실 불가)
+//                cnt_stock은 현재값이라 RAM 플래그만 두고 최신 재고를 다시 쏜다
+//   원격 명령  : MQTT warehouse/cmd 토픽 {"cmd":"skip_load"|"resume"} + 시리얼 SKIPLOAD/RESUME
+//   NVS        : 재고 + 큐 + 상태 + 중복방지 ID + 재전송 큐를 주문 단위로 저장
 //
 // 외부 인터페이스(변경 금지)
-//   MQTT 토픽 3개(주문/교체/cnt_load), 아두이노 /dispense URL, Mobius cnt_dispense·cnt_stock payload
+//   MQTT 토픽(주문/교체/cnt_load), 아두이노 /dispense URL, Mobius cnt_dispense·cnt_stock payload
 
 // ==================================================
 // 1. 하드웨어 구성 (저장소 / 로봇암 / 레일 매핑)
@@ -74,7 +87,7 @@ struct RobotArm {
 const int NUM_ARMS = 3;
 
 RobotArm robotArms[NUM_ARMS] = {
-  { "로봇암1(키캡)",  34, false },
+  { "로봇암1(키캡)",  34, true },
   { "로봇암2(board)", 35, false },
   { "로봇암3(예비)",  36, false },
 };
@@ -107,23 +120,30 @@ const int TOTAL_PER_RAIL      = 300;  // 레일당 예비재고 총량(임시값
 
 // 배출 / 픽업
 const int  MAX_JOBS                 = 8;
-const int  DISPENSE_TASK_STACK      = 8192;   // HTTPClient + 문자열 연결
+const int  DISPENSE_TASK_STACK      = 8192;   // 아두이노는 평문 HTTP라 이 정도로 충분
 const int  PICK_TASK_STACK          = 4096;   // GPIO + 로그만
 const int  TASK_PRIO                = 1;
 const int  SAME_ARM_GAP_MS          = 300;
 const int  DISPENSE_RETRY_DELAY_MS  = 500;
 const unsigned long SLOW_WARN_MS    = 25000;
-const char* DISPENSE_FAIL_STATUS    = "partial";   // 플랫폼팀 확정 시 이 한 줄만 변경
+const char* DISPENSE_FAIL_STATUS    = "partial";   // 플랫폼팀이 rejected 상태에 합의하면 검증 실패 쪽만 분리
 
 // 큐 / 중복방지
 const int ORDER_QUEUE_SIZE   = 10;
 const int REPLACE_QUEUE_SIZE = 8;
 const int RECENT_ID_SIZE     = 12;
 
+// Mobius 재전송
+const int           DISPENSE_RETRY_QUEUE_SIZE = 6;      // cnt_dispense 재전송 큐 (NVS 영속)
+const unsigned long MOBIUS_RETRY_INTERVAL_MS  = 5000;   // 재전송/재고 재동기화 시도 간격
+
+// 대기 경고
+const unsigned long WAIT_WARN_INTERVAL_MS = 120000;   // WAITING_LOAD/NEEDS_CONFIRM 경고 주기 (2분)
+
 // NVS
 const char* NVS_NAMESPACE  = "warehouse";
-const int   NVS_SCHEMA_VER = 2;   // 2: 상태 저장 포맷 통합(st). 구조가 바뀌면 올릴 것 (불일치 시 전체 초기화)
-const size_t RUNTIME_STATE_DOC_SIZE = 4096;   // saveRuntimeState/loadRuntimeState 공용 풀 크기
+const int   NVS_SCHEMA_VER = 2;   // 상태 키는 추가만 됐으므로(rq, ws) 버전 유지 - 구조가 깨지게 바뀌면 올릴 것
+const size_t RUNTIME_STATE_DOC_SIZE = 6144;   // saveRuntimeState/loadRuntimeState 공용 풀 크기 (재전송 큐 포함)
 
 // 네트워크
 const unsigned long WIFI_CONNECT_TIMEOUT_MS   = 20000;
@@ -143,7 +163,7 @@ const int           HTTP_TIMEOUT_MS           = 8000;
 // ※ 템플릿/구조체 멤버 함수는 Arduino의 프로토타입 자동생성 대상이 아니므로
 //    반드시 사용 지점보다 앞(이 절)에 정의돼 있어야 한다.
 
-// 고정 크기 링큐. 주문 큐와 교체 큐가 같은 구현을 쓴다.
+// 고정 크기 링큐. 주문 큐 / 교체 큐 / 재전송 큐가 같은 구현을 쓴다.
 template <typename T, int N>
 struct RingQueue {
   T   items[N];
@@ -151,6 +171,7 @@ struct RingQueue {
   int count = 0;
 
   bool empty() const { return count == 0; }
+  bool full()  const { return count >= N; }
   bool push(const T& v) {
     if (count >= N) return false;
     items[(head + count) % N] = v;
@@ -244,12 +265,13 @@ struct DispenseGroup {
 // ==================================================
 
 enum DispatchState {
-  DISPATCH_IDLE = 0,          // 다음 주문을 시작할 수 있음
-  DISPATCH_RUNNING = 1,       // 워커 태스크 실행 중 (NVS에 이 값이 남아 있으면 배출 중 재부팅된 것)
-  DISPATCH_WAITING_LOAD = 2,  // AGV의 cnt_load 신호 대기 중
+  DISPATCH_IDLE = 0,           // 다음 주문을 시작할 수 있음
+  DISPATCH_RUNNING = 1,        // 워커 태스크 실행 중 (NVS에 이 값이 남아 있으면 배출 중 재부팅된 것)
+  DISPATCH_WAITING_LOAD = 2,   // AGV의 cnt_load 신호 대기 중
+  DISPATCH_NEEDS_CONFIRM = 3,  // 재부팅 복구 후 사람 확인 대기 (RESUME 명령으로만 해제)
 };
 
-// RUNNING 안의 세부 단계. NVS에는 저장하지 않는다 (재부팅 시 RUNNING이면 어느 단계든 partial 처리).
+// RUNNING 안의 세부 단계. NVS에는 저장하지 않는다 (재부팅 시 RUNNING이면 어느 단계든 NEEDS_CONFIRM 처리).
 enum DispatchPhase { PHASE_DISPENSE = 0, PHASE_PICK = 1 };
 
 WiFiClientSecure secureClient;       // Mobius용 (메인 루프 전용, 의도적으로 setInsecure 유지)
@@ -263,11 +285,16 @@ int totalPool[NUM_STORAGES][MAX_RAILS];
 DispatchState dispatchState = DISPATCH_IDLE;
 DispatchPhase dispatchPhase = PHASE_DISPENSE;
 String        currentOrderId = "";
+time_t        waitingSince   = 0;      // WAITING_LOAD/NEEDS_CONFIRM 진입 시각 (NTP). NVS 저장
+unsigned long lastWaitWarnMs = 0;
 
-RingQueue<PendingOrder,   ORDER_QUEUE_SIZE>   orderQueue;
-RingQueue<PendingReplace, REPLACE_QUEUE_SIZE> replaceQueue;
+RingQueue<PendingOrder,   ORDER_QUEUE_SIZE>          orderQueue;
+RingQueue<PendingReplace, REPLACE_QUEUE_SIZE>        replaceQueue;
+RingQueue<String,         DISPENSE_RETRY_QUEUE_SIZE> dispenseRetryQueue;   // 직렬화된 con 문자열 (NVS 영속)
 IdRing recentOrderIds;
 IdRing recentLoadIds;
+
+bool stockSyncPending = false;   // cnt_stock 업로드 실패 시 true. 최신 재고만 다시 쏘면 되므로 RAM 전용
 
 DispenseJob   dispenseJobs[MAX_JOBS];
 int           dispenseJobCount = 0;
@@ -284,16 +311,19 @@ void printStock();
 void saveStockToNVS();
 void saveRuntimeState();
 void syncStockToMobius();
-void notifyDispenseStatus(const String& orderId, const char* status, bool withErrors = false);
+void notifyDispenseStatus(const String& orderId, const char* status,
+                          const char* reason = nullptr, bool withDetail = false);
 bool triggerDispense(const DispenseJob& job);
 bool triggerRobotArm(int storageId);
 void processOrder(const String& conData);
 void processReplaceRequest(const String& conData);
 void processLoadConfirmation(const String& conData);
+void processControlCommand(const String& conData);
 void beginDispatch(const PendingOrder& o);
 void finishDispensePhase();
 void finalizeDispatch();
 void printStorageStatus();
+bool postToMobius(const char* container, const String& con, const String& what);
 
 // ==================================================
 // 6. 레일 매핑 유틸
@@ -421,7 +451,7 @@ void replaceCartridge(int storageId, int rail) {
 // ==================================================
 //   "schema" : 포맷 버전. 다르면 재고/상태 구분 없이 전체 초기화 (옛 큐·중복방지 ID 잔존 방지)
 //   "stock", "pool" : 재고 배열 통째
-//   "state"  : 상태머신 + 현재 주문 + 주문 큐 + 중복방지 ID (JSON 한 덩어리)
+//   "state"  : 상태머신 + 현재 주문 + 대기시각 + 재전송 큐 + 주문 큐 + 중복방지 ID (JSON 한 덩어리)
 
 void saveStockToNVS() {
   prefs.putBytes("stock", stock, sizeof(stock));
@@ -441,11 +471,15 @@ void saveRuntimeState() {
 
   doc["st"]  = (int)dispatchState;
   doc["cur"] = currentOrderId;
+  doc["ws"]  = (long)waitingSince;
 
-  // 중복방지 ID를 큐보다 먼저 쓴다. 풀이 넘치면 뒤에 넣은 큐 꼬리부터 잘리므로
-  // 상태머신과 중복방지는 항상 온전하게 남고, 유실은 최신 주문 몇 건으로 한정된다.
+  // 저장 순서 = 잘림 우선순위. 풀이 넘치면 뒤에 넣은 것부터 잘리므로
+  // 상태머신 -> 중복방지 ID -> cnt_dispense 재전송 큐 -> 주문 큐 순으로 중요한 것을 앞에 쓴다.
   recentOrderIds.save(doc, "ro", "roi");
   recentLoadIds.save(doc, "rl", "rli");
+
+  JsonArray rq = doc.createNestedArray("rq");
+  for (int i = 0; i < dispenseRetryQueue.count; i++) rq.add(dispenseRetryQueue.at(i));
 
   JsonArray q = doc.createNestedArray("q");
   for (int i = 0; i < orderQueue.count; i++) {
@@ -483,8 +517,9 @@ bool loadRuntimeState() {
   }
 
   int st = doc["st"] | 0;
-  dispatchState  = (st >= 0 && st <= DISPATCH_WAITING_LOAD) ? (DispatchState)st : DISPATCH_IDLE;
+  dispatchState  = (st >= 0 && st <= DISPATCH_NEEDS_CONFIRM) ? (DispatchState)st : DISPATCH_IDLE;
   currentOrderId = doc["cur"] | "";
+  waitingSince   = (time_t)(doc["ws"] | 0L);
 
   orderQueue.clear();
   for (JsonObject e : doc["q"].as<JsonArray>()) {
@@ -496,6 +531,14 @@ bool loadRuntimeState() {
     if (!orderQueue.push(o)) break;
   }
 
+  dispenseRetryQueue.clear();
+  for (JsonVariant v : doc["rq"].as<JsonArray>()) {
+    if (!dispenseRetryQueue.push(v.as<String>())) break;
+  }
+  if (!dispenseRetryQueue.empty()) {
+    Serial.println("[RETRY] 미전송 cnt_dispense " + String(dispenseRetryQueue.count) + "건 복원");
+  }
+
   recentOrderIds.load(doc, "ro", "roi");
   recentLoadIds.load(doc, "rl", "rli");
   return true;
@@ -505,8 +548,10 @@ void resetRuntimeState() {
   dispatchState  = DISPATCH_IDLE;
   dispatchPhase  = PHASE_DISPENSE;
   currentOrderId = "";
+  waitingSince   = 0;
   orderQueue.clear();
   replaceQueue.clear();
+  dispenseRetryQueue.clear();
   recentOrderIds.clear();
   recentLoadIds.clear();
 }
@@ -521,7 +566,7 @@ void applyFactoryDefaults() {
   saveRuntimeState();
 }
 
-// 카트리지를 전부 새로 채웠을 때 / CARTRIDGE_CAPACITY를 바꿨을 때 사용
+// 카트리지를 전부 새로 채웠을 때 / CARTRIDGE_CAPACITY를 바꿨을 때 사용. NEEDS_CONFIRM 탈출용으로도 쓸 수 있다.
 void factoryReset() {
   applyFactoryDefaults();
   Serial.println("[NVS] 공장 초기화 완료 - 재고를 카트리지 용량으로 되돌림");
@@ -548,8 +593,8 @@ void initPersistence() {
   }
 
   if (loadRuntimeState()) {
-    Serial.println("[NVS] 상태 복원 - 대기 주문 " + String(orderQueue.count) + "개, AGV 대기 " +
-                   String(dispatchState == DISPATCH_WAITING_LOAD ? "예" : "아니오"));
+    Serial.println("[NVS] 상태 복원 - 대기 주문 " + String(orderQueue.count) + "개, 상태 " +
+                   String((int)dispatchState));
   } else {
     Serial.println("[NVS] 저장된 상태 없음 - 빈 큐로 시작");
     saveRuntimeState();
@@ -559,16 +604,19 @@ void initPersistence() {
 }
 
 // 배출 도중 재부팅되면 NVS에 RUNNING이 남는다. 실물은 나갔는데 재고 차감은 안 됐을 수 있다.
-// 어느 레일에서 끊겼는지는 알 수 없으므로 detail 없이 partial만 올린다.
+// 자동으로 큐를 재개하지 않고 NEEDS_CONFIRM으로 진입해, 사람이 선반/배출구를 확인하고
+// RESUME 명령(시리얼 또는 MQTT {"cmd":"resume"})을 줄 때까지 기다린다.
 void recoverInterruptedDispatch() {
   if (dispatchState != DISPATCH_RUNNING) return;
 
   Serial.println();
   Serial.println("[복구] 이전 배출이 완료되지 않은 채 재부팅됨: " + currentOrderId);
-  Serial.println("[복구] 실물 배출분과 저장된 재고가 어긋났을 수 있음 - 선반/배출구 실물 확인 권장");
+  Serial.println("[복구] 실물 배출분과 저장된 재고가 어긋났을 수 있음 - 선반/배출구 확인 후 RESUME 입력");
 
-  notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS);
-  dispatchState = DISPATCH_IDLE;   // 어느 단계에서 끊겼는지 알 수 없으므로 대기 없이 큐 재개
+  notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS, "interrupted");
+  dispatchState  = DISPATCH_NEEDS_CONFIRM;
+  waitingSince   = time(nullptr);
+  lastWaitWarnMs = millis();
   saveRuntimeState();
 }
 
@@ -635,13 +683,14 @@ void pickWorkerTask(void* param) {
 // ==================================================
 
 // 배출 항목 하나를 Job으로 등록. 비활성 저장소는 파일럿 범위 밖이라 집계에서도 제외한다.
+// (미정의 글자/색상은 processOrder에서 이미 거절됐으므로 여기 오는 항목은 매핑이 보장된다)
 void addDispenseJob(int storageId, int rail, char letter) {
   if (dispenseJobCount >= MAX_JOBS) return;
 
   String tag = (storageId == STORAGE_BOARD) ? String("board") : String(letter);
 
   if (!isValidLocation(storageId, rail)) {
-    Serial.println("[DISPENSE] " + tag + " 매핑 실패 (글자/색상 확인), 스킵");
+    Serial.println("[DISPENSE] " + tag + " 매핑 실패 (검증 누락?), 스킵");
     return;
   }
   if (!storages[storageId].enabled) {
@@ -703,7 +752,9 @@ bool allGroupsDone() {
 // 주문을 닫고 다음 상태를 정한다. 바구니에 뭔가 들어갔으면 AGV를 기다리고, 아니면 바로 다음 주문.
 void closeDispatch(int pickedCount) {
   if (pickedCount > 0) {
-    dispatchState = DISPATCH_WAITING_LOAD;
+    dispatchState  = DISPATCH_WAITING_LOAD;
+    waitingSince   = time(nullptr);
+    lastWaitWarnMs = millis();
     Serial.println("[DISPATCH] AGV cnt_load 신호 대기 중");
   } else {
     dispatchState = DISPATCH_IDLE;
@@ -726,7 +777,7 @@ void beginDispatch(const PendingOrder& o) {
     char letter    = toupper(o.keycap.charAt(i));
     char colorChar = (i < o.colorsStr.length()) ? o.colorsStr.charAt(i) : '?';
     int  storageId = letterToStorage(letter);
-    if (storageId < 0) continue;   // 정의되지 않은 글자(오타 등)
+    if (storageId < 0) continue;   // processOrder 검증을 통과했으므로 실제로는 발생하지 않음
     addDispenseJob(storageId, resolveRail(storageId, letter, colorToIndex(colorChar)), letter);
   }
 
@@ -735,10 +786,10 @@ void beginDispatch(const PendingOrder& o) {
     addDispenseJob(STORAGE_BOARD, resolveRail(STORAGE_BOARD, 'B', colorIdx), 'B');
   }
 
-  // 배출할 게 없으면 (전부 비활성/매핑 실패) 실패로 닫는다
+  // 배출할 게 없으면 (전부 비활성) 실패로 닫는다
   if (dispenseJobCount == 0) {
     Serial.println("[DISPATCH] 배출 가능한 항목 없음 - " + String(DISPENSE_FAIL_STATUS) + " 처리");
-    notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS);
+    notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS, "not_dispensable");
     closeDispatch(0);
     return;
   }
@@ -754,7 +805,7 @@ void beginDispatch(const PendingOrder& o) {
   }
   if (anyNoStock) {
     Serial.println("[DISPATCH] 주문 전체 중단, 배출 안 함");
-    notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS, true);
+    notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS, "no_stock", true);
     closeDispatch(0);
     return;
   }
@@ -809,7 +860,7 @@ void finishDispensePhase() {
     if (dispensedCount > 0) {
       Serial.println("[DISPATCH] !! 이미 배출된 " + String(dispensedCount) + "개가 배출구에 남아 있음 - 수동 회수 필요");
     }
-    notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS, true);
+    notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS, "dispense_fail", true);
     closeDispatch(0);   // 바구니에 실린 게 없으니 AGV를 기다리지 않는다
     return;
   }
@@ -853,10 +904,22 @@ void finalizeDispatch() {
     notifyDispenseStatus(currentOrderId, "done");
   } else {
     Serial.println("[DISPATCH] 픽업 실패 " + String(failCount) + "건");
-    notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS, true);
+    notifyDispenseStatus(currentOrderId, DISPENSE_FAIL_STATUS, "pickup_fail", true);
   }
 
   closeDispatch(pickedCount);
+}
+
+// WAITING_LOAD / NEEDS_CONFIRM 장기 대기 경고. 자동 전환은 하지 않는다 (오탐 방지).
+void warnIfWaitingLong(const char* what, const char* howToClear) {
+  if (millis() - lastWaitWarnMs < WAIT_WARN_INTERVAL_MS) return;
+  lastWaitWarnMs = millis();
+
+  String elapsed = "?";
+  if (waitingSince > 0 && time(nullptr) >= TIME_VALID_MIN) {
+    elapsed = String((long)((time(nullptr) - waitingSince) / 60)) + "분";
+  }
+  Serial.println("[WAIT] " + String(what) + " " + elapsed + " 경과 - 확인 필요 (" + howToClear + ")");
 }
 
 // 상태머신 한 스텝. loop()에서 매번 호출된다.
@@ -876,7 +939,14 @@ void serviceDispatch() {
       break;
 
     case DISPATCH_WAITING_LOAD:
-      break;   // cnt_load 수신 시 processLoadConfirmation()이 IDLE로 되돌린다
+      // cnt_load 수신 시 processLoadConfirmation()이, 또는 skip_load 명령이 IDLE로 되돌린다
+      warnIfWaitingLong("AGV cnt_load 대기", "cnt_load 또는 SKIPLOAD 명령");
+      break;
+
+    case DISPATCH_NEEDS_CONFIRM:
+      // 재부팅 복구 상태. 사람이 실물 확인 후 RESUME 명령을 줄 때까지 큐를 재개하지 않는다
+      warnIfWaitingLong("재부팅 복구 확인 대기", "선반/배출구 확인 후 RESUME 명령");
+      break;
 
     case DISPATCH_IDLE: {
       PendingOrder next;
@@ -974,7 +1044,7 @@ bool triggerRobotArm(int storageId) {
 }
 
 // ==================================================
-// 12. Mobius(COSS) 업로드 (메인 루프 전용)
+// 12. Mobius(COSS) 업로드 + 재전송 (메인 루프 전용)
 // ==================================================
 
 String generateRI() {
@@ -1016,17 +1086,54 @@ bool postToMobius(const char* container, const String& con, const String& what) 
   return ok;
 }
 
-// cnt_dispense (창고팀 내부용 detail):
-//   {"order_id":..., "status":"started"|"done"|"partial", "detail":[{"storage_id":n,"rail":n}, ...]}
-//   detail = 실패한 레일 전부 (1~5개). 실패가 없으면(started/done) 필드 자체를 생략한다.
-void notifyDispenseStatus(const String& orderId, const char* status, bool withErrors) {
+// cnt_dispense를 보내거나, 실패하면 NVS 영속 재전송 큐에 넣는다.
+// 큐가 비어있지 않으면 순서 보장을 위해 새 보고도 무조건 큐 뒤에 붙인다 (started가 done을 앞지르지 않게).
+void sendOrQueueDispense(const String& con, const String& what) {
+  if (dispenseRetryQueue.empty() && postToMobius(CNT_DISPENSE_NAME, con, what)) return;
+
+  if (dispenseRetryQueue.full()) {
+    String dropped;
+    dispenseRetryQueue.pop(dropped);
+    Serial.println("[RETRY] !! 재전송 큐 가득 - 가장 오래된 cnt_dispense 폐기: " + dropped);
+  }
+  dispenseRetryQueue.push(con);
+  Serial.println("[RETRY] cnt_dispense 재전송 큐 적재 (" + String(dispenseRetryQueue.count) + "건 대기)");
+  saveRuntimeState();
+}
+
+// 재전송 큐 드레인. 메인 루프에서만 호출 (secureClient가 단일 객체이므로 별도 태스크 금지).
+// FIFO 앞에서부터 하나씩만 보내 순서를 보장한다.
+void serviceDispenseRetry() {
+  static unsigned long lastTry = 0;
+  if (dispenseRetryQueue.empty()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (millis() - lastTry < MOBIUS_RETRY_INTERVAL_MS) return;
+  lastTry = millis();
+
+  if (postToMobius(CNT_DISPENSE_NAME, dispenseRetryQueue.at(0),
+                   "cnt_dispense 재전송 (" + String(dispenseRetryQueue.count) + "건 대기)")) {
+    String sent;
+    dispenseRetryQueue.pop(sent);
+    saveRuntimeState();
+  }
+}
+
+// cnt_dispense payload:
+//   {"order_id":..., "status":"started"|"done"|"partial",
+//    "reason":"invalid_letter|invalid_color|invalid_board|no_stock|dispense_fail|pickup_fail|interrupted|not_dispensable|queue_full",
+//    "detail":[{"storage_id":n,"rail":n}, ...]}
+//   reason/detail은 실패 시에만 붙는다. detail = 실패한 레일 전부.
+//   플랫폼팀이 rejected 상태에 합의하면 검증 실패(invalid_*/queue_full)의 status만 rejected로 바꾸면 된다.
+void notifyDispenseStatus(const String& orderId, const char* status, const char* reason, bool withDetail) {
   StaticJsonDocument<512> doc;
   doc["order_id"] = orderId;
   doc["status"]   = status;
+  if (reason) doc["reason"] = reason;
 
-  String what = "cnt_dispense 업로드 " + orderId + " (status=" + status;
+  String what = "cnt_dispense " + orderId + " (status=" + status;
+  if (reason) what += ", reason=" + String(reason);
 
-  if (withErrors) {
+  if (withDetail) {
     JsonArray detail = doc.createNestedArray("detail");
     for (int j = 0; j < dispenseJobCount; j++) {
       const DispenseJob& job = dispenseJobs[j];
@@ -1040,10 +1147,11 @@ void notifyDispenseStatus(const String& orderId, const char* status, bool withEr
 
   String con;
   serializeJson(doc, con);
-  postToMobius(CNT_DISPENSE_NAME, con, what + ")");
+  sendOrQueueDispense(con, what + ")");
 }
 
 // cnt_stock: {"keycap":{글자:{색상:n}}, "board":{색상:n}}  비활성 저장소는 0으로 표기
+// 실패해도 큐에 넣지 않는다. 현재값이므로 stockSyncPending 플래그만 세우고 최신 재고를 다시 쏜다.
 void syncStockToMobius() {
   StaticJsonDocument<1024> doc;
   JsonObject keycapObj = doc.createNestedObject("keycap");
@@ -1062,12 +1170,38 @@ void syncStockToMobius() {
 
   String con;
   serializeJson(doc, con);
-  postToMobius(CNT_STOCK_NAME, con, "cnt_stock 동기화");
+  stockSyncPending = !postToMobius(CNT_STOCK_NAME, con, "cnt_stock 동기화");
+  if (stockSyncPending) Serial.println("[RETRY] cnt_stock 실패 - 최신 재고로 재시도 예정");
+}
+
+// cnt_stock 재동기화. 실패했을 때만 주기적으로 최신 재고를 다시 쏜다 (RAM 플래그).
+void serviceStockRetry() {
+  static unsigned long lastTry = 0;
+  if (!stockSyncPending) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (millis() - lastTry < MOBIUS_RETRY_INTERVAL_MS) return;
+  lastTry = millis();
+  syncStockToMobius();
 }
 
 // ==================================================
 // 13. MQTT 수신 처리 (파싱 + 큐 적재만. 실제 작업은 loop()에서)
 // ==================================================
+
+// 주문 유효성 검증. 미정의 글자/색상이 하나라도 있으면 사유 코드를 돌려준다 (없으면 nullptr).
+// 배출을 시작한 뒤 partial로 무는 것보다, 큐에 넣기 전에 통째로 거절하는 쪽이 부작용이 없다.
+const char* validateOrder(const PendingOrder& o) {
+  if (o.keycap.length() == 0) return "invalid_letter";
+  for (unsigned int i = 0; i < o.keycap.length(); i++) {
+    if (letterToStorage(o.keycap.charAt(i)) < 0) return "invalid_letter";
+  }
+  if (o.colorsStr.length() < o.keycap.length()) return "invalid_color";
+  for (unsigned int i = 0; i < o.keycap.length(); i++) {
+    if (colorToIndex(o.colorsStr.charAt(i)) < 0) return "invalid_color";
+  }
+  if (o.boardColor.length() > 0 && colorToIndex(o.boardColor.charAt(0)) < 0) return "invalid_board";
+  return nullptr;
+}
 
 void processOrder(const String& conData) {
   StaticJsonDocument<512> doc;
@@ -1095,8 +1229,22 @@ void processOrder(const String& conData) {
   Serial.println();
   Serial.println("[ORDER] " + o.orderId + " | keycap=" + o.keycap + " | colors=" + o.colorsStr + " | board=" + o.boardColor);
 
+  // 미정의 글자/색상은 배출 시작 전에 통째로 거절한다.
+  // 조용히 스킵하면 일부만 배출하고 done으로 오보되는 사고가 난다.
+  const char* invalid = validateOrder(o);
+  if (invalid) {
+    Serial.println("[ORDER] " + o.orderId + " 검증 실패 (" + invalid + ") - 주문 거절");
+    recentOrderIds.remember(o.orderId);   // QoS1 재전송으로 같은 오류 주문을 반복 보고하지 않게
+    notifyDispenseStatus(o.orderId, DISPENSE_FAIL_STATUS, invalid);
+    saveRuntimeState();
+    return;
+  }
+
   if (!orderQueue.push(o)) {
-    Serial.println("[QUEUE] 큐가 가득 참 - 주문 " + o.orderId + " 유실, 확인 필요");
+    Serial.println("[QUEUE] 큐가 가득 참 - 주문 " + o.orderId + " 수용 불가");
+    recentOrderIds.remember(o.orderId);
+    notifyDispenseStatus(o.orderId, DISPENSE_FAIL_STATUS, "queue_full");
+    saveRuntimeState();
     return;
   }
   Serial.println("[QUEUE] " + o.orderId + " 대기열에 추가 (현재 대기: " + String(orderQueue.count) + "개)");
@@ -1139,11 +1287,50 @@ void processLoadConfirmation(const String& conData) {
 
   if (dispatchState == DISPATCH_WAITING_LOAD) {
     dispatchState = DISPATCH_IDLE;
+    waitingSince  = 0;
     Serial.println("[LOAD] 대기 해제 - 다음 주문 진행 가능");
   } else {
     Serial.println("[LOAD] AGV 대기 상태가 아닌데 cnt_load 수신 - 무시 (순서 확인 필요)");
   }
   saveRuntimeState();
+}
+
+// 원격/시리얼 복구 명령 공용 처리. 상태 전환은 사람이 명령을 줄 때만 일어난다.
+void handleControlCommand(const String& cmd) {
+  if (cmd == "SKIPLOAD" || cmd == "SKIP_LOAD") {
+    if (dispatchState == DISPATCH_WAITING_LOAD) {
+      dispatchState = DISPATCH_IDLE;
+      waitingSince  = 0;
+      Serial.println("[CMD] skip_load - AGV 대기 강제 해제, 다음 주문 진행");
+      saveRuntimeState();
+    } else {
+      Serial.println("[CMD] skip_load 무시 - AGV 대기 상태가 아님");
+    }
+  } else if (cmd == "RESUME") {
+    if (dispatchState == DISPATCH_NEEDS_CONFIRM) {
+      dispatchState = DISPATCH_IDLE;
+      waitingSince  = 0;
+      currentOrderId = "";
+      Serial.println("[CMD] resume - 재부팅 복구 확인 완료, 큐 재개");
+      saveRuntimeState();
+    } else {
+      Serial.println("[CMD] resume 무시 - 복구 확인 대기 상태가 아님");
+    }
+  } else {
+    Serial.println("[CMD] 알 수 없는 명령: " + cmd + " (skip_load / resume)");
+  }
+}
+
+// MQTT warehouse/cmd: {"cmd":"skip_load"} 또는 {"cmd":"resume"}
+void processControlCommand(const String& conData) {
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, conData)) {
+    Serial.println("[CMD] 명령 파싱 실패");
+    return;
+  }
+  String cmd = doc["cmd"] | "";
+  cmd.toUpperCase();
+  handleControlCommand(cmd);
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -1158,6 +1345,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if      (topicStr == MQTT_TOPIC)         processOrder(message);
   else if (topicStr == MQTT_REPLACE_TOPIC) processReplaceRequest(message);
   else if (topicStr == MQTT_LOAD_TOPIC)    processLoadConfirmation(message);
+  else if (topicStr == MQTT_CMD_TOPIC)     processControlCommand(message);
   else Serial.println("[MQTT] 알 수 없는 토픽, 무시");
 }
 
@@ -1244,7 +1432,9 @@ bool tryConnectMQTT() {
   mqttClient.subscribe(MQTT_TOPIC);
   mqttClient.subscribe(MQTT_REPLACE_TOPIC);
   mqttClient.subscribe(MQTT_LOAD_TOPIC);
-  Serial.println("[MQTT] 구독 시작: " + String(MQTT_TOPIC) + ", " + MQTT_REPLACE_TOPIC + ", " + MQTT_LOAD_TOPIC);
+  mqttClient.subscribe(MQTT_CMD_TOPIC);
+  Serial.println("[MQTT] 구독 시작: " + String(MQTT_TOPIC) + ", " + MQTT_REPLACE_TOPIC + ", " +
+                 MQTT_LOAD_TOPIC + ", " + MQTT_CMD_TOPIC);
   return true;
 }
 
@@ -1271,7 +1461,7 @@ void ensureMQTT() {
 }
 
 // ==================================================
-// 15. 시리얼 명령 (STATUS / TEST E|I|N|S / FACTORYRESET)
+// 15. 시리얼 명령 (STATUS / TEST / SKIPLOAD / RESUME / FACTORYRESET)
 // ==================================================
 
 void printStorageStatus() {
@@ -1288,22 +1478,30 @@ void printStorageStatus() {
   }
 }
 
+const char* dispatchStateName() {
+  switch (dispatchState) {
+    case DISPATCH_RUNNING:
+      return (dispatchPhase == PHASE_DISPENSE) ? "배출 단계 진행 중" : "픽업 단계 진행 중";
+    case DISPATCH_WAITING_LOAD:  return "AGV cnt_load 대기";
+    case DISPATCH_NEEDS_CONFIRM: return "재부팅 복구 확인 대기 (RESUME 필요)";
+    default:                     return "대기";
+  }
+}
+
 void printSystemStatus() {
   printStorageStatus();
   printStock();
   Serial.println("현재 주문: " + (currentOrderId.length() > 0 ? currentOrderId : "(없음)"));
-  String stateStr = "대기";
-  if (dispatchState == DISPATCH_RUNNING) {
-    stateStr = (dispatchPhase == PHASE_DISPENSE) ? "배출 단계 진행 중" : "픽업 단계 진행 중";
-  }
-  Serial.println("배출 상태: " + stateStr);
+  Serial.println("배출 상태: " + String(dispatchStateName()));
   Serial.println("MQTT 연결: " + String(mqttClient.connected() ? "연결됨" : "끊김"));
-  Serial.println("AGV cnt_load 대기 중: " + String(dispatchState == DISPATCH_WAITING_LOAD ? "예" : "아니오"));
   Serial.println("대기열(큐)에 쌓인 주문: " + String(orderQueue.count) + "개");
   Serial.println("대기 중인 교체 요청: " + String(replaceQueue.count) + "개");
+  Serial.println("cnt_dispense 재전송 대기: " + String(dispenseRetryQueue.count) + "건");
+  Serial.println("cnt_stock 재동기화 대기: " + String(stockSyncPending ? "예" : "아니오"));
   Serial.println("NVS 스키마 버전: " + String(prefs.getInt("schema", 0)));
   Serial.println("NVS 여유 엔트리: " + String(prefs.freeEntries()));
   Serial.println("Free heap: " + String(ESP.getFreeHeap()) + " bytes");
+  Serial.println("loop 태스크 스택 여유: " + String(uxTaskGetStackHighWaterMark(NULL)) + " bytes");
 }
 
 // 재고를 건드리지 않고 실물만 배출한다. job_id에 millis()를 섞어 멱등 캐시에 걸리지 않게 한다.
@@ -1343,6 +1541,8 @@ void checkSerialCommand() {
 
   if (input == "STATUS") {
     printSystemStatus();
+  } else if (input == "SKIPLOAD" || input == "RESUME") {
+    handleControlCommand(input);
   } else if (input == "FACTORYRESET") {
     if (running) Serial.println("[NVS] 배출 진행 중에는 초기화할 수 없음");
     else factoryReset();
@@ -1350,7 +1550,7 @@ void checkSerialCommand() {
     if (running) Serial.println("[TEST] 배출 진행 중에는 테스트 명령을 실행하지 않음");
     else runTestDispense(input.charAt(5));
   } else {
-    Serial.println("[SYSTEM] 사용 가능: STATUS, TEST E, TEST I, TEST N, TEST S, FACTORYRESET");
+    Serial.println("[SYSTEM] 사용 가능: STATUS, TEST E/I/N/S, SKIPLOAD, RESUME, FACTORYRESET");
   }
 }
 
@@ -1366,6 +1566,10 @@ void initRobotArmPins() {
   for (int a = 0; a < NUM_ARMS; a++) pinMode(robotArms[a].donePin, INPUT);
   Serial.println("[ARM] GPIO 초기화 완료 (START 5개 / DONE 3개)");
 }
+
+// Mobius HTTPS + MQTT TLS가 전부 메인 루프 태스크에서 돌기 때문에
+// 기본 8192B로는 부족할 수 있다 (랜덤 리셋의 유력 원인).
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 void setup() {
   Serial.begin(115200);
@@ -1391,8 +1595,9 @@ void setup() {
   printStorageStatus();
   Serial.println("[SYSTEM] MQTT 구독 기반 주문 수신 - 36레일(색상 반영) 구조, AGV cnt_load 큐 방식");
   Serial.println("[SYSTEM] 배출: 전 레일 동시 배출 -> 즉시 cnt_stock -> 로봇암 픽업. 하나라도 실패 시 주문 중단");
-  Serial.println("[SYSTEM] MQTT는 TLS 인증서 검증 적용 (HiveMQ 루트 CA)");
-  Serial.println("[SYSTEM] 명령: STATUS, TEST E/I/N/S, FACTORYRESET");
+  Serial.println("[SYSTEM] cnt_dispense는 NVS 재전송 큐, cnt_stock은 최신값 재동기화로 유실 방어");
+  Serial.println("[SYSTEM] 원격 명령: " + String(MQTT_CMD_TOPIC) + " {\"cmd\":\"skip_load\"|\"resume\"}");
+  Serial.println("[SYSTEM] 명령: STATUS, TEST E/I/N/S, SKIPLOAD, RESUME, FACTORYRESET");
 }
 
 void loop() {
@@ -1401,5 +1606,7 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED) ensureMQTT();
   serviceDispatch();
   serviceReplaceQueue();
+  serviceDispenseRetry();
+  serviceStockRetry();
   delay(10);
 }
