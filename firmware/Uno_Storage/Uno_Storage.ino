@@ -1,50 +1,47 @@
 #include "config.h"
 #include <WiFiS3.h>
-#include <Wire.h>
-#include <Adafruit_PWMServoDriver.h>
+#include <Servo.h>
 
 // ==================================================
 // 스마트 창고 - 선반 아두이노 (R4 WiFi)
 // ==================================================
 // 아두이노 5대, 선반(storage)당 1대.
-//   storage 0~3 (EI/NS/FT/JP): 레일 8개 -> PCA9685 채널 0~7
-//   storage 4   (board)      : 레일 4개 -> PCA9685 채널 0~3
-//   rail 번호 = PCA9685 채널 번호 (1:1 대응)
+//   storage 0~3 (EI/NS/FT/JP): 레일 8개
+//   storage 4   (board)      : 레일 4개
+//   rail 번호 = servoPins[] 배열의 인덱스 (그 레일 서보가 물린 실제 핀)
 //
-// [2026-08-27 변경 사항]
-//  - 이중 스토퍼(레일당 서보 2개) 폐기 -> 단일 푸셔(레일당 서보 1개)
-//  - 파라미터명 floor -> storage_id (플랫폼팀 확정 명칭)
-//  - job_id 기반 멱등 처리 추가: 같은 job_id 재요청 시 실제 배출 없이 이전 결과만 응답
-//    (ESP32가 타임아웃 후 안전하게 재시도할 수 있게 하기 위함)
-//  - 실패 시 HTTP 500 반환 (기존에는 실패해도 200이라 ESP32가 성공으로 오인)
-//  - 응답을 JSON으로 통일
-//  - 로봇암 트리거는 아두이노가 하지 않는다 (ESP32가 GPIO로 직접 처리)
-//    로봇암 1대가 선반 여러 개를 커버해서, 아두이노 여러 대가 같은 Magic Box 핀에
-//    물리면 출력끼리 충돌하기 때문. 아두이노는 순수 서보 배출만 담당한다.
-//  - Wi-Fi 비밀값을 config.h로 분리 (.gitignore 필수)
+// [2026-09-02 변경 사항 - 서보 구동 방식 교체]
+//  - PCA9685(I2C, Adafruit_PWMServoDriver) 방식 폐기
+//    -> 실기 테스트로 동작이 확인된 표준 Servo 라이브러리 + GPIO 직결 방식으로 전환
+//  - 레일당 PUSH_OUT/PUSH_IDLE 각도 왕복 방식 폐기
+//    -> 0도 -> 180도 풀 스윕 방식으로 교체 (1도씩 15ms 간격, 실기 테스트값)
+//  - Wire / Adafruit_PWMServoDriver 의존성 제거
+//  - 통신(WiFi/HTTP), job_id 멱등 처리, JSON 응답 로직은 기존 구조 그대로 유지
+//  - 배출은 HTTP /dispense 요청으로만 트리거됨 (버튼 관련 코드 없음)
 // ==================================================
 
 WiFiServer server(80);
-Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
-// PCA9685 펄스 범위 (SG90 계열 기준, 실측 후 조정)
-const int SERVO_MIN = 102;   // 0도
-const int SERVO_MAX = 512;   // 180도
+// ---- 레일 <-> 실제 서보 신호핀 매핑 ----
+// !! 반드시 실제 배선에 맞게 이 배열만 수정하세요 !!
+// 인덱스 = rail 번호, 값 = 그 레일 서보가 연결된 디지털 핀 번호
+// (rail 0 = pin 9만 실측값이고, 나머지는 임시값입니다)
+const int servoPins[8] = { 9, 10, 11, 12, 13, A0, A1, A2 };
 
-// 레일별 각도 보정값. 특정 레일이 덜 밀리거나 과하게 밀리면 여기만 조정.
-// (인덱스 = rail 번호, 단위 = 도)
-int railAngleOffset[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+Servo servos[8];
+
+// 0 -> 180도 스윕 시 1도 이동할 때마다 대기하는 시간 (실기 테스트로 확인된 값)
+const int SWEEP_STEP_DELAY_MS = 15;
 
 int railCountOfThisBoard() {
   return (MY_STORAGE_ID == 4) ? 4 : 8;
 }
 
 // ==================================================
-// 멱등 처리 (job_id 중복 방어)
+// 멱등 처리 (job_id 중복 방어) - 기존 로직 그대로
 // ==================================================
 // ESP32가 응답 타임아웃 후 같은 job_id로 재시도할 수 있다.
 // 이미 처리한 job_id면 서보를 다시 돌리지 않고 이전 결과만 돌려준다.
-// -> "응답만 유실됐는데 실물이 두 개 나가는" 사고를 막는 핵심 장치.
 
 const int JOB_HISTORY_SIZE = 10;
 
@@ -60,24 +57,37 @@ int findJob(const String& id) {
   return -1;
 }
 
-void rememberJob(const String& id, bool ok) {
+void rememberJob(const String& id, bool success) {
   if (id.length() == 0) return;
   jobIds[jobHistoryIdx] = id;
-  jobResults[jobHistoryIdx] = ok;
+  jobResults[jobHistoryIdx] = success;
   jobHistoryIdx = (jobHistoryIdx + 1) % JOB_HISTORY_SIZE;
 }
 
 // ==================================================
-// 서보 제어
+// 서보 제어 (실기 테스트로 확인된 방식: 0 -> 180도 풀 스윕)
 // ==================================================
 
-void setServoAngle(int channel, int angle) {
-  angle = constrain(angle, 0, 180);
-  int pulse = map(angle, 0, 180, SERVO_MIN, SERVO_MAX);
-  pwm.setPWM(channel, 0, pulse);
+// 복귀(0도로 되돌아가는) 동작 후 실제로 0도에 도달할 때까지 기다려주는 시간.
+// 스텝 없이 한 번에 명령을 보내므로 서보 자체 최고 속도로 움직인다.
+// 기구 저항 때문에 0도까지 못 미치고 배출 스윕이 시작되면 이 값을 늘리고,
+// 이미 충분히 빠르면 줄여서 전체 사이클 시간을 단축하면 된다.
+const int RETURN_DELAY_MS = 400;
+
+void sweepRail(int rail) {
+  Servo& s = servos[rail];
+
+  // 복귀: 현재 위치가 어디든 0도로 한 번에 명령 (스텝 없이 최고 속도로 이동)
+  s.write(0);
+  delay(RETURN_DELAY_MS);
+
+  // 배출: 0 -> 180도, 1도씩 천천히 (실기 테스트로 확인된 속도, 그대로 유지)
+  for (int pos = 0; pos <= 180; pos++) {
+    s.write(pos);
+    delay(SWEEP_STEP_DELAY_MS);
+  }
 }
 
-// 단일 푸셔: 밀어냄 -> 원위치. 맨 아래 1개만 배출된다.
 bool dispenseRail(int rail) {
   if (rail < 0 || rail >= railCountOfThisBoard()) {
     Serial.println("   !! rail " + String(rail) + " 는 이 보드(storage " + String(MY_STORAGE_ID) + ") 범위 밖");
@@ -88,21 +98,15 @@ bool dispenseRail(int rail) {
     return false;
   }
 
-  int offset = (rail < 8) ? railAngleOffset[rail] : 0;
-
-  setServoAngle(rail, PUSH_OUT_ANGLE + offset);
-  Serial.println("   STEP1: 푸셔 밀어냄 (ch" + String(rail) + ", " + String(PUSH_OUT_ANGLE + offset) + "도)");
-  delay(PUSH_HOLD_MS);
-
-  setServoAngle(rail, PUSH_IDLE_ANGLE);
-  Serial.println("   STEP2: 푸셔 복귀");
-  delay(PUSH_RETURN_MS);
+  Serial.println("   STEP: 서보 스윕 시작 (rail " + String(rail) + ", pin " + String(servoPins[rail]) + ")");
+  sweepRail(rail);
+  Serial.println("   STEP: 서보 스윕 완료");
 
   return true;
 }
 
 // ==================================================
-// HTTP 파라미터 파싱
+// HTTP 파라미터 파싱 - 기존 로직 그대로
 // ==================================================
 
 String getParamValue(const String& request, const String& key) {
@@ -137,17 +141,16 @@ void sendJson(WiFiClient& client, int statusCode, const String& body) {
 void setup() {
   Serial.begin(9600);
 
-  Wire.begin();
-  pwm.begin();
-  pwm.setPWMFreq(50);
-  delay(300);
-
-  // 배선된 레일 전부 초기 위치(푸셔 후퇴)로
+  // 배선된 레일 전부 서보 attach만 하고, 각도는 쓰지 않는다.
+  // (write()를 호출해야 실제로 펄스가 나가서 서보가 움직이므로, attach()만 하면
+  //  업로드/재부팅해도 서보가 저절로 안 움직인다 - 첫 배출 요청이 와야 비로소 움직임)
+  // attach()에 펄스 범위(500~2500us)를 넓게 줘서, 서보 스펙상 0~180도보다
+  // 실제로 조금 더 넓게 움직이게 한다 (푸셔가 부품을 끝까지 밀어내지 못하는 문제 대응).
+  // 서보마다 기계적 한계가 있어 여기까지 넓혀도 안 움직이면 그게 진짜 물리적 한계다.
   for (int r = 0; r < WIRED_RAIL_COUNT && r < railCountOfThisBoard(); r++) {
-    setServoAngle(r, PUSH_IDLE_ANGLE);
-    delay(200);
+    servos[r].attach(servoPins[r], 500, 2500);
   }
-  Serial.println("서보 초기 위치 설정 완료 (배선 " + String(WIRED_RAIL_COUNT) + "개)");
+  Serial.println("서보 attach 완료 (배선 " + String(WIRED_RAIL_COUNT) + "개, 첫 배출 요청 전까지는 움직이지 않음)");
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("WiFi 연결 중");
@@ -156,7 +159,21 @@ void setup() {
     Serial.print(".");
   }
   Serial.println();
-  Serial.println("WiFi 연결됨");
+  Serial.println("WiFi 연결됨 (연결 상태만 확인됨, IP는 아직 못 받았을 수 있음)");
+
+  // R4 WiFi는 WL_CONNECTED가 뜬 직후에도 DHCP로 실제 IP를 아직 못 받은 경우가 있다.
+  // localIP()가 0.0.0.0이 아닐 때까지 최대 10초 더 기다린다.
+  Serial.print("IP 할당 대기 중");
+  unsigned long ipWaitStart = millis();
+  while (WiFi.localIP() == IPAddress(0, 0, 0, 0) && millis() - ipWaitStart < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+    Serial.println("!! 10초 지나도 IP를 못 받음 - 공유기 DHCP 상태 확인 필요");
+  }
   Serial.print("이 보드의 IP: ");
   Serial.println(WiFi.localIP());
   Serial.println("담당 storage_id: " + String(MY_STORAGE_ID) +
@@ -214,10 +231,10 @@ void loop() {
   }
 
   // --- 실제 배출 + 로봇암 픽업 ---
-  bool ok = dispenseRail(rail);
-  rememberJob(jobId, ok);
+  bool success = dispenseRail(rail);
+  rememberJob(jobId, success);
 
-  if (ok) {
+  if (success) {
     Serial.println(">> 배출 완료");
     sendJson(client, 200,
              "{\"job_id\":\"" + jobId + "\",\"result\":\"success\",\"cached\":false,\"rail\":" +
