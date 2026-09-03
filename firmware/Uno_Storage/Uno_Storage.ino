@@ -31,8 +31,7 @@ const int servoPins[8] = { 9, 10, 11, 12, 13, A0, A1, A2 };
 Servo servos[8];
 
 // 0 -> 180도 스윕 시 1도 이동할 때마다 대기하는 시간 (실기 테스트로 확인된 값)
-const int SWEEP_STEP_DELAY_MS = 15;
-
+const int SWEEP_STEP_DELAY_MS =
 int railCountOfThisBoard() {
   return (MY_STORAGE_ID == 4) ? 4 : 8;
 }
