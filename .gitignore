@@ -1,12 +1,12 @@
-# 가상환경
-venv/
-
-# 로컬 비밀값
+# 비밀값
+config.h
 .env
 
-# ESP32 config.h - Mobius API 키, WiFi 비밀번호, MQTT 비밀번호 전부 평문으로 있음
-config.h
-
-# Python 캐시
+# 빌드/캐시
+*.o
 __pycache__/
 *.pyc
+.DS_Store
+
+# IDE
+.vscode/
