@@ -30,6 +30,12 @@ git checkout -b <본인이름>
 
 ## 작업 중 수정 후 업데이트하는 방법
 
+먼저 로컬에 클론해둔 저장소 폴더로 이동 (Git Bash 새로 켰거나 다른 폴더에 있었다면 필수):
+
+```bash
+cd 저장소_클론한_경로/warehouse-team
+```
+
 파일 수정할 때마다 아래 3단계 반복하면 됨.
 
 ```bash
@@ -55,6 +61,8 @@ git push -u origin <본인이름>
 ## 다른 사람이 main에 올린 최신 내용 받아오기
 
 ```bash
+cd 저장소_클론한_경로/warehouse-team
+
 git checkout main
 git pull
 
