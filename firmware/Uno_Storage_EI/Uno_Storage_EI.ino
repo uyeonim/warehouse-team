@@ -4,123 +4,97 @@
   ================================================================================
   역할
    1) HiveMQ Cloud(MQTT, TLS)에 직접 연결해서 "sjuiot/warehouse/process" 구독
-      (주문 push는 MQTT 한 방향으로만 옴: Mobius -> Flask 웹훅 -> MQTT publish)
+      (주문/재고보충 push는 MQTT 한 방향으로만 옴: Mobius -> Flask 웹훅 -> MQTT publish.
+       Flask(/notify/process)는 con 내용을 파싱하지 않고 그대로 relay만 하므로,
+       orders/restock 파싱과 그에 따른 후속 HTTP 호출은 전부 이 아두이노가 직접 함)
    2) status == "assigned" 인 주문에서, 내 축(keycap 문자열의 AXIS_INDEX 위치)
-      글자와 그 위치의 색상을 뽑아냄
-      예) keycap:"ESFJ", colors:["r","y","b","g"] 이고 내가 EI(index 0) 보드면
-          -> letter='E', color='r'  => "E_r" 레일 담당
-   3) 해당 레일 상태를 busy로 Flask에 HTTPS POST -> 서보로 배출 -> IR센서로 배출 확인
-   4) 배출 결과 보고는 MQTT가 아니라 Flask에 HTTPS POST (짧게 연결->전송->종료)
-      - 성공했을 때만 /report/keycap-dispense 호출
-      - 성공/실패 관계없이 /report/keycap-status는 항상 호출 (성공: idle/empty, 실패: disable)
-   5) Flask가 이 보고를 받아서 Mobius에 CIN 업로드 (아두이노는 Mobius를 직접 모름)
+      글자와 그 위치의 색상을 뽑아서 로컬 큐 + 서버 큐(Redis) 양쪽에 적재
+   3) 배출은 반드시 "직전에 우리가 배출한 주문이 keycap_packed 상태가 될 때까지"
+      대기했다가 순서대로 진행 (로봇암/컨베이어가 1대뿐이라 동시 진행 불가)
+   4) 배출 성공/실패는 IR센서로 판정, 성공 시에만 dispense 이벤트 보고
+   5) 재고는 Redis가 원본(source of truth). 아두이노 로컬 count는
+      "즉각 empty 판단용 캐시"일 뿐 - 부팅 시 서버에서 조회해서 채움
+   6) restock(카트리지 재고보충)도 cnt_process의 restock 배열에서 직접 감지해서
+      서버에 알리고, 서버가 계산한 채워진 개수를 응답받아 로컬 count 동기화
+
+  ============================== 통신 대상 (Flask) ==============================
+   GET  /stock/keycap?board=EI         부팅 시 재고 8칸 초기 조회
+   GET  /queue/EI/next                 부팅 시 미완료 큐 복원
+   POST /queue/EI/enqueue              새 주문 감지 시 서버 큐에도 적재
+   POST /queue/EI/complete             배출 성공 후 서버 큐에서 제거
+   POST /restock/{letter}/{color}      restock 감지 시 호출, 채워진 개수 응답받음
+   POST /report/keycap-status          기존 그대로 (상태 보고, 성공/실패 무관 항상)
+   POST /report/keycap-dispense        기존 그대로 (배출 성공했을 때만)
+
+  ※ 위 신규 라우트(/stock, /queue/*, /restock/*)는 이번에 새로 정의한 스펙이라
+    Flask 쪽 실제 응답 형식과 어긋나면 즉시 팀원과 맞춰서 파싱부만 고칠 것.
+    이 코드가 가정하는 응답 형식은 각 함수 주석에 명시해둠.
 
   [2026-09-06 변경 사항 - 서보 배출 동작을 0~90도 점프 -> 0~180도 풀 스윕으로 교체]
    - 실물 테스트 결과 0~90도 점프 방식은 디스펜서가 부품을 끝까지 밀어내지 못함
      (각도 부족) -> 구버전(ESP32/Uno_Storage.ino 시절) 검증된 "0->180도, 1도씩
-     천천히 스윕" 방식으로 교체
-   - 단, delay()로 블로킹하면 그 몇 초 동안 mqttClient.loop()가 안 돌아 MQTT
-     연결이 끊길 위험이 있으므로, 스윕 전체를 상태머신에 편입해 millis() 기준
-     non-blocking으로 처리함 (delay() 호출 없음)
-   - 복귀(180->0 또는 최초 0도 이동)는 구버전과 동일하게 스텝 없이 한 번에 점프
-   - SWEEP_STEP_DELAY_MS(1도당 대기시간)는 구버전 실기 테스트값 15ms를 기본값으로
-     둠 -> 실물로 배출 성공률/속도 확인 후 필요시 조정
-
-  [여러 차례 시도했던 "대기각/스윕시작각 분리 + 복귀도 스텝화" 버전은 롤백함]
-   - 대기 위치를 뒤로 젖히면서(SERVO_HOME_ANGLE=90) 동시에 0~180도 풀 폭을
-     쓰려고 대기각<->스윕시작각을 분리했더니, 매 사이클마다 여분의 이동이
-     하나 더 생겨서 "한 번 더 도는" 것처럼 느껴지는 부작용이 있었음.
-   - 실기 테스트 결과 이 단순 버전(90->180 단일 스윕 + 점프 복귀)이 체감상
-     더 낫다고 판단 -> 이 구조를 기준으로 되돌리고, 아래 스티션(정지마찰)
-     문제만 별도로 해결함.
+     천천히 스윕" 방식으로 교체. delay() 없이 millis() 기준 non-blocking 처리.
 
   [2026-09-07 스티션(정지마찰) 대응 - 스윕 시작 시 breakaway kick 추가]
-   - 증상: 스윕 시작하자마자 제자리에서 부르르 떨다가(=스티션과 씨름) 한쪽
-     방향으로 스무스하게 풀려나감.
-   - 원인: 1도씩 미세하게 명령을 올리면 서보 위치제어 루프가 인식하는 오차가
-     작아서 출력 토크도 작음 -> 정지마찰을 넘길 만큼의 토크가 안 나와서
-     제자리에 머무름 -> 이후 스텝들이 계속 쌓이면서(오차 누적) 토크도 같이
-     누적되다가, 마찰을 넘어서는 순간 누적된 만큼 한꺼번에 튀어나가는
-     현상 (겉보기엔 "부르르 떨다가 훅 풀림"으로 보임).
-   - 해결: DS_HOMING -> DS_SWEEPING 전환 시, 1도씩 올리지 않고 먼저
-     BREAKAWAY_KICK_DEG(기본 4도)만큼 한 번에 점프시켜 마찰을 깔끔하게
-     넘긴 뒤(BREAKAWAY_SETTLE_MS만큼 짧게 대기), 그 지점부터 기존과 동일하게
-     1도씩 천천히 스윕을 이어감. 새 상태 DS_BREAKAWAY_WAIT 추가.
-   - 주의: 킥 이후에도 여전히 떨림이 남아있다면 (a) BREAKAWAY_KICK_DEG를
-     조금씩 올려보고, 그래도 안 되면 (b) 레일에 부품을 넣지 않은 무부하
-     상태로도 같은 증상이 나는지 확인할 것. 무부하에서도 떨리면 이건
-     소프트웨어가 아니라 전원(전압 강하)이나 기구적 간섭/마찰 문제일
-     가능성이 높음.
+   - 1도씩 미세하게 명령을 올리면 정지마찰을 넘길 토크가 안 나와서 제자리에서
+     떨다가 누적된 힘이 한꺼번에 터지는 현상 -> 스윕 시작 시 BREAKAWAY_KICK_DEG
+     만큼 한 번에 점프시켜 마찰을 먼저 넘긴 뒤 1도씩 스윕 이어감.
 
   [2026-09-07 seq 비교를 정수 -> 문자열로 변경]
-   - 증상: Postman 테스트용 seq를 Date.now() 등 13자리 큰 숫자로 만들면
-     아두이노가 새 주문을 아예 인식 못 함 (mqttCallback 진입 로그조차 안 뜸).
-   - 원인: doc["seq"]를 long/long long 정수로 파싱하던 중 32비트 long
-     범위(약 21억, 10자리)를 넘는 값에서 ArduinoJson v6의 정수 처리가
-     깨짐. 실측으로 "9자리는 항상 성공, 10자리는 값에 따라 반반, 11자리
-     이상은 항상 실패"까지 확인함.
-   - 해결: seq를 정수로 받지 않고 처음부터 String으로 받아서 비교.
-     자릿수 제한이 사라지므로 플랫폼팀이 실제로 어떤 형식(카운터형이든
-     타임스탬프형이든)으로 seq를 만들어도 안전함.
+   - doc["seq"]를 long/long long 정수로 파싱 시 32비트 long 범위(10자리)를 넘는
+     값에서 ArduinoJson v6 정수 처리가 깨지는 문제 확인 -> String으로 받아서 비교,
+     자릿수 제한 없앰.
 
-  [2026-09-07 재고 영속화 추가 - Preferences(NVS급 플래시 저장) 사용]
-   - 배경: 이전까지는 rail[][].count가 RAM에만 있어서, 아두이노가
-     재부팅(리셋/정전/재업로드)되면 재고가 INITIAL_COUNT(8)로 초기화되고
-     실제 남은 재고와 어긋남.
-   - 결정 배경: 재고 계산의 동시성 문제(레이스 컨디션)는 플랫폼이 이전
-     주문의 배출 완료 신호를 확인한 뒤에만 다음 주문을 cnt_process에
-     올리는 순차 처리 구조라 애초에 발생하지 않는 것으로 확인됨. 즉
-     Redis 같은 원자적 카운터가 필요한 상황이 아니라서, 아두이노 자체
-     로컬 영속화(ESP32 시절 NVS와 동일한 개념)만으로 충분하다고 판단.
-   - 방식: R4 WiFi도 ESP32와 동일한 Preferences 라이브러리를 지원함.
-     부팅 시(setup) 저장된 값을 복원하고, 배출 성공으로 count가 바뀔
-     때마다 그 즉시 저장. 키는 "E_r" 같은 글자_색상 문자열 그대로 사용
-     (Preferences 키 길이 제한 15자 이내로 여유 있음).
-   - FACTORYRESET: 시리얼 모니터에 "FACTORYRESET" 입력 시 저장된 값을
-     지우고 INITIAL_COUNT로 되돌림 (카트리지 실물 교체 후 사용).
+  [2026-09-09 재고 관리를 Preferences(로컬 영속화) -> Redis(서버) 기반으로 전환]
+   - 배경: R4 WiFi의 Preferences 라이브러리가 실기에서 최초 접근 시 수 분 단위로
+     블로킹되는 문제가 발생, 원인 특정이 어려워 근본적으로 다른 방식으로 전환.
+   - 재고의 원본(source of truth)은 이제 Redis. 아두이노는 부팅 시 GET /stock/keycap
+     으로 값을 받아와 로컬 count에 채우고, 이후엔 배출/restock마다 서버와 동기화.
+   - 배출(차감)은 아두이노가 계산해서 서버에 보고(SET), restock(충전)은 서버가
+     계산해서 아두이노에 알려주는(응답값 반영) 반대 방향 흐름임에 주의.
+   - 큐(대기 주문 목록)도 서버(Redis)에 같이 적재해서, 재부팅 시 GET /queue/EI/next
+     로 미완료 목록을 복원함 (재부팅 시점에 진행 중이던 배출 자체는 유실되지만,
+     아직 시작 안 한 대기 주문은 복원됨).
 
-  주의: MQTT 연결(주문 수신용)을 계속 유지한 채로 매 배출마다 별도의
-  HTTPS 연결을 짧게 열었다 닫는 구조. Uno R4 WiFi(RA4M1, 32KB SRAM +
-  ESP32-S3 동반 모듈)에서 두 개의 TLS 세션을 "동시에" 유지하는 조합은
-  비슷한 아키텍처(WiFiNINA 계열)에서 불안정 사례가 보고된 적이 있으므로,
-  실제 배출 사이클 전체(주문 수신 중 HTTPS 보고 발생)를 초기에 반드시
-  하드웨어로 테스트해볼 것. 문제가 생기면 reportRailStatus/reportDispenseResult
-  호출 전후로 mqttClient.disconnect() / tryConnectMQTT() 로 감싸서 MQTT를
-  잠깐 끊었다 재연결하는 방식으로 바꿀 수 있음 (HiveMQ에 persistent session +
-  QoS1 구독이면 끊긴 동안의 주문 push도 재연결 시 유실 없이 받음).
+  [2026-09-09 keycap_packed 게이트 추가]
+   - 배경: 로봇암/컨베이어가 1대뿐이라, 우리가 배출을 마쳐도 그 결과물이
+     "keycap_packed" 상태(트레이에 실제로 담겨 다음 단계로 넘어감)가 되기 전에
+     다음 배출을 시작하면 안 됨.
+   - 방식: 배출 성공/실패 처리 직후 gateOrderId에 그 주문의 order_id를 기록하고
+     게이트를 잠금. 이후 수신하는 모든 cnt_process 스냅샷에서 그 order_id의
+     status가 "keycap_packed"이거나 orders 목록에서 아예 사라졌으면 게이트를 열어
+     다음 큐 항목을 진행함. 큐잉 순서 자체는 스냅샷에 등장한 순서를 그대로 따름.
+
+  [2026-09-09 restock/orders 중복 호출 방지]
+   - 같은 스냅샷이 재전송되는 경우는 seq로 이미 막혀있지만, "플랫폼이 처리 완료
+     표시를 아직 안 지운 상태로 여러 스냅샷에 걸쳐 같은 항목이 계속 남아있는 경우"
+     까지 막아야 서버에 같은 restock을 중복 호출하지 않음.
+   - orders는 기존 alreadyProcessed(order_id+letter+color 조합) 로직 그대로 재사용.
+   - restock은 별도로 "지금 이 스냅샷 restock 배열에 내 레일이 있는가"를 보고,
+     이전 스냅샷에서 이미 있었으면 스킵, 이번에 사라졌으면 다음 등장 시 다시
+     호출 가능하도록 in-progress 플래그로 관리함.
 
   다른 3개 보드(N/S, T/F, P/J)는 이 파일을 복사한 뒤
   "보드별 설정" 블록만 아래 표대로 바꿔서 각 보드에 업로드하면 됩니다.
 
   ------------------------------------------------------------------------------
-   보드      LETTER_0 / LETTER_1   AXIS_INDEX   MQTT_CLIENT_ID
+   보드      LETTER_0 / LETTER_1   AXIS_INDEX   MQTT_CLIENT_ID   BOARD_NAME
   ------------------------------------------------------------------------------
-   E/I       'E' / 'I'             0            "arduino_EI"
-   N/S       'N' / 'S'             1            "arduino_NS"
-   T/F       'T' / 'F'             2            "arduino_TF"
-   P/J       'P' / 'J'             3            "arduino_PJ"
+   E/I       'E' / 'I'             0            "arduino_EI"     "EI"
+   N/S       'N' / 'S'             1            "arduino_NS"     "NS"
+   T/F       'T' / 'F'             2            "arduino_TF"     "TF"
+   P/J       'P' / 'J'             3            "arduino_PJ"     "PJ"
   ------------------------------------------------------------------------------
 
   필요 라이브러리 (라이브러리 매니저에서 설치)
-   - WiFiS3            (Uno R4 보드 패키지 설치 시 자동 포함)
-   - PubSubClient       (Nick O'Leary) - 표준 라이브러리 사용, 컴파일 문제 시
-                         "pubsubclient_UnoR4" 포크로 교체
-   - ArduinoJson        (v6.21.x 기준으로 작성됨. v7 사용 시 StaticJsonDocument
-                         관련 문법 확인 필요)
-   - ArduinoHttpClient  (Arduino 공식) - Flask에 보고용 HTTPS POST 보낼 때 사용
-   - Adafruit PWM Servo Driver Library (+ 의존성 Adafruit BusIO)
-   - Preferences        (Uno R4 보드 패키지 설치 시 자동 포함, ESP32의 NVS와 동일 개념)
+   - WiFiS3, PubSubClient, ArduinoJson(v6), ArduinoHttpClient,
+     Adafruit PWM Servo Driver Library (+ Adafruit BusIO)
+   ※ Preferences 라이브러리는 더 이상 사용하지 않음 (위 변경사항 참고)
 
   하드웨어 관련 주의사항 (실측 후 반드시 조정)
-   - SERVO_MIN_PULSE / SERVO_MAX_PULSE : 서보 개체별로 다름
-   - SWEEP_STEP_DELAY_MS : 1도 이동마다 대기 시간, 너무 빠르면 부품이 안 밀리고
-     너무 느리면 전체 사이클이 늘어짐 (구버전 실기값 15ms 기본)
-   - BREAKAWAY_KICK_DEG / BREAKAWAY_SETTLE_MS : 시작 시 스티션을 넘기기 위한
-     초기 킥 각도/정착 대기시간. 킥이 너무 작으면 여전히 떨리고, 너무 크면
-     그 자체가 또 다른 "훅 튀는 동작"처럼 보일 수 있음 - 실측하며 조정
-   - IR_DETECT_LEVEL : 사용하는 IR 센서가 감지 시 HIGH/LOW 중 무엇을 주는지 확인
-   - IR_PIN 배열의 실제 배선 핀 번호
-   - PCA9685 I2C 주소가 0x40이 아니면 pwm 생성자 인자 수정
+   - SERVO_MIN_PULSE / SERVO_MAX_PULSE, SWEEP_STEP_DELAY_MS,
+     BREAKAWAY_KICK_DEG / BREAKAWAY_SETTLE_MS, IR_DETECT_LEVEL, IR_PIN,
+     PCA9685 I2C 주소(0x40 아니면 수정)
   ================================================================================
 */
 
@@ -130,7 +104,6 @@
 #include <ArduinoHttpClient.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
-#include <Preferences.h>
 #include "config.h"
 struct DispenseJob;
 
@@ -141,6 +114,7 @@ const char  LETTER_0            = 'E';
 const char  LETTER_1            = 'I';
 const uint8_t AXIS_INDEX        = 0;      // keycap 문자열에서의 내 축 위치 (E/I=0, N/S=1, T/F=2, P/J=3)
 const char* MQTT_CLIENT_ID      = "arduino_EI";
+const char* BOARD_NAME           = "EI";  // /queue/{board}/*, /stock/keycap?board=* 에 그대로 씀
 // ===========================================================================
 
 // ---- 색상 순서 (colors 배열/보드 내부 인덱싱과 동일 순서로 고정) ----
@@ -161,23 +135,19 @@ const uint8_t IR_PIN[2][4] = {
 // ---- 서보 동작 파라미터 (실측 후 조정) ----
 #define SERVO_MIN_PULSE       150
 #define SERVO_MAX_PULSE       600
-#define SERVO_HOME_ANGLE      90   // 실측 확정값. 대기 위치를 더 뒤로 젖히려고 0->90으로 변경함
-#define SWEEP_STEP_DELAY_MS   15    // 1도 이동마다 대기 (구버전 실기 테스트값, 다르면 교체)
-#define RETURN_DELAY_MS        400  // 복귀 명령(0도로 점프) 후 실제 도달까지 대기 (구버전값)
-#define DISPENSE_HOLD_MS       400  // 180도(완전 배출 위치) 도달 후 유지 시간
-#define IR_CHECK_DELAY_MS      250  // 복귀 후 IR 판정까지 대기
+#define SERVO_HOME_ANGLE       90   // 실측 확정값
+#define SWEEP_STEP_DELAY_MS    15   // 1도 이동마다 대기 (구버전 실기 테스트값)
+#define RETURN_DELAY_MS       400   // 복귀 명령 후 실제 도달까지 대기
+#define DISPENSE_HOLD_MS      400   // 180도(완전 배출) 도달 후 유지 시간
+#define IR_CHECK_DELAY_MS     250   // 복귀 후 IR 판정까지 대기
 #define IR_DETECT_LEVEL       LOW   // 센서가 "감지됨"일 때 주는 레벨 (실측 후 조정)
-#define BREAKAWAY_KICK_DEG      4   // 스윕 시작 시 정지마찰(스티션)을 한 번에 넘기기 위한 초기 킥 각도
-#define BREAKAWAY_SETTLE_MS    60   // 킥 이동 후 실제 도달까지 대기 (실측 후 조정)
+#define BREAKAWAY_KICK_DEG      4   // 스윕 시작 시 정지마찰을 넘기기 위한 초기 킥 각도
+#define BREAKAWAY_SETTLE_MS    60   // 킥 이동 후 실제 도달까지 대기
 
-// ---- 초기 재고 (Preferences에 저장된 값이 없을 때만 사용됨, 최초 1회 세팅용) ----
-const uint8_t INITIAL_COUNT = 8;
+// ---- 카트리지 최대 용량 (restock 시 이 값까지 채움, 전체 풀 부족하면 서버가 그보다 적게 응답) ----
+#define MAX_CAPACITY 30
 
-// ---- 재고 영속화 (Preferences, ESP32의 NVS와 동일 개념) ----
-Preferences prefs;
-const char* PREFS_NAMESPACE = "warehouse";
-
-// ---- 레일 상태 (부팅 시 Preferences에서 복원, 배출 성공마다 갱신+저장) ----
+// ---- 레일 상태 (부팅 시 서버에서 조회해서 채움, 배출/restock마다 서버와 동기화) ----
 enum RailStatus : uint8_t { RAIL_IDLE, RAIL_BUSY, RAIL_EMPTY, RAIL_DISABLE };
 struct RailState {
   uint8_t count;
@@ -186,55 +156,13 @@ struct RailState {
 };
 RailState rail[2][4]; // [글자슬롯][색상슬롯]
 
-// 레일 하나의 Preferences 키 문자열 생성 (예: "E_r")
-String railPrefsKey(int l, int c) {
-  char letter = (l == 0) ? LETTER_0 : LETTER_1;
-  char color = COLOR_LIST[c];
-  return String(letter) + "_" + String(color);
+char letterOf(int l) { return (l == 0) ? LETTER_0 : LETTER_1; }
+char colorOf(int c)  { return COLOR_LIST[c]; }
+String letterColorKey(int l, int c) {
+  return String(letterOf(l)) + "_" + String(colorOf(c));
 }
 
-// 부팅 시: 저장된 재고 복원. 저장된 값이 없으면(최초 1회) INITIAL_COUNT로 시작
-void loadStockFromPrefs() {
-  for (int l = 0; l < 2; l++) {
-    for (int c = 0; c < 4; c++) {
-      String key = railPrefsKey(l, c);
-      uint8_t count = prefs.getUChar(key.c_str(), INITIAL_COUNT);
-      rail[l][c].count = count;
-      rail[l][c].status = (count == 0) ? RAIL_EMPTY : RAIL_IDLE;
-    }
-  }
-}
-
-// 재고가 바뀔 때마다 즉시 해당 레일 값만 저장 (배출마다 1건이라 쓰기 부담 적음)
-void saveStockToPrefs(int l, int c) {
-  String key = railPrefsKey(l, c);
-  prefs.putUChar(key.c_str(), rail[l][c].count);
-}
-
-// 카트리지 실물 교체 후 시리얼로 "FACTORYRESET" 입력 시 호출됨
-void factoryResetStock() {
-  for (int l = 0; l < 2; l++) {
-    for (int c = 0; c < 4; c++) {
-      rail[l][c].count = INITIAL_COUNT;
-      rail[l][c].status = RAIL_IDLE;
-      saveStockToPrefs(l, c);
-    }
-  }
-  Serial.println("[NVS] 공장 초기화 완료 - 재고를 INITIAL_COUNT로 되돌림");
-}
-
-// 시리얼 명령 처리 (지금은 FACTORYRESET 하나만 지원)
-void checkSerialCommand() {
-  if (!Serial.available()) return;
-  String cmd = Serial.readStringUntil('\n');
-  cmd.trim();
-  if (cmd == "FACTORYRESET") {
-    factoryResetStock();
-  }
-}
-
-// ---- 최근 처리한 (주문,글자,색상) 조합 기록 -> 중복 배출 방지 ----
-// (동일 스냅샷 재전송, MQTT 중복 등으로 같은 assigned 를 두 번 받는 상황 대비)
+// ============================== 최근 처리한 주문 기록 (중복 배출 방지) ==============================
 #define ORDER_HISTORY_SIZE 8
 String processedJobKeys[ORDER_HISTORY_SIZE];
 uint8_t processedIdx = 0;
@@ -250,13 +178,19 @@ void markProcessed(const String& jobKey) {
   processedIdx = (processedIdx + 1) % ORDER_HISTORY_SIZE;
 }
 
-// ---- 배출 대기열 (동시에 여러 assigned 주문이 들어와도 순차 처리) ----
+// ============================== restock 중복 호출 방지 ==============================
+// 스냅샷마다 restock 배열에 우리 레일이 계속 남아있는 동안은 이미 호출한 것으로 취급.
+// 다음 스냅샷에서 그 레일이 배열에서 사라지면(=처리 완료로 플랫폼이 지움) 다시
+// 등장할 때 새 restock 이벤트로 인식해서 재호출 가능해짐.
+bool restockInProgress[2][4] = { {false, false, false, false}, {false, false, false, false} };
+
+// ============================== 배출 대기열 (로컬 캐시, 서버 큐와 동기화) ==============================
 struct DispenseJob {
   String orderId;
   char letter;
   char color;
 };
-#define JOB_QUEUE_SIZE 4
+#define JOB_QUEUE_SIZE 8
 DispenseJob jobQueue[JOB_QUEUE_SIZE];
 uint8_t jobHead = 0, jobTail = 0;
 
@@ -274,19 +208,18 @@ bool queuePop(DispenseJob& job) {
   return true;
 }
 
-// ---- 배출 상태 머신 ----
-// DS_HOMING        : 복귀(0도) 명령 후 실제 도달까지 대기
-// DS_BREAKAWAY_WAIT: 스윕 시작 전, 스티션을 넘기기 위한 초기 킥(BREAKAWAY_KICK_DEG)
-//                    이동 후 실제 도달까지 짧게 대기
-// DS_SWEEPING      : (홈+킥 각도)->180도, 1도씩 천천히 배출 스윕 (non-blocking)
-// DS_HOLDING       : 180도(완전 배출) 위치에서 잠깐 유지
-// DS_RETURNING     : 복귀(0도) 명령 후 IR 판정 전까지 대기
-// DS_WAIT_IR       : IR 센서로 배출 성공/실패 판정
+// ============================== keycap_packed 게이트 ==============================
+// gateOpen == true  : 다음 큐 항목을 시작해도 됨
+// gateOpen == false : gateOrderId가 keycap_packed 되기를 기다리는 중, 새 배출 시작 금지
+bool   gateOpen = true;
+String gateOrderId = "";
+
+// ============================== 배출 상태 머신 ==============================
 enum DispenseState { DS_IDLE, DS_HOMING, DS_BREAKAWAY_WAIT, DS_SWEEPING, DS_HOLDING, DS_RETURNING, DS_WAIT_IR };
 DispenseState dsState = DS_IDLE;
 DispenseJob   currentJob;
 unsigned long dsTimer = 0;
-int           sweepAngle = 0;   // 현재 진행 중인 스윕 각도 (0~180)
+int           sweepAngle = 0;
 
 // ---- 마지막으로 처리한 cnt_process 스냅샷 seq (문자열 비교, 자릿수 제한 없음) ----
 String lastSeqStr = "";
@@ -294,13 +227,13 @@ String lastSeqStr = "";
 // ---- 네트워크 / 하드웨어 객체 ----
 WiFiSSLClient wifiSSLClient;      // MQTT 전용 - 상시 연결 유지 (주문 수신)
 PubSubClient  mqttClient(wifiSSLClient);
-WiFiSSLClient httpSSLClient;      // Flask 보고 전용 - 배출할 때만 짧게 연결
+WiFiSSLClient httpSSLClient;      // Flask 보고/조회 전용 - 필요할 때만 짧게 연결
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
-// ---- MQTT 토픽 (주문 push 수신 전용, 확정된 이름) ----
+// ---- MQTT 토픽 ----
 const char* TOPIC_CNT_PROCESS = "sjuiot/warehouse/process";
 
-// ---- Flask(Cloud Run) 보고 엔드포인트 (아두이노 -> Flask -> Mobius CIN) ----
+// ---- Flask(Cloud Run) 엔드포인트 ----
 const char* REPORT_STATUS_PATH   = "/report/keycap-status";
 const char* REPORT_DISPENSE_PATH = "/report/keycap-dispense";
 
@@ -309,6 +242,9 @@ void ensureWiFi();
 void ensureMQTT();
 bool tryConnectMQTT();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
+void handleOrdersField(JsonObject orders);
+void handleRestockField(JsonArray restock);
+void checkGateAgainstOrders(JsonObject orders);
 void handleAssignedOrder(const String& orderId, const char* keycap, JsonArray colors);
 void runDispenseStateMachine();
 void moveServoAngle(uint8_t channel, uint8_t angle);
@@ -316,26 +252,32 @@ void reportRailStatus(char letter, char color, RailStatus status, const String& 
 void reportDispenseResult(const String& orderId, char letter, char color);
 int  letterSlot(char c);
 int  colorSlot(char c);
+bool postJsonToFlask(const char* path, const char* payload, String& responseOut);
+bool getJsonFromFlask(const char* path, String& responseOut);
+void fetchInitialStock();
+void restoreQueueFromServer();
+void enqueueToServer(const DispenseJob& job);
+void completeOnServer(const DispenseJob& job);
+void callRestock(int l, int c);
+void checkSerialCommand();
 
 // ============================== setup / loop ==============================
 void setup() {
   Serial.begin(115200);
-
-  // 재고 복원 (Preferences, ESP32 NVS와 동일 개념 - 재부팅해도 유지됨)
-  prefs.begin(PREFS_NAMESPACE, false);
-  loadStockFromPrefs();
+  delay(500);
 
   // IR 센서 핀 설정
   for (int l = 0; l < 2; l++) {
     for (int c = 0; c < 4; c++) {
       pinMode(IR_PIN[l][c], INPUT);
+      rail[l][c].status = RAIL_IDLE; // 서버 조회 전 임시값, fetchInitialStock()에서 덮어씀
     }
   }
 
   // PCA9685 초기화 및 전 채널 홈 포지션 이동
   Wire.begin();
   pwm.begin();
-  pwm.setPWMFreq(50); // 서보용 표준 주파수
+  pwm.setPWMFreq(50);
   delay(50);
   for (int l = 0; l < 2; l++) {
     for (int c = 0; c < 4; c++) {
@@ -343,29 +285,42 @@ void setup() {
     }
   }
 
-  // WiFi 연결 (최초 1회는 블로킹으로 확인)
+  // WiFi 연결 (최초 1회, 연결될 때까지 대기)
   Serial.print("[WiFi] 연결 시도: ");
   Serial.println(WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[WiFi] 연결됨");
+  } else {
+    Serial.println("[WiFi] 30초 내 연결 실패, loop()에서 계속 재시도함");
+  }
 
   // TLS 인증서는 Arduino IDE "SSL 루트 인증서 업로드" 도구로 R4 WiFi 모듈에
   // 직접 구워 넣는 방식을 쓰므로, 코드에서 setCACert() 등을 호출할 필요 없음.
+  // Flask 보고/조회용 httpSSLClient도 같은 방식으로 인증서가 미리 등록돼 있어야 함.
 
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  mqttClient.setBufferSize(2048); // cnt_process 스냅샷이 기본 256바이트보다 큼
+  mqttClient.setBufferSize(2048);
   mqttClient.setCallback(mqttCallback);
+
+  // 서버(Redis)에서 재고/큐 복원 - WiFi 연결된 상태에서만 의미 있음
+  if (WiFi.status() == WL_CONNECTED) {
+    fetchInitialStock();
+    restoreQueueFromServer();
+  } else {
+    Serial.println("[경고] WiFi 미연결 상태로 setup 종료 - 재고/큐 복원 실패, 로컬 기본값(0) 사용됨");
+  }
 
   Serial.print("[");
   Serial.print(AXIS_NAME);
   Serial.println("] setup 완료");
-  Serial.println("[NVS] 복원된 재고:");
-  for (int l = 0; l < 2; l++) {
-    for (int c = 0; c < 4; c++) {
-      Serial.print("  " + railPrefsKey(l, c) + " = " + String(rail[l][c].count));
-      Serial.println(rail[l][c].status == RAIL_EMPTY ? " (empty)" : "");
-    }
-  }
-  Serial.println("[안내] 카트리지 교체 후 재고 초기화하려면 시리얼로 FACTORYRESET 입력");
+  Serial.println("[안내] 시리얼 명령: SETEMPTY E_r / REPAIR E_r (테스트용)");
 }
 
 void loop() {
@@ -417,7 +372,6 @@ bool tryConnectMQTT() {
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (strcmp(topic, TOPIC_CNT_PROCESS) != 0) return;
 
-  // 문서 크기는 cnt_process 스냅샷 크기에 맞춰 조정 (필요시 늘리기)
   StaticJsonDocument<2048> doc;
   DeserializationError err = deserializeJson(doc, payload, length);
   if (err) {
@@ -426,17 +380,51 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  // seq는 정수로 안 받고 문자열로 비교 (자릿수 제한 없음 - 상단 changelog 참고)
   String seqStr = doc["seq"].as<String>();
   if (seqStr == lastSeqStr) return; // 동일 스냅샷 -> 재전송 무시
   lastSeqStr = seqStr;
 
   JsonObject orders = doc["orders"];
+
+  // 게이트 확인이 먼저 - 이번 스냅샷에서 우리가 기다리던 주문이 keycap_packed 됐는지 체크
+  checkGateAgainstOrders(orders);
+
+  handleOrdersField(orders);
+
+  JsonArray restock = doc["restock"];
+  handleRestockField(restock);
+}
+
+// ---- 게이트: 우리가 기다리던 주문이 완료됐는지 확인, 완료면 게이트 열기 ----
+void checkGateAgainstOrders(JsonObject orders) {
+  if (gateOpen) return; // 기다리는 중이 아니면 확인할 것 없음
+  if (gateOrderId.length() == 0) { gateOpen = true; return; }
+
+  if (!orders.containsKey(gateOrderId.c_str())) {
+    // 목록에서 아예 사라짐 = 완료 처리된 것으로 간주
+    Serial.println("[게이트] " + gateOrderId + " 목록에서 사라짐 -> 게이트 열림");
+    gateOpen = true;
+    gateOrderId = "";
+    return;
+  }
+
+  JsonObject order = orders[gateOrderId.c_str()].as<JsonObject>();
+  const char* status = order["status"] | "";
+  if (strcmp(status, "keycap_packed") == 0) {
+    Serial.println("[게이트] " + gateOrderId + " keycap_packed 확인 -> 게이트 열림");
+    gateOpen = true;
+    gateOrderId = "";
+  }
+}
+
+// ---- orders 필드 처리: 우리 축 담당 주문을 큐에 적재 (로컬 + 서버) ----
+void handleOrdersField(JsonObject orders) {
+  // 스냅샷에 등장한 순서 그대로 큐잉 순서가 됨 (ArduinoJson은 JSON 원문 순서를 유지)
   for (JsonPair kv : orders) {
     JsonObject order = kv.value().as<JsonObject>();
     const char* status = order["status"] | "";
     if (strcmp(status, "assigned") != 0) continue;
-    if (!order["fault"].isNull()) continue; // fault 있으면 정지된 주문 -> 스킵
+    if (!order["fault"].isNull()) continue;
 
     String orderId = String(kv.key().c_str());
     const char* keycap = order["keycap"] | "";
@@ -457,7 +445,6 @@ void handleAssignedOrder(const String& orderId, const char* keycap, JsonArray co
   char color = colorStr[0];
   if (colorSlot(color) < 0) return;
 
-  // order_id + letter + color 조합으로 중복 배출 방지
   String jobKey = orderId + "_" + String(letter) + "_" + String(color);
   if (alreadyProcessed(jobKey)) return;
   markProcessed(jobKey);
@@ -465,12 +452,50 @@ void handleAssignedOrder(const String& orderId, const char* keycap, JsonArray co
   DispenseJob job{orderId, letter, color};
   if (!queuePush(job)) {
     Serial.println("[큐] 가득 참 - 주문이 유실될 수 있음. JOB_QUEUE_SIZE 조정 검토 필요");
+    return;
+  }
+  enqueueToServer(job); // 서버(Redis) 큐에도 동일하게 적재 - 재부팅 복원용
+}
+
+// ---- restock 필드 처리: 우리 축 담당 항목만 골라서 서버에 알림 ----
+void handleRestockField(JsonArray restock) {
+  // 이번 스냅샷에 등장한 우리 축 restock 항목 표시
+  bool presentNow[2][4] = { {false,false,false,false}, {false,false,false,false} };
+
+  for (JsonVariant item : restock) {
+    String rc = item.as<String>(); // 예: "E_r"
+    if (rc.length() < 3) continue;
+    char letter = rc.charAt(0);
+    char color  = rc.charAt(2);
+    int l = letterSlot(letter);
+    int c = colorSlot(color);
+    if (l < 0 || c < 0) continue; // 우리 축 담당 아님
+
+    presentNow[l][c] = true;
+
+    if (!restockInProgress[l][c]) {
+      // 새로 등장한 restock 이벤트 - 서버 호출
+      restockInProgress[l][c] = true;
+      callRestock(l, c);
+    }
+    // 이미 restockInProgress였으면 (이전 스냅샷에서 이미 호출함) 이번엔 스킵
+  }
+
+  // 이번 스냅샷에서 사라진 항목은 in-progress 해제 (다음에 다시 등장하면 새 이벤트로 처리)
+  for (int l = 0; l < 2; l++) {
+    for (int c = 0; c < 4; c++) {
+      if (restockInProgress[l][c] && !presentNow[l][c]) {
+        restockInProgress[l][c] = false;
+      }
+    }
   }
 }
 
-// ============================== 배출 상태 머신 (90->180도 non-blocking 스윕 + 시작 스티션 킥) ==============================
+// ============================== 배출 상태 머신 (90->180도 non-blocking 스윕 + 시작 스티션 킥 + 게이트) ==============================
 void runDispenseStateMachine() {
   if (dsState == DS_IDLE) {
+    if (!gateOpen) return; // 직전 주문이 keycap_packed 되기 전까지 다음 배출 금지
+
     DispenseJob job;
     if (!queuePop(job)) return;
 
@@ -479,8 +504,9 @@ void runDispenseStateMachine() {
     if (l < 0 || c < 0) return;
 
     if (rail[l][c].status == RAIL_DISABLE || rail[l][c].status == RAIL_EMPTY) {
-      // TODO: 배출 불가 상태에서 들어온 주문을 어떻게 보고할지 플랫폼팀과 협의 필요
       Serial.println("[배출] 해당 레일 사용 불가(disable/empty) - 건너뜀");
+      // 이 job은 버려지는 것이므로 서버 큐에서도 제거해줘야 함 (안 그러면 다음 부팅 때 또 시도됨)
+      completeOnServer(job);
       return;
     }
 
@@ -489,8 +515,6 @@ void runDispenseStateMachine() {
     rail[l][c].lastOrderId = job.orderId;
     reportRailStatus(job.letter, job.color, RAIL_BUSY, job.orderId);
 
-    // 복귀: 현재 위치가 어디든 홈 각도로 한 번에 명령 (구버전과 동일 - 스텝 없이 최고 속도)
-    // 이미 홈에 있는 상태(직전 사이클 종료 후)라면 이 명령은 물리적으로는 no-op임
     moveServoAngle(SERVO_CHANNEL[l][c], SERVO_HOME_ANGLE);
     dsTimer = millis();
     dsState = DS_HOMING;
@@ -503,10 +527,6 @@ void runDispenseStateMachine() {
     int l = letterSlot(currentJob.letter);
     int c = colorSlot(currentJob.color);
 
-    // 정지마찰(스티션) 대응: 1도씩 미세하게 밀기 시작하면 토크가 부족해
-    // 제자리에서 부르르 떨다가 여러 스텝 누적된 뒤에야 갑자기 풀려나가는
-    // 현상이 있었음 -> 시작 시 BREAKAWAY_KICK_DEG만큼 한 번에 확 밀어서
-    // 마찰을 깔끔하게 넘긴 뒤, 그 지점부터 기존과 동일하게 1도씩 스윕
     sweepAngle = SERVO_HOME_ANGLE + BREAKAWAY_KICK_DEG;
     moveServoAngle(SERVO_CHANNEL[l][c], sweepAngle);
     dsTimer = millis();
@@ -516,7 +536,6 @@ void runDispenseStateMachine() {
 
   if (dsState == DS_BREAKAWAY_WAIT) {
     if (millis() - dsTimer < BREAKAWAY_SETTLE_MS) return;
-    // 킥으로 마찰을 넘긴 지점(sweepAngle)부터 이어서 1도씩 스윕 시작
     dsTimer = millis();
     dsState = DS_SWEEPING;
     return;
@@ -533,7 +552,6 @@ void runDispenseStateMachine() {
     moveServoAngle(SERVO_CHANNEL[l][c], sweepAngle);
 
     if (sweepAngle >= 180) {
-      // 홈+킥 각도 -> 180도 스윕 완료 (구버전과 동일하게 1도씩 천천히)
       dsTimer = millis();
       dsState = DS_HOLDING;
     }
@@ -545,8 +563,6 @@ void runDispenseStateMachine() {
 
     int l = letterSlot(currentJob.letter);
     int c = colorSlot(currentJob.color);
-    // 복귀도 한 번에 점프 (구버전과 동일 - 이 버전은 복귀 시 "한 번 더 도는" 느낌이
-    // 없다고 확인됐으므로 그대로 유지)
     moveServoAngle(SERVO_CHANNEL[l][c], SERVO_HOME_ANGLE);
     dsTimer = millis();
     dsState = DS_RETURNING;
@@ -556,7 +572,7 @@ void runDispenseStateMachine() {
   if (dsState == DS_RETURNING) {
     if (millis() - dsTimer < IR_CHECK_DELAY_MS) return;
     dsState = DS_WAIT_IR;
-    return; // 다음 loop()에서 바로 판정
+    return;
   }
 
   if (dsState == DS_WAIT_IR) {
@@ -567,17 +583,17 @@ void runDispenseStateMachine() {
     if (success) {
       if (rail[l][c].count > 0) rail[l][c].count--;
       rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
-      saveStockToPrefs(l, c); // 재고가 실제로 바뀐 순간 즉시 영속화
-      // 배출 결과 보고(cnt_keycap_dispense)는 성공했을 때만 전송
       reportDispenseResult(currentJob.orderId, currentJob.letter, currentJob.color);
     } else {
       rail[l][c].status = RAIL_DISABLE;
-      // count는 안 바뀌었으므로 저장할 것 없음. disable은 일시적 상태로
-      // 취급해 재부팅 시 count 기준(0이면 empty, 아니면 idle)으로 복원됨.
     }
 
-    // 상태 보고(cnt_keycap_status)는 성공/실패 관계없이 항상 전송
     reportRailStatus(currentJob.letter, currentJob.color, rail[l][c].status, currentJob.orderId);
+    completeOnServer(currentJob); // 성공/실패 관계없이 서버 큐에서는 제거 (더 이상 대기열에 있을 이유 없음)
+
+    // 게이트 잠금: 이 주문이 keycap_packed 될 때까지 다음 배출 시작 안 함
+    gateOrderId = currentJob.orderId;
+    gateOpen = false;
 
     dsState = DS_IDLE;
     return;
@@ -590,26 +606,24 @@ void moveServoAngle(uint8_t channel, uint8_t angle) {
   pwm.setPWM(channel, 0, pulse);
 }
 
-// ============================== Flask HTTPS 보고 ==============================
-// 공통: JSON 문자열을 지정한 path로 POST. 연결 열고-보내고-끊는 짧은 수명.
-// MQTT(wifiSSLClient)는 건드리지 않고 별도의 httpSSLClient만 사용.
-bool postJsonToFlask(const char* path, const char* payload) {
+// ============================== Flask HTTPS 공통 통신 ==============================
+bool postJsonToFlask(const char* path, const char* payload, String& responseOut) {
   HttpClient http(httpSSLClient, FLASK_HOST, FLASK_PORT);
-  http.setTimeout(5000); // 보고 1건이 무한 대기하지 않도록 타임아웃 설정
+  http.setTimeout(5000);
 
   int err = http.post(path, "application/json", payload);
   if (err != 0) {
-    Serial.print("[HTTPS] 연결/전송 실패, err=");
+    Serial.print("[HTTPS] POST 연결/전송 실패, err=");
     Serial.println(err);
     http.stop();
     return false;
   }
 
   int statusCode = http.responseStatusCode();
-  String body = http.responseBody(); // 응답을 읽어야 연결이 깔끔히 정리됨
+  responseOut = http.responseBody();
   http.stop();
 
-  Serial.print("[HTTPS] ");
+  Serial.print("[HTTPS] POST ");
   Serial.print(path);
   Serial.print(" -> ");
   Serial.print(payload);
@@ -618,14 +632,180 @@ bool postJsonToFlask(const char* path, const char* payload) {
   Serial.println(")");
 
   if (statusCode < 200 || statusCode >= 300) {
-    Serial.print("[HTTPS] Flask 응답 실패: ");
-    Serial.println(body);
-    // TODO: 재시도 정책 필요 여부는 테스트 후 결정 (지금은 1회만 시도)
+    Serial.print("[HTTPS] 응답 실패: ");
+    Serial.println(responseOut);
     return false;
   }
   return true;
 }
 
+bool getJsonFromFlask(const char* path, String& responseOut) {
+  HttpClient http(httpSSLClient, FLASK_HOST, FLASK_PORT);
+  http.setTimeout(5000);
+
+  int err = http.get(path);
+  if (err != 0) {
+    Serial.print("[HTTPS] GET 연결/전송 실패, err=");
+    Serial.println(err);
+    http.stop();
+    return false;
+  }
+
+  int statusCode = http.responseStatusCode();
+  responseOut = http.responseBody();
+  http.stop();
+
+  Serial.print("[HTTPS] GET ");
+  Serial.print(path);
+  Serial.print("  (status=");
+  Serial.print(statusCode);
+  Serial.println(")");
+
+  if (statusCode < 200 || statusCode >= 300) {
+    Serial.print("[HTTPS] 응답 실패: ");
+    Serial.println(responseOut);
+    return false;
+  }
+  return true;
+}
+
+// ---- 부팅 시 재고 초기 조회 ----
+// 가정하는 응답 형식: {"E_r":8,"E_y":8,"E_b":8,"E_g":8,"I_r":8,"I_y":8,"I_b":8,"I_g":8}
+// 주의: 원래 쿼리스트링(?board=EI) 방식이었는데 ArduinoHttpClient에서
+// "err=-1"(연결 자체 실패)이 발생함이 실기 확인됨 -> 경로 파라미터 방식으로 변경.
+// Flask 쪽에 /stock/keycap/<board> 형태의 라우트가 추가로 필요함
+// (기존 ?board= 방식 라우트는 그대로 둬도 무방, 이 경로만 병행 추가)
+void fetchInitialStock() {
+  String path = String("/stock/keycap/") + BOARD_NAME;
+  String resp;
+  if (!getJsonFromFlask(path.c_str(), resp)) {
+    Serial.println("[재고] 초기 조회 실패 - 로컬 count 0으로 시작 (empty 취급)");
+    for (int l = 0; l < 2; l++) {
+      for (int c = 0; c < 4; c++) {
+        rail[l][c].count = 0;
+        rail[l][c].status = RAIL_EMPTY;
+      }
+    }
+    return;
+  }
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, resp);
+  if (err) {
+    Serial.print("[재고] 응답 파싱 실패: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  Serial.println("[재고] 서버에서 복원된 값:");
+  for (int l = 0; l < 2; l++) {
+    for (int c = 0; c < 4; c++) {
+      String key = letterColorKey(l, c);
+      uint8_t count = doc[key] | 0;
+      rail[l][c].count = count;
+      rail[l][c].status = (count == 0) ? RAIL_EMPTY : RAIL_IDLE;
+      Serial.println("  " + key + " = " + String(count));
+    }
+  }
+}
+
+// ---- 부팅 시 미완료 큐 복원 ----
+// 가정하는 응답 형식: [{"order_id":"o1","letter":"E","color":"r"}, ...]
+void restoreQueueFromServer() {
+  String path = String("/queue/") + BOARD_NAME + "/next";
+  String resp;
+  if (!getJsonFromFlask(path.c_str(), resp)) {
+    Serial.println("[큐] 서버 큐 조회 실패 - 빈 큐로 시작");
+    return;
+  }
+
+  StaticJsonDocument<1024> doc;
+  DeserializationError err = deserializeJson(doc, resp);
+  if (err) {
+    Serial.print("[큐] 응답 파싱 실패: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  JsonArray arr = doc.as<JsonArray>();
+  int restored = 0;
+  for (JsonObject item : arr) {
+    String orderId = item["order_id"].as<String>();
+    const char* letterStr = item["letter"] | "";
+    const char* colorStr  = item["color"] | "";
+    if (strlen(letterStr) == 0 || strlen(colorStr) == 0) continue;
+
+    DispenseJob job{orderId, letterStr[0], colorStr[0]};
+    if (queuePush(job)) {
+      // 이미 서버 큐에 있던 것이므로 다시 enqueue 호출은 안 함, 로컬 중복방지 기록만
+      String jobKey = orderId + "_" + String(job.letter) + "_" + String(job.color);
+      markProcessed(jobKey);
+      restored++;
+    }
+  }
+  Serial.print("[큐] 서버에서 복원된 대기 주문: ");
+  Serial.println(restored);
+}
+
+void enqueueToServer(const DispenseJob& job) {
+  String path = String("/queue/") + BOARD_NAME + "/enqueue";
+  StaticJsonDocument<192> doc;
+  doc["board"] = BOARD_NAME;
+  doc["order_id"] = job.orderId;
+  doc["letter"] = String(job.letter);
+  doc["color"] = String(job.color);
+  char payload[192];
+  serializeJson(doc, payload, sizeof(payload));
+
+  String resp;
+  postJsonToFlask(path.c_str(), payload, resp);
+}
+
+void completeOnServer(const DispenseJob& job) {
+  String path = String("/queue/") + BOARD_NAME + "/complete";
+  StaticJsonDocument<192> doc;
+  doc["board"] = BOARD_NAME;
+  doc["order_id"] = job.orderId;
+  doc["letter"] = String(job.letter);
+  doc["color"] = String(job.color);
+  char payload[192];
+  serializeJson(doc, payload, sizeof(payload));
+
+  String resp;
+  postJsonToFlask(path.c_str(), payload, resp);
+}
+
+// ---- restock 호출: 서버가 계산한 "채워진 개수"를 응답받아 로컬 count 동기화 ----
+// 가정하는 응답 형식: {"filled": 25}
+void callRestock(int l, int c) {
+  char letter = letterOf(l);
+  char color = colorOf(c);
+  String path = String("/restock/") + letter + "/" + color;
+
+  String resp;
+  if (!postJsonToFlask(path.c_str(), "{}", resp)) {
+    Serial.println("[restock] 호출 실패 - 로컬 count 변경 안 함, 다음 스냅샷에서 재시도됨");
+    restockInProgress[l][c] = false; // 실패했으니 다음에 다시 시도할 수 있게 플래그 해제
+    return;
+  }
+
+  StaticJsonDocument<128> doc;
+  DeserializationError err = deserializeJson(doc, resp);
+  if (err) {
+    Serial.print("[restock] 응답 파싱 실패: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  uint8_t filled = doc["filled"] | 0;
+  rail[l][c].count = filled;
+  rail[l][c].status = (filled == 0) ? RAIL_EMPTY : RAIL_IDLE;
+  reportRailStatus(letter, color, rail[l][c].status, "restock"); // 특정 주문 아닌 restock으로 인한 변경임을 구분
+
+  Serial.println("[restock] " + letterColorKey(l, c) + " -> " + String(filled) + "개로 채워짐");
+}
+
+// ============================== 상태 보고 ==============================
 void reportRailStatus(char letter, char color, RailStatus status, const String& orderId) {
   int l = letterSlot(letter);
   int c = colorSlot(color);
@@ -633,7 +813,7 @@ void reportRailStatus(char letter, char color, RailStatus status, const String& 
 
   StaticJsonDocument<256> doc;
   doc["order_id"] = orderId;
-  doc["letter_color"] = String(letter) + "_" + String(color); // 예: "E_r" - Flask가 어떤 cnt_keycap_status 인지 식별
+  doc["letter_color"] = String(letter) + "_" + String(color);
   doc["count"] = rail[l][c].count;
   switch (status) {
     case RAIL_IDLE:    doc["status"] = "idle";    break;
@@ -644,17 +824,63 @@ void reportRailStatus(char letter, char color, RailStatus status, const String& 
 
   char payload[256];
   serializeJson(doc, payload, sizeof(payload));
-  postJsonToFlask(REPORT_STATUS_PATH, payload);
+  String resp;
+  postJsonToFlask(REPORT_STATUS_PATH, payload, resp);
 }
 
 void reportDispenseResult(const String& orderId, char letter, char color) {
   StaticJsonDocument<128> doc;
   doc["order_id"] = orderId;
-  doc["keycap"] = String(letter) + "_" + String(color); // 예: "E_r"
+  doc["keycap"] = String(letter) + "_" + String(color);
 
   char payload[128];
   serializeJson(doc, payload, sizeof(payload));
-  postJsonToFlask(REPORT_DISPENSE_PATH, payload);
+  String resp;
+  postJsonToFlask(REPORT_DISPENSE_PATH, payload, resp);
+}
+
+// ============================== 시리얼 테스트 명령 ==============================
+// SETEMPTY E_r  : 해당 레일을 강제로 count=0/empty로 만듦 (restock 흐름 테스트용)
+// REPAIR E_r    : disable 상태인 레일을 idle로 복구 (count는 그대로 유지)
+void checkSerialCommand() {
+  if (!Serial.available()) return;
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+
+  int sp = line.indexOf(' ');
+  String cmd = (sp < 0) ? line : line.substring(0, sp);
+  String arg = (sp < 0) ? "" : line.substring(sp + 1);
+  arg.trim();
+
+  if (cmd == "SETEMPTY" || cmd == "REPAIR") {
+    if (arg.length() < 3 || arg.charAt(1) != '_') {
+      Serial.println("[명령] 형식: " + cmd + " E_r (글자_색상)");
+      return;
+    }
+    char letter = arg.charAt(0);
+    char color = arg.charAt(2);
+    int l = letterSlot(letter);
+    int c = colorSlot(color);
+    if (l < 0 || c < 0) {
+      Serial.println("[명령] " + arg + " 는 이 보드(" + String(AXIS_NAME) + ") 담당 레일이 아님");
+      return;
+    }
+
+    if (cmd == "SETEMPTY") {
+      rail[l][c].count = 0;
+      rail[l][c].status = RAIL_EMPTY;
+      reportRailStatus(letter, color, RAIL_EMPTY, "manual_test");
+      Serial.println("[명령] " + arg + " -> empty로 강제 설정, 서버에도 보고함(order_id=manual_test)");
+    } else { // REPAIR
+      rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
+      reportRailStatus(letter, color, rail[l][c].status, "manual_test");
+      Serial.println("[명령] " + arg + " -> " + (rail[l][c].status == RAIL_EMPTY ? "empty" : "idle") + "로 복구, 서버에도 보고함(order_id=manual_test)");
+    }
+    return;
+  }
+
+  Serial.println("[명령] 알 수 없는 명령: " + cmd);
 }
 
 // ============================== 유틸 ==============================
