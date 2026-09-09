@@ -1,0 +1,7 @@
+venv
+.env
+__pycache__
+*.pyc
+*.ino
+make_sub.py
+delete_sub.py
