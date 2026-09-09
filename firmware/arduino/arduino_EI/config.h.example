@@ -1,0 +1,21 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// 이 파일을 복사해서 "config.h"로 저장한 뒤 실제 값을 채워넣으세요.
+// config.h 자체는 .gitignore에 의해 커밋되지 않습니다 (비밀번호 포함).
+
+// ---- WiFi ----
+#define WIFI_SSID   "여기에_와이파이_이름"
+#define WIFI_PASS   "여기에_와이파이_비밀번호"
+
+// ---- HiveMQ Cloud (MQTT, TLS) ----
+#define MQTT_HOST   "여기에_HiveMQ_호스트_주소"
+#define MQTT_PORT   8883
+#define MQTT_USER   "여기에_MQTT_사용자명"
+#define MQTT_PASS   "여기에_MQTT_비밀번호"
+
+// ---- Flask (Cloud Run) ----
+#define FLASK_HOST  "warehouse-flask-53685477799.asia-northeast3.run.app"
+#define FLASK_PORT  443
+
+#endif
