@@ -74,6 +74,31 @@
      이전 스냅샷에서 이미 있었으면 스킵, 이번에 사라졌으면 다음 등장 시 다시
      호출 가능하도록 in-progress 플래그로 관리함.
 
+  [2026-09-09 HTTPS 요청 재시도 로직 추가]
+   - 배경: WiFi 연결 직후 첫 HTTPS(TLS) 요청만 err=-1로 실패하고 바로 다음
+     요청은 정상 성공하는 패턴을 실기에서 반복 확인 (R4 WiFi TLS 핸드셰이크
+     타이밍 이슈로 추정).
+   - getJsonFromFlask / postJsonToFlask 모두 실패 시 300ms 대기 후 1회 재시도.
+     재시도까지 실패하면 기존과 동일하게 실패 처리(재고 0/empty, 재고보충 재시도 등).
+
+  [2026-09-09 restock 필드명 수정 + order_id 명시]
+   - Mobius cnt_process의 실제 재고보충 필드명은 "restock"이 아니라 "key_restock"
+     이었음 -> doc["key_restock"]로 파싱 필드명 수정 (기존엔 잘못된 필드명이라
+     restock 배열을 아예 못 읽고 있었음).
+   - reportRailStatus 호출 시 order_id를 빈 문자열("")로 보내던 지점(시리얼 명령
+     SETEMPTY/REPAIR, restock 처리) 전부 식별 가능한 문자열로 변경:
+     시리얼 명령 -> "manual", restock -> "restock". Mobius 기록만 봐도 상태 변화
+     원인을 구분할 수 있게 됨.
+
+  [2026-09-09 pool을 글자 단위에서 색상별로 세분화]
+   - 기존엔 pool:{글자}(예: pool:E) 하나로 4색 재고를 합쳐서 관리했는데,
+     실제 창고 재고 수량표가 색상별로 다 다르게 나와서(예: E그린 158 vs E블루 157)
+     글자 단위로 합쳐두면 실제 재고와 어긋남 -> pool도 stock과 동일하게
+     색상별(pool:{글자}_{색상}, 예: pool:E_r)로 분리해서 관리하도록 변경.
+     아두이노 코드 자체는 letter/color를 그대로 넘겨 /restock/{letter}/{color}를
+     호출하는 방식이라 이 변경은 Flask/Redis 쪽 키 구조만 바뀐 것이고
+     아두이노 코드에는 영향 없음.
+
   다른 3개 보드(N/S, T/F, P/J)는 이 파일을 복사한 뒤
   "보드별 설정" 블록만 아래 표대로 바꿔서 각 보드에 업로드하면 됩니다.
 
@@ -391,7 +416,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   handleOrdersField(orders);
 
-  JsonArray restock = doc["restock"];
+  JsonArray restock = doc["key_restock"];  // 실제 Mobius 필드명은 "restock"이 아니라 "key_restock"
   handleRestockField(restock);
 }
 
@@ -606,77 +631,84 @@ void moveServoAngle(uint8_t channel, uint8_t angle) {
   pwm.setPWM(channel, 0, pulse);
 }
 
-// ============================== Flask HTTPS 공통 통신 ==============================
+// ============================== Flask HTTPS 공통 통신 (실패 시 1회 재시도) ==============================
 bool postJsonToFlask(const char* path, const char* payload, String& responseOut) {
-  HttpClient http(httpSSLClient, FLASK_HOST, FLASK_PORT);
-  http.setTimeout(5000);
+  for (uint8_t attempt = 0; attempt < 2; attempt++) {
+    HttpClient http(httpSSLClient, FLASK_HOST, FLASK_PORT);
+    http.setTimeout(5000);
 
-  int err = http.post(path, "application/json", payload);
-  if (err != 0) {
-    Serial.print("[HTTPS] POST 연결/전송 실패, err=");
-    Serial.println(err);
+    int err = http.post(path, "application/json", payload);
+    if (err != 0) {
+      Serial.print("[HTTPS] POST 연결/전송 실패, err=");
+      Serial.print(err);
+      Serial.println(attempt == 0 ? " (재시도)" : "");
+      http.stop();
+      delay(300);
+      continue;
+    }
+
+    int statusCode = http.responseStatusCode();
+    responseOut = http.responseBody();
     http.stop();
-    return false;
+
+    Serial.print("[HTTPS] POST ");
+    Serial.print(path);
+    Serial.print(" -> ");
+    Serial.print(payload);
+    Serial.print("  (status=");
+    Serial.print(statusCode);
+    Serial.println(")");
+
+    if (statusCode < 200 || statusCode >= 300) {
+      Serial.print("[HTTPS] 응답 실패: ");
+      Serial.println(responseOut);
+      return false;
+    }
+    return true;
   }
-
-  int statusCode = http.responseStatusCode();
-  responseOut = http.responseBody();
-  http.stop();
-
-  Serial.print("[HTTPS] POST ");
-  Serial.print(path);
-  Serial.print(" -> ");
-  Serial.print(payload);
-  Serial.print("  (status=");
-  Serial.print(statusCode);
-  Serial.println(")");
-
-  if (statusCode < 200 || statusCode >= 300) {
-    Serial.print("[HTTPS] 응답 실패: ");
-    Serial.println(responseOut);
-    return false;
-  }
-  return true;
+  return false;
 }
 
 bool getJsonFromFlask(const char* path, String& responseOut) {
-  HttpClient http(httpSSLClient, FLASK_HOST, FLASK_PORT);
-  http.setTimeout(5000);
+  for (uint8_t attempt = 0; attempt < 2; attempt++) {
+    HttpClient http(httpSSLClient, FLASK_HOST, FLASK_PORT);
+    http.setTimeout(5000);
 
-  int err = http.get(path);
-  if (err != 0) {
-    Serial.print("[HTTPS] GET 연결/전송 실패, err=");
-    Serial.println(err);
+    int err = http.get(path);
+    if (err != 0) {
+      Serial.print("[HTTPS] GET 연결/전송 실패, err=");
+      Serial.print(err);
+      Serial.println(attempt == 0 ? " (재시도)" : "");
+      http.stop();
+      delay(300);
+      continue;
+    }
+
+    int statusCode = http.responseStatusCode();
+    responseOut = http.responseBody();
     http.stop();
-    return false;
+
+    Serial.print("[HTTPS] GET ");
+    Serial.print(path);
+    Serial.print("  (status=");
+    Serial.print(statusCode);
+    Serial.println(")");
+
+    if (statusCode < 200 || statusCode >= 300) {
+      Serial.print("[HTTPS] 응답 실패: ");
+      Serial.println(responseOut);
+      return false;
+    }
+    return true;
   }
-
-  int statusCode = http.responseStatusCode();
-  responseOut = http.responseBody();
-  http.stop();
-
-  Serial.print("[HTTPS] GET ");
-  Serial.print(path);
-  Serial.print("  (status=");
-  Serial.print(statusCode);
-  Serial.println(")");
-
-  if (statusCode < 200 || statusCode >= 300) {
-    Serial.print("[HTTPS] 응답 실패: ");
-    Serial.println(responseOut);
-    return false;
-  }
-  return true;
+  return false;
 }
 
 // ---- 부팅 시 재고 초기 조회 ----
 // 가정하는 응답 형식: {"E_r":8,"E_y":8,"E_b":8,"E_g":8,"I_r":8,"I_y":8,"I_b":8,"I_g":8}
-// 주의: 원래 쿼리스트링(?board=EI) 방식이었는데 ArduinoHttpClient에서
-// "err=-1"(연결 자체 실패)이 발생함이 실기 확인됨 -> 경로 파라미터 방식으로 변경.
-// Flask 쪽에 /stock/keycap/<board> 형태의 라우트가 추가로 필요함
-// (기존 ?board= 방식 라우트는 그대로 둬도 무방, 이 경로만 병행 추가)
+// (형식 다르면 Flask 쪽과 맞춰서 이 파싱부만 수정할 것)
 void fetchInitialStock() {
-  String path = String("/stock/keycap/") + BOARD_NAME;
+  String path = String("/stock/keycap?board=") + BOARD_NAME;
   String resp;
   if (!getJsonFromFlask(path.c_str(), resp)) {
     Serial.println("[재고] 초기 조회 실패 - 로컬 count 0으로 시작 (empty 취급)");
@@ -800,7 +832,7 @@ void callRestock(int l, int c) {
   uint8_t filled = doc["filled"] | 0;
   rail[l][c].count = filled;
   rail[l][c].status = (filled == 0) ? RAIL_EMPTY : RAIL_IDLE;
-  reportRailStatus(letter, color, rail[l][c].status, "restock"); // 특정 주문 아닌 restock으로 인한 변경임을 구분
+  reportRailStatus(letter, color, rail[l][c].status, "restock"); // 특정 order_id에 종속 안 되므로 식별용 문자열 사용
 
   Serial.println("[restock] " + letterColorKey(l, c) + " -> " + String(filled) + "개로 채워짐");
 }
@@ -870,12 +902,12 @@ void checkSerialCommand() {
     if (cmd == "SETEMPTY") {
       rail[l][c].count = 0;
       rail[l][c].status = RAIL_EMPTY;
-      reportRailStatus(letter, color, RAIL_EMPTY, "manual_test");
-      Serial.println("[명령] " + arg + " -> empty로 강제 설정, 서버에도 보고함(order_id=manual_test)");
+      reportRailStatus(letter, color, RAIL_EMPTY, "manual");
+      Serial.println("[명령] " + arg + " -> empty로 강제 설정, 서버에도 보고함");
     } else { // REPAIR
       rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
-      reportRailStatus(letter, color, rail[l][c].status, "manual_test");
-      Serial.println("[명령] " + arg + " -> " + (rail[l][c].status == RAIL_EMPTY ? "empty" : "idle") + "로 복구, 서버에도 보고함(order_id=manual_test)");
+      reportRailStatus(letter, color, rail[l][c].status, "manual");
+      Serial.println("[명령] " + arg + " -> " + (rail[l][c].status == RAIL_EMPTY ? "empty" : "idle") + "로 복구, 서버에도 보고함");
     }
     return;
   }
