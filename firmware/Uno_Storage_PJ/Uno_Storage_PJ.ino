@@ -1,6 +1,6 @@
 /*
   ================================================================================
-  키캡 배출 아두이노 - E/I 축 담당 (Arduino Uno R4 WiFi)
+  키캡 배출 아두이노 - P/J 축 담당 (Arduino Uno R4 WiFi)
   ================================================================================
   역할
    1) HiveMQ Cloud(MQTT, TLS)에 직접 연결해서 "sjuiot/warehouse/process" 구독
@@ -9,25 +9,32 @@
        orders/restock 파싱과 그에 따른 후속 HTTP 호출은 전부 이 아두이노가 직접 함)
    2) status == "assigned" 인 주문에서, 내 축(keycap 문자열의 AXIS_INDEX 위치)
       글자와 그 위치의 색상을 뽑아서 로컬 큐 + 서버 큐(Redis) 양쪽에 적재
-   3) 배출은 반드시 "직전에 우리가 배출한 주문이 pickup_reached 상태가 될 때까지"
+   3) 배출은 반드시 "직전에 우리가 배출한 주문이 pickup_reached 이후 상태가 될 때까지"
       대기했다가 순서대로 진행 (로봇암/컨베이어가 1대뿐이라 동시 진행 불가)
-   4) 배출 성공/실패는 IR센서로 판정, 성공 시에만 dispense 이벤트 보고
+   4) 배출 성공/실패는 IR센서로 판정(미장착 보드는 항상 성공 처리), 성공 시에만
+      dispense 이벤트 보고
    5) 재고는 Redis가 원본(source of truth). 아두이노 로컬 count는
       "즉각 empty 판단용 캐시"일 뿐 - 부팅 시 서버에서 조회해서 채움
-   6) restock(카트리지 재고보충)도 cnt_process의 restock 배열에서 직접 감지해서
+   6) restock(카트리지 재고보충)도 cnt_process의 keycap_restock 배열에서 직접 감지해서
       서버에 알리고, 서버가 계산한 채워진 개수를 응답받아 로컬 count 동기화
+   7) 게이트(픽업 대기) 상태도 Redis에 영속화해서, 재부팅되면 서버에서 복원함
+      (로컬 RAM에만 있으면 재부팅 시 유실되어 큐에 남은 주문을 게이트 없이
+       바로 배출해버리는 문제가 있었음)
 
   ============================== 통신 대상 (Flask) ==============================
    GET  /stock/keycap?board=PJ         부팅 시 재고 8칸 초기 조회
    GET  /queue/PJ/next                 부팅 시 미완료 큐 복원
    POST /queue/PJ/enqueue              새 주문 감지 시 서버 큐에도 적재
-   POST /queue/PJ/complete              배출 성공 후 서버 큐에서 제거
-   POST /restock/{letter}/{color}      restock 감지 시 호출, 채워진 개수 응답받음
-   POST /report/keycap-status          기존 그대로 (상태 보고, 성공/실패 무관 항상)
-   POST /report/keycap-dispense        기존 그대로 (배출 성공했을 때만)
+   POST /queue/PJ/complete             배출 성공 후(또는 유령 주문 정리 시) 서버 큐에서 제거
+   POST /restock/{letter}/{color}                restock 감지 시 호출, 채워진 개수 응답받음
+   POST /report/keycap-status              기존 그대로 (상태 보고, 성공/실패 무관 항상)
+   POST /report/keycap-dispense            기존 그대로 (배출 성공했을 때만)
+   GET  /gate/PJ                       부팅 시 게이트(픽업 대기) 상태 복원
+   POST /gate/PJ                       게이트 잠글 때 서버에 기록 (body: order_id)
+   POST /gate/PJ/clear                 게이트 열릴 때 서버 기록 해제
 
-  ※ 위 신규 라우트(/stock, /queue/*, /restock/*)는 이번에 새로 정의한 스펙이라
-    Flask 쪽 실제 응답 형식과 어긋나면 즉시 팀원과 맞춰서 파싱부만 고칠 것.
+  ※ 위 신규 라우트(/stock, /queue/*, /restock/*, /gate/*)는 이번에 새로 정의한
+    스펙이라 Flask 쪽 실제 응답 형식과 어긋나면 즉시 팀원과 맞춰서 파싱부만 고칠 것.
     이 코드가 가정하는 응답 형식은 각 함수 주석에 명시해둠.
 
   [2026-09-06 변경 사항 - 서보 배출 동작을 0~90도 점프 -> 0~180도 풀 스윕으로 교체]
@@ -62,8 +69,9 @@
      다음 배출을 시작하면 안 됨.
    - 방식: 배출 성공/실패 처리 직후 gateOrderId에 그 주문의 order_id를 기록하고
      게이트를 잠금. 이후 수신하는 모든 cnt_process 스냅샷에서 그 order_id의
-     status가 "pickup_reached"이거나 orders 목록에서 아예 사라졌으면 게이트를 열어
-     다음 큐 항목을 진행함. 큐잉 순서 자체는 스냅샷에 등장한 순서를 그대로 따름.
+     status가 pickup_reached(이후 단계 포함)이거나 orders 목록에서 아예 사라졌으면
+     게이트를 열어 다음 큐 항목을 진행함. 큐잉 순서 자체는 스냅샷에 등장한 순서를
+     그대로 따름.
 
   [2026-09-09 restock/orders 중복 호출 방지]
    - 같은 스냅샷이 재전송되는 경우는 seq로 이미 막혀있지만, "플랫폼이 처리 완료
@@ -81,7 +89,7 @@
    - getJsonFromFlask / postJsonToFlask 모두 실패 시 300ms 대기 후 1회 재시도.
      재시도까지 실패하면 기존과 동일하게 실패 처리(재고 0/empty, 재고보충 재시도 등).
 
-  [2026-09-09 restock 필드명 수정 + order_id 명시]
+  [2026-09-09 restock 필드명 확정 + order_id 명시]
    - Mobius cnt_process의 실제 재고보충 필드명은 "keycap_restock"임 ->
      doc["keycap_restock"]로 파싱 (플랫폼팀 확인 완료).
    - reportRailStatus 호출 시 order_id를 빈 문자열("")로 보내던 지점(시리얼 명령
@@ -107,7 +115,7 @@
    - 대응: Mobius CIN 생성을 실제로 거치는 두 엔드포인트(REPORT_STATUS_PATH,
      REPORT_DISPENSE_PATH)에 대해서만 postJsonToFlask 호출 시 타임아웃을
      FLASK_MOBIUS_TIMEOUT_MS(8000ms, 6.5초 워스트케이스 + 여유 1.5초)로 늘림.
-   - 나머지(재고/큐/restock 조회·조작)는 Redis만 쓰고 Mobius를 거치지 않아
+   - 나머지(재고/큐/restock/게이트 조회·조작)는 Redis만 쓰고 Mobius를 거치지 않아
      원래도 빠르므로 기본 타임아웃(5000ms) 그대로 둠 - 전부 다 늘리면 loop()
      블로킹 시간이 불필요하게 길어져 MQTT keepalive(PubSubClient 기본 15초)에
      영향 줄 수 있어 이 두 곳만 선별 적용함.
@@ -116,8 +124,62 @@
      MQTT 재연결이 잦아지면 MQTT_KEEPALIVE를 늘리거나 Flask 쪽 재시도를
      줄이는 방향(MOBIUS_MAX_RETRIES ↓ 또는 MOBIUS_REQUEST_TIMEOUT ↓)을 검토할 것.
 
-  다른 3개 보드(N/S, T/F, P/J)는 이 파일을 복사한 뒤
-  "보드별 설정" 블록만 아래 표대로 바꿔서 각 보드에 업로드하면 됩니다.
+  [2026-09-?? 유령 주문(orders에서 사라진 큐 항목) 자동 정리 추가]
+   - 배경: cnt_process 스펙상 진행 중인 주문은 매 스냅샷마다 전부 실리므로,
+     로컬 큐(jobQueue)에 대기 중인 job이 한 번이라도 orders 목록에서 빠지면
+     더 이상 진행 중이 아니라고(취소/오류 등으로 종료됐다고) 판단해도 됨.
+   - pruneDeadJobsFromQueue()를 매 스냅샷마다 checkGateAgainstOrders() 다음,
+     handleOrdersField() 이전에 실행. 큐를 한 번 비웠다가 orders에 남아있는
+     것만 순서 그대로 다시 채워넣고, 제거된 job은 completeOnServer()로 서버
+     큐에서도 함께 제거함. currentJob(배출 진행 중인 것)은 이미 큐 밖으로
+     나온 상태라 영향 없음.
+
+  [2026-09-?? IR 센서 미장착 보드 대응 토글 추가]
+   - 배경: IR 센서 수량이 부족해 일부 보드는 물리적으로 배선이 안 된 상태로
+     먼저 테스트/운영해야 하는 상황 발생.
+   - IR_SENSOR_INSTALLED 매크로로 제어: 1이면 기존처럼 IR_PIN을 실제로 읽어서
+     성공/실패 판정, 0이면 DS_WAIT_IR 단계에서 핀을 읽지 않고 무조건 성공(idle)
+     처리함. 센서 장착/배선 완료되는 대로 이 값만 1로 바꾸면 원래 동작으로
+     복귀함 - 이 보드(PJ)의 현재 기본값은 아래 "보드별 설정" 블록에서
+     확인/조정할 것.
+
+  [2026-09-13 게이트 상태를 Redis에 영속화 (재부팅 복원)]
+   - 배경: gateOpen/gateOrderId가 로컬 RAM 변수라서 재부팅하면 무조건
+     gateOpen=true로 초기화됨. 큐는 Redis에서 복원되는데 게이트 상태는
+     복원이 안 되니, 재부팅 직후 "직전 배출이 아직 픽업 안 됐을 수도 있는데"
+     큐에 남은 다음 주문을 게이트 확인 없이 바로 배출해버리는 문제가 있었음.
+   - 대응: Redis에 gate:{board} 키를 하나 더 두고, 게이트를 잠글 때(배출
+     직후) 그 주문 id를 SET, 게이트가 열릴 때(pickup_reached 이후 확인 또는
+     목록에서 사라짐) DELETE. 부팅 시 GET해서 값이 있으면 "잠금+해당 order_id
+     대기중" 상태로, 없으면 "열림" 상태로 시작.
+   - 트레이드오프: 부팅 시점엔 실제 상태를 재확인하지 않고 Redis 값 그대로
+     잠금부터 걸고 시작함. 다음 MQTT 스냅샷이 들어오면 기존
+     checkGateAgainstOrders()가 즉시 재평가해서 필요하면 바로 열어주므로,
+     부팅 직후 스냅샷 수신 전까지의 아주 짧은 구간만 실제보다 보수적으로
+     닫혀있을 수 있음 (안전한 방향의 오차라 허용).
+
+  [2026-09-13 게이트 오픈 조건을 pickup_reached 단일 비교 -> 이후 상태 화이트리스트로 확장]
+   - 배경: 플랫폼팀 상태표 확인 결과 pickup_reached 이후로도
+     loaded -> arrived -> (unclaimed) -> verified -> received -> completed
+     등 여러 단계가 더 있음이 확인됨. 기존 코드는 status가 정확히
+     "pickup_reached" 문자열일 때만 게이트를 열었는데, 스냅샷 수신 유실로
+     pickup_reached 단계를 건너뛰고 바로 그 다음 단계(loaded 등)로 넘어간
+     스냅샷을 받으면, orders 목록엔 여전히 주문이 남아있고(containsKey=true)
+     status도 "pickup_reached"가 아니라서 게이트가 영원히 안 열리는
+     문제가 있었음.
+   - 대응: GATE_OPEN_STATUSES 화이트리스트를 두고, pickup_reached 및 그
+     이후 모든 단계를 게이트 오픈 조건으로 인정하도록 변경.
+   - unclaimed(노쇼)도 일단 화이트리스트에 포함함 - 픽업 지점 자체는 우리
+     입장에서 비워진 것으로 간주. 단, 노쇼 시 실제로 물건이 픽업 지점에서
+     치워지는지는 로봇암/컨베이어 운영 방식에 달려있어 재확인 필요
+     (치워지지 않는 운영이라면 이 상태는 화이트리스트에서 빼야 함).
+   - 화이트리스트 문자열은 플랫폼팀 상태표 기준으로 채워둔 것이라, 실제
+     Mobius orders[].status 값과 대소문자/철자가 정확히 일치하는지 반드시
+     실측 확인 필요. 그 앞단계(assigned, dispensing 등 우리가 아직 픽업
+     지점을 안 비운 상태)는 절대 포함하면 안 됨.
+
+  다른 3개 보드는 이 파일을 복사한 뒤 "보드별 설정" 블록만 아래 표대로
+  바꿔서 각 보드에 업로드하면 됩니다. (지금 이 파일은 PJ 보드용입니다)
 
   ------------------------------------------------------------------------------
    보드      LETTER_0 / LETTER_1   AXIS_INDEX   MQTT_CLIENT_ID   BOARD_NAME
@@ -136,7 +198,7 @@
   하드웨어 관련 주의사항 (실측 후 반드시 조정)
    - SERVO_MIN_PULSE / SERVO_MAX_PULSE, SWEEP_STEP_DELAY_MS,
      BREAKAWAY_KICK_DEG / BREAKAWAY_SETTLE_MS, IR_DETECT_LEVEL, IR_PIN,
-     PCA9685 I2C 주소(0x40 아니면 수정)
+     PCA9685 I2C 주소(0x40 아니면 수정), IR_SENSOR_INSTALLED(센서 배선 여부)
   ================================================================================
 */
 
@@ -156,7 +218,7 @@ const char  LETTER_0            = 'P';
 const char  LETTER_1            = 'J';
 const uint8_t AXIS_INDEX        = 3;      // keycap 문자열에서의 내 축 위치 (E/I=0, N/S=1, T/F=2, P/J=3)
 const char* MQTT_CLIENT_ID      = "arduino_PJ";
-const char* BOARD_NAME           = "PJ";  // /queue/{board}/*, /stock/keycap?board=* 에 그대로 씀
+const char* BOARD_NAME           = "PJ";  // /queue/{board}/*, /stock/keycap?board=*, /gate/{board} 에 그대로 씀
 // ===========================================================================
 
 // ---- 색상 순서 (colors 배열/보드 내부 인덱싱과 동일 순서로 고정) ----
@@ -186,10 +248,11 @@ const uint8_t IR_PIN[2][4] = {
 #define BREAKAWAY_KICK_DEG      4   // 스윕 시작 시 정지마찰을 넘기기 위한 초기 킥 각도
 #define BREAKAWAY_SETTLE_MS    60   // 킥 이동 후 실제 도달까지 대기
 
-// ---- [IR 센서 미장착 보드용] ----
-// 이 보드는 IR 센서 수량 부족으로 물리 연결이 안 돼 있음.
-// 0으로 두면 DS_WAIT_IR 단계에서 실제 핀을 읽지 않고 무조건 성공(idle) 처리함.
-// 나중에 센서 확보되면 이 값만 1로 바꾸고 IR_PIN 배선하면 원래대로 동작함.
+// ---- [IR 센서 장착 여부 토글] ----
+// 1 = 센서 배선 완료, 실제로 IR_PIN을 읽어서 성공/실패 판정 (기본 동작)
+// 0 = 센서 미장착/미배선, DS_WAIT_IR 단계에서 핀을 읽지 않고 무조건 성공(idle) 처리
+// 센서를 나중에 달거나 떼거나 할 때 이 값만 0/1로 바꾸면 됩니다 (배선은 별개로 필요).
+// ※ 이 보드(PJ)의 현재 기본값: 1 (장착 가정) - 실제 배선 상태 확인 후 다르면 0으로 변경
 #define IR_SENSOR_INSTALLED 0
 
 // ---- 카트리지 최대 용량 (restock 시 이 값까지 채움, 전체 풀 부족하면 서버가 그보다 적게 응답) ----
@@ -256,11 +319,34 @@ bool queuePop(DispenseJob& job) {
   return true;
 }
 
-// ============================== pickup_reached 게이트 ==============================
+// ============================== pickup 게이트 ==============================
 // gateOpen == true  : 다음 큐 항목을 시작해도 됨
-// gateOpen == false : gateOrderId가 pickup_reached 되기를 기다리는 중, 새 배출 시작 금지
+// gateOpen == false : gateOrderId가 pickup_reached(이후) 되기를 기다리는 중, 새 배출 시작 금지
+// 이 두 변수는 로컬 RAM 캐시일 뿐이고, 원본은 Redis(gate:{board})임.
+// 재부팅 시 restoreGateFromServer()로 복원, 변경될 때마다 lockGateOnServer/
+// clearGateOnServer로 서버에도 즉시 동기화함.
 bool   gateOpen = true;
 String gateOrderId = "";
+
+// ---- 게이트를 열어도 되는 상태 목록 ----
+// pickup_reached 이후 단계는 전부 "우리 픽업 지점은 이미 비워진 상태"이므로
+// 다음 배출을 시작해도 됨. 스냅샷 유실로 pickup_reached를 건너뛰고 바로
+// 다음 단계로 넘어간 경우까지 커버하기 위해 단일 status 비교 대신 화이트리스트 사용.
+// ※ 실측 필요: 플랫폼팀 상태표 기준 문자열이므로 실제 Mobius 값과 철자/대소문자
+//   일치 여부 반드시 확인할 것. assigned/dispensing 등 이전 단계는 절대 포함 금지.
+// ※ unclaimed(노쇼) 포함 여부는 노쇼 시 실제로 픽업 지점이 비워지는지에 달려있음 -
+//   로봇암/컨베이어 운영 방식 확정되면 재검토.
+const char* GATE_OPEN_STATUSES[] = {
+  "pickup_reached", "loaded", "arrived", "unclaimed", "verified", "received", "completed"
+};
+const uint8_t GATE_OPEN_STATUSES_COUNT = sizeof(GATE_OPEN_STATUSES) / sizeof(GATE_OPEN_STATUSES[0]);
+
+bool isGateOpenStatus(const char* status) {
+  for (uint8_t i = 0; i < GATE_OPEN_STATUSES_COUNT; i++) {
+    if (strcmp(status, GATE_OPEN_STATUSES[i]) == 0) return true;
+  }
+  return false;
+}
 
 // ============================== 배출 상태 머신 ==============================
 enum DispenseState { DS_IDLE, DS_HOMING, DS_BREAKAWAY_WAIT, DS_SWEEPING, DS_HOLDING, DS_RETURNING, DS_WAIT_IR };
@@ -284,6 +370,7 @@ const char* TOPIC_CNT_PROCESS = "sjuiot/warehouse/process";
 // ---- Flask(Cloud Run) 엔드포인트 ----
 const char* REPORT_STATUS_PATH   = "/report/keycap-status";
 const char* REPORT_DISPENSE_PATH = "/report/keycap-dispense";
+const char* GATE_PATH            = "/gate"; // GET/POST {GATE_PATH}/{BOARD_NAME}, POST {GATE_PATH}/{BOARD_NAME}/clear
 
 // ---- Flask -> Mobius CIN 생성 재시도 시간에 맞춘 타임아웃 ----
 // Flask 워스트케이스: 요청당 3초 × 2회 + 재시도 대기 0.5초 × 1회 ≈ 6.5초.
@@ -315,13 +402,16 @@ void enqueueToServer(const DispenseJob& job);
 void completeOnServer(const DispenseJob& job);
 void callRestock(int l, int c);
 void checkSerialCommand();
+void restoreGateFromServer();
+void lockGateOnServer(const String& orderId);
+void clearGateOnServer();
 
 // ============================== setup / loop ==============================
 void setup() {
   Serial.begin(115200);
   delay(500);
 
-  // IR 센서 핀 설정
+  // IR 센서 핀 설정 (IR_SENSOR_INSTALLED가 0이어도 핀 설정 자체는 무해하므로 그대로 둠)
   for (int l = 0; l < 2; l++) {
     for (int c = 0; c < 4; c++) {
       pinMode(IR_PIN[l][c], INPUT);
@@ -364,12 +454,15 @@ void setup() {
   mqttClient.setBufferSize(2048);
   mqttClient.setCallback(mqttCallback);
 
-  // 서버(Redis)에서 재고/큐 복원 - WiFi 연결된 상태에서만 의미 있음
+  // 서버(Redis)에서 재고/큐/게이트 복원 - WiFi 연결된 상태에서만 의미 있음
+  // 순서 중요: restoreQueueFromServer()가 먼저 끝나야 jobQueue가 채워진 상태에서
+  // 이후 게이트 재평가(스냅샷 수신 시)가 정상적으로 이어짐.
   if (WiFi.status() == WL_CONNECTED) {
     fetchInitialStock();
     restoreQueueFromServer();
+    restoreGateFromServer();
   } else {
-    Serial.println("[경고] WiFi 미연결 상태로 setup 종료 - 재고/큐 복원 실패, 로컬 기본값(0) 사용됨");
+    Serial.println("[경고] WiFi 미연결 상태로 setup 종료 - 재고/큐/게이트 복원 실패, 로컬 기본값 사용됨");
   }
 
   Serial.print("[");
@@ -441,7 +534,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   JsonObject orders = doc["orders"];
 
-  // 게이트 확인이 먼저 - 이번 스냅샷에서 우리가 기다리던 주문이 pickup_reached 됐는지 체크
+  // 게이트 확인이 먼저 - 이번 스냅샷에서 우리가 기다리던 주문이 pickup_reached
+  // (이후 상태 포함)됐는지 체크
   checkGateAgainstOrders(orders);
 
   // 큐에 남아있던 job 중 이번 스냅샷 orders에 없는 것들(종료/유령 주문) 정리
@@ -453,7 +547,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   handleRestockField(restock);
 }
 
-// ---- 게이트: 우리가 기다리던 주문이 완료됐는지 확인, 완료면 게이트 열기 ----
+// ---- 게이트: 우리가 기다리던 주문이 pickup_reached 이후 단계가 됐는지 확인, 맞으면 게이트 열기 ----
 void checkGateAgainstOrders(JsonObject orders) {
   if (gateOpen) return; // 기다리는 중이 아니면 확인할 것 없음
   if (gateOrderId.length() == 0) { gateOpen = true; return; }
@@ -463,15 +557,17 @@ void checkGateAgainstOrders(JsonObject orders) {
     Serial.println("[게이트] " + gateOrderId + " 목록에서 사라짐 -> 게이트 열림");
     gateOpen = true;
     gateOrderId = "";
+    clearGateOnServer();
     return;
   }
 
   JsonObject order = orders[gateOrderId.c_str()].as<JsonObject>();
   const char* status = order["status"] | "";
-  if (strcmp(status, "pickup_reached") == 0) {
-    Serial.println("[게이트] " + gateOrderId + " pickup_reached 확인 -> 게이트 열림");
+  if (isGateOpenStatus(status)) {
+    Serial.println("[게이트] " + gateOrderId + " status=" + String(status) + " -> 게이트 열림");
     gateOpen = true;
     gateOrderId = "";
+    clearGateOnServer();
   }
 }
 
@@ -531,7 +627,7 @@ void handleAssignedOrder(const String& orderId, const char* keycap, JsonArray co
   if (letterSlot(letter) < 0) return; // 방어코드: 내 축 글자가 아니면 무시
 
   const char* colorStr = colors[AXIS_INDEX];
-  if (colorStr == nullptr || colorStr[0] == '\0') return;
+  if (colorStr == nullptr || colorStr[0] == '\\0') return;
   char color = colorStr[0];
   if (colorSlot(color) < 0) return;
 
@@ -584,7 +680,7 @@ void handleRestockField(JsonArray restock) {
 // ============================== 배출 상태 머신 (90->180도 non-blocking 스윕 + 시작 스티션 킥 + 게이트) ==============================
 void runDispenseStateMachine() {
   if (dsState == DS_IDLE) {
-    if (!gateOpen) return; // 직전 주문이 pickup_reached 되기 전까지 다음 배출 금지
+    if (!gateOpen) return; // 직전 주문이 pickup_reached(이후) 되기 전까지 다음 배출 금지
 
     DispenseJob job;
     if (!queuePop(job)) return;
@@ -685,9 +781,11 @@ void runDispenseStateMachine() {
     reportRailStatus(currentJob.letter, currentJob.color, rail[l][c].status, currentJob.orderId);
     completeOnServer(currentJob); // 성공/실패 관계없이 서버 큐에서는 제거 (더 이상 대기열에 있을 이유 없음)
 
-    // 게이트 잠금: 이 주문이 pickup_reached 될 때까지 다음 배출 시작 안 함
+    // 게이트 잠금: 이 주문이 pickup_reached(이후) 될 때까지 다음 배출 시작 안 함
+    // 로컬 뿐 아니라 서버(Redis)에도 즉시 기록해서 재부팅 시에도 이 잠금이 복원되게 함.
     gateOrderId = currentJob.orderId;
     gateOpen = false;
+    lockGateOnServer(gateOrderId);
 
     dsState = DS_IDLE;
     return;
@@ -909,6 +1007,62 @@ void callRestock(int l, int c) {
   Serial.println("[restock] " + letterColorKey(l, c) + " -> " + String(filled) + "개로 채워짐");
 }
 
+// ============================== 게이트 서버 동기화 ==============================
+// ---- 부팅 시 딱 1회: 서버(Redis)에 저장된 게이트 상태 복원 ----
+// 가정하는 응답 형식: {"locked": true, "order_id": "order_test_8017"} 또는 {"locked": false}
+void restoreGateFromServer() {
+  String path = String(GATE_PATH) + "/" + BOARD_NAME;
+  String resp;
+  if (!getJsonFromFlask(path.c_str(), resp)) {
+    Serial.println("[게이트] 서버 상태 조회 실패 - 기본값(open)으로 시작");
+    return;
+  }
+
+  StaticJsonDocument<192> doc;
+  DeserializationError err = deserializeJson(doc, resp);
+  if (err) {
+    Serial.print("[게이트] 응답 파싱 실패: ");
+    Serial.println(err.c_str());
+    Serial.println("[게이트] 기본값(open)으로 시작");
+    return;
+  }
+
+  bool locked = doc["locked"] | false;
+  if (locked) {
+    gateOrderId = doc["order_id"] | "";
+    if (gateOrderId.length() == 0) {
+      // 서버가 locked=true인데 order_id를 안 줬으면 판단 불가 - 안전하게 열림 처리
+      gateOpen = true;
+      Serial.println("[게이트] 복원: locked=true인데 order_id 없음 - 방어적으로 열림 처리");
+      return;
+    }
+    gateOpen = false;
+    Serial.println("[게이트] 복원: " + gateOrderId + " pickup 대기 중 (잠금 상태로 시작)");
+  } else {
+    gateOpen = true;
+    gateOrderId = "";
+    Serial.println("[게이트] 복원: 잠긴 것 없음 (열림 상태로 시작)");
+  }
+}
+
+// ---- 게이트 잠글 때(배출 직후) 서버에도 기록 - 재부팅 대비 ----
+void lockGateOnServer(const String& orderId) {
+  String path = String(GATE_PATH) + "/" + BOARD_NAME;
+  StaticJsonDocument<128> doc;
+  doc["order_id"] = orderId;
+  char payload[128];
+  serializeJson(doc, payload, sizeof(payload));
+  String resp;
+  postJsonToFlask(path.c_str(), payload, resp);
+}
+
+// ---- 게이트 열릴 때 서버 기록도 해제 ----
+void clearGateOnServer() {
+  String path = String(GATE_PATH) + "/" + BOARD_NAME + "/clear";
+  String resp;
+  postJsonToFlask(path.c_str(), "{}", resp);
+}
+
 // ============================== 상태 보고 ==============================
 void reportRailStatus(char letter, char color, RailStatus status, const String& orderId) {
   int l = letterSlot(letter);
@@ -950,7 +1104,7 @@ void reportDispenseResult(const String& orderId, char letter, char color) {
 // REPAIR E_r    : disable 상태인 레일을 idle로 복구 (count는 그대로 유지)
 void checkSerialCommand() {
   if (!Serial.available()) return;
-  String line = Serial.readStringUntil('\n');
+  String line = Serial.readStringUntil('\\n');
   line.trim();
   if (line.length() == 0) return;
 
