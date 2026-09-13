@@ -2,6 +2,8 @@ import os
 import json
 import ssl
 import uuid
+import logging
+import sys
 import requests
 import paho.mqtt.client as mqtt
 from flask import Flask, request, abort, jsonify
@@ -15,6 +17,18 @@ redis = Redis(
     url=os.environ["UPSTASH_REDIS_REST_URL"],
     token=os.environ["UPSTASH_REDIS_REST_TOKEN"]
 )
+
+# ============================================================
+# 로깅 설정: print() 대신 이걸 씀 — Cloud Run/gunicorn 환경에서
+# 버퍼링 없이 즉시 flush됨 (PYTHONUNBUFFERED 이슈 회피)
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
+    force=True,  # gunicorn이 이미 만들어둔 핸들러 무시하고 강제 재설정
+)
+logger = logging.getLogger("warehouse")
 
 MQTT_HOST = os.getenv("MQTT_HOST")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 8883))
@@ -115,25 +129,49 @@ def hello():
 # ============================================================
 @app.route("/notify/<kind>", methods=["POST"])
 def notify(kind):
+    logger.info(f"[notify/{kind}] 요청 수신됨 (여기 찍히면 최소한 도달은 한 것)")
+
     if kind not in TOPICS:
+        logger.warning(f"[notify/{kind}] 등록 안 된 kind, 404 리턴")
         abort(404)
 
+    raw_body = request.get_data(as_text=True)
+    logger.info(f"[notify/{kind}] raw body: {raw_body}")
+
     data = request.get_json(force=True, silent=True) or {}
+    if not data:
+        logger.warning(f"[notify/{kind}] JSON 파싱 실패 또는 빈 body")
+
     sgn = data.get("m2m:sgn", {})
+    if not sgn:
+        logger.warning(f"[notify/{kind}] 'm2m:sgn' 키 자체가 없음. data keys: {list(data.keys())}")
+
     if sgn.get("vrq"):
+        logger.info(f"[notify/{kind}] 구독 검증 요청(vrq)임 → 200만 응답하고 종료")
         return "", 200
 
     cin = sgn.get("nev", {}).get("rep", {}).get("m2m:cin")
-    if cin:
-        con = cin.get("con")
-        if isinstance(con, str):
-            try:
-                con = json.loads(con)
-            except ValueError:
-                pass
-        payload = json.dumps(con, ensure_ascii=False)
-        ok = publish(TOPICS[kind], payload)
-        print(f"[{kind}] → MQTT {'전송 완료' if ok else '전송 실패'}:", payload)
+    if not cin:
+        logger.warning(f"[notify/{kind}] cin을 못 찾음. sgn 내용: {sgn}")
+        return "", 200
+
+    con = cin.get("con")
+    logger.info(f"[notify/{kind}] cin 찾음. con(raw): {con}")
+
+    if isinstance(con, str):
+        try:
+            con = json.loads(con)
+            logger.info(f"[notify/{kind}] con JSON 파싱 성공: {con}")
+        except ValueError as e:
+            logger.error(f"[notify/{kind}] con JSON 파싱 실패: {e}, con 원본: {con}")
+
+    payload = json.dumps(con, ensure_ascii=False)
+    ok = publish(TOPICS[kind], payload)
+    if ok:
+        logger.info(f"[{kind}] → MQTT 전송 완료: {payload}")
+    else:
+        logger.error(f"[{kind}] → MQTT 전송 실패: {payload}")
+
     return "", 200
 
 
@@ -276,6 +314,64 @@ def restock_letter_color(letter, color):
 
     print(f"[restock] {letter_color}: {fill_amount}개로 채움 (pool 남음 {pool_qty - fill_amount})")
     return jsonify({"filled": fill_amount}), 200
+
+
+# ============================================================
+# 게이트(픽업 대기) 상태: 배출 직후 다음 주문이 pickup_reached(이후) 될 때까지
+# 대기하는 상태를 Redis에 영속화. 아두이노 재부팅 시 로컬 RAM(gateOpen/gateOrderId)이
+# 유실되므로, 부팅 시 이걸 조회해서 복원함.
+# Redis 키: gate:{board}  (값 = 대기 중인 order_id, 키 자체가 없으면 "열림" 상태)
+# ============================================================
+def _gate_key(board: str) -> str:
+    return f"gate:{board}"
+
+
+@app.route("/gate/<board>", methods=["GET"])
+def get_gate_status(board):
+    """
+    아두이노 부팅 시 게이트 상태 복원용 조회.
+    응답 형식: {"locked": true, "order_id": "order_test_8017"} 또는 {"locked": false}
+    """
+    if board not in BOARD_LETTERS:
+        abort(404)
+
+    order_id = redis.get(_gate_key(board))
+    if not order_id:
+        return jsonify({"locked": False}), 200
+
+    return jsonify({"locked": True, "order_id": order_id}), 200
+
+
+@app.route("/gate/<board>", methods=["POST"])
+def lock_gate(board):
+    """
+    아두이노가 배출 직후(pickup 대기 시작) 게이트를 잠글 때 호출.
+    요청 형식: {"order_id": "order_test_8017"}
+    """
+    if board not in BOARD_LETTERS:
+        abort(404)
+
+    data = request.get_json(force=True, silent=True) or {}
+    order_id = data.get("order_id")
+    if not order_id:
+        return jsonify({"error": "order_id는 필수"}), 400
+
+    redis.set(_gate_key(board), order_id)
+    print(f"[gate] {board} 잠금: {order_id}")
+    return jsonify({"result": "ok"}), 200
+
+
+@app.route("/gate/<board>/clear", methods=["POST"])
+def clear_gate(board):
+    """
+    아두이노가 pickup_reached(이후 상태) 확인해서 게이트를 열 때 호출.
+    """
+    if board not in BOARD_LETTERS:
+        abort(404)
+
+    redis.delete(_gate_key(board))
+    print(f"[gate] {board} 해제")
+    return jsonify({"result": "ok"}), 200
 
 
 if __name__ == "__main__":
