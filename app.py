@@ -9,6 +9,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from upstash_redis import Redis
+
+redis = Redis(
+    url=os.environ["UPSTASH_REDIS_REST_URL"],
+    token=os.environ["UPSTASH_REDIS_REST_TOKEN"]
+)
+
 # ============================================================
 # 이 Flask는 "로봇암/컨베이어 파트" 전용 릴레이.
 # 키캡 카트리지 파트(팀원 Cloud Run)와는 완전히 분리된 인프라:
@@ -17,7 +24,16 @@ load_dotenv()
 #   - 별도 Mobius 구독 (sub 이름이 팀원 것과 겹치면 안 됨!)
 # Mobius AE/인증 정보(COSS_*)는 팀 공용 값을 그대로 씀 (원래 팀 공용
 # 크리덴셜이라 여기서 새로 만들 필요 없음)
+#
+# 보드는 카트리지·아두이노가 없어서, 이 릴레이가 board 재고(Redis)도
+# 같이 관리함 - 로봇암 PC가 busy/idle+count를 보고하면 여기서 캐싱.
+# Upstash Redis는 키캡 팀 계정과 동일 인스턴스, 키 프리픽스만 다름
+# (stock:board_{color} vs 키캡의 stock:{letter_color}).
 # ============================================================
+
+BOARD_COLORS = ["red", "yellow", "blue", "green"]
+BOARD_STATUS_VALUES = ("idle", "busy", "disable", "empty")  # idle/busy/disable(오배출)/empty(재고부족)
+BOARD_COLOR_CODE = {"red": "r", "yellow": "y", "blue": "b", "green": "g"}  # cnt_warehouse/cnt_board_status 밑 실제 컨테이너명
 
 MQTT_HOST = os.getenv("MQTT_HOST")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 8883))
@@ -38,6 +54,18 @@ COSS_LECTURE = os.getenv("COSS_LECTURE")
 COSS_CREATOR = os.getenv("COSS_CREATOR")
 ORIGIN = os.getenv("ORIGIN")
 AE_NAME = os.getenv("AE_NAME")
+
+# 필수 환경변수 누락을 배포 직후 부팅 로그에서 바로 드러나게 함
+# (없으면 None이 조용히 들어갔다가, 나중에 요청 처리 중 .rstrip() 등에서
+#  AttributeError로 터져서 502만 뜨고 원인 파악이 어려워짐)
+_REQUIRED_ENV = {
+    "COSS_BASE_URL": COSS_BASE_URL, "AE_NAME": AE_NAME, "ORIGIN": ORIGIN,
+    "COSS_API_KEY": COSS_API_KEY, "COSS_CREATOR": COSS_CREATOR, "COSS_LECTURE": COSS_LECTURE,
+    "MQTT_HOST": os.getenv("MQTT_HOST"), "MQTT_USER": os.getenv("MQTT_USER"), "MQTT_PASS": os.getenv("MQTT_PASS"),
+}
+_missing = [k for k, v in _REQUIRED_ENV.items() if not v]
+if _missing:
+    print(f"[BOOT] ⚠️ 환경변수 누락: {', '.join(_missing)} - 관련 기능이 500/502로 실패함")
 
 app = Flask(__name__)
 
@@ -70,6 +98,10 @@ def post_cin_to_mobius(cnt_path: str, content: dict) -> bool:
       "cnt_conveyor/cnt_keycap_conveyor"
       "cnt_conveyor/cnt_tray_conveyor"
     """
+    if not COSS_BASE_URL or not AE_NAME:
+        print("[Mobius] COSS_BASE_URL/AE_NAME이 비어있음 - env.yaml/.env 확인 필요")
+        return False
+
     url = f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/{cnt_path.strip('/')}"
     headers = {
         "X-API-KEY": COSS_API_KEY,
@@ -163,24 +195,99 @@ def report_tray_robot_arm():
 @app.route("/report/board-robot-arm", methods=["POST"])
 def report_board_robot_arm():
     """
-    보드 카트리지 -> 트레이 직접 투입 결과 보고.
-    body: {"order_id": "...", "status": "done" | "failed"}
-    색상 대조(cnt_board_dispense)는 카트리지 쪽 별도 보고이며 여기선 다루지 않음.
+    보드 로봇암 -> 트레이 직접 투입 결과 보고.
+    body: {"order_id": "...", "board": "done" | "failed"}
+    스펙 필드명이 "board" (status 아님) - COSS 명세 cnt_board_robot_arm 그대로.
+    색상 실측(cnt_board_dispense)은 /report/board-dispense 에서 별도 보고.
     """
     data = request.get_json(force=True, silent=True) or {}
     order_id = data.get("order_id")
-    status = data.get("status")
+    board = data.get("board")
 
-    if not order_id or status not in ("done", "failed"):
-        return jsonify({"error": "order_id, status(done/failed)는 필수"}), 400
+    if not order_id or board not in ("done", "failed"):
+        return jsonify({"error": "order_id, board(done/failed)는 필수"}), 400
 
-    content = {"order_id": order_id, "status": status}
+    content = {"order_id": order_id, "board": board}
     ok = post_cin_to_mobius("cnt_robot_arm/cnt_board_robot_arm", content)
     print(f"[report/board-robot-arm] {'성공' if ok else '실패'}:", content)
 
     if not ok:
         return jsonify({"error": "mobius CIN 생성 실패"}), 502
     return jsonify({"result": "ok"}), 200
+
+
+@app.route("/report/board-dispense", methods=["POST"])
+def report_board_dispense():
+    """
+    실제로 배출(픽업)한 보드 색상 보고 - 플랫폼이 주문 색과 대조하는 용도.
+    body: {"order_id": "...", "board": "blue"}   (색 이름 그대로, r/y/b/g 코드 아님)
+    스펙: cnt_warehouse/cnt_board_dispense
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    order_id = data.get("order_id")
+    color = data.get("board")
+
+    if not order_id or color not in BOARD_COLORS:
+        return jsonify({"error": f"order_id, board({'/'.join(BOARD_COLORS)})는 필수"}), 400
+
+    content = {"order_id": order_id, "board": color}
+    ok = post_cin_to_mobius("cnt_warehouse/cnt_board_dispense", content)
+    print(f"[report/board-dispense] {'성공' if ok else '실패'}:", content)
+
+    if not ok:
+        return jsonify({"error": "mobius CIN 생성 실패"}), 502
+    return jsonify({"result": "ok"}), 200
+
+
+@app.route("/report/board-status", methods=["POST"])
+def report_board_status():
+    """
+    보드 색상별 카트리지(레일) 상태 보고 (아두이노가 없어서 로봇암 PC가 대신 보고).
+    body: {"order_id": "...", "board": "blue", "status": "idle"|"busy"|"disable"|"empty", "count": 5}
+    - order_id: 이 레일을 마지막으로 사용한 주문
+    - count: 현재 재고 수량
+    - status: idle(대기) / busy(배출 중) / disable(오배출) / empty(재고 부족)
+    스펙: cnt_warehouse/cnt_board_status/cnt_{r|y|b|g}  예) cnt_warehouse/cnt_board_status/cnt_r
+         (컨테이너 이름은 한 글자 색상 코드 - 키캡의 cnt_keycap_status/cnt_E_r 등과 같은 패턴)
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    order_id = data.get("order_id")
+    color = data.get("board")
+    status = data.get("status")
+    count = data.get("count")
+
+    if not order_id or color not in BOARD_COLORS or status not in BOARD_STATUS_VALUES:
+        return jsonify({
+            "error": f"order_id, board({'/'.join(BOARD_COLORS)}), status({'/'.join(BOARD_STATUS_VALUES)})는 필수"
+        }), 400
+    if count is None:
+        return jsonify({"error": "count는 필수"}), 400
+
+    content = {"order_id": order_id, "count": count, "status": status}
+    code = BOARD_COLOR_CODE[color]
+    cnt_path = f"cnt_warehouse/cnt_board_status/cnt_{code}"
+
+    ok = post_cin_to_mobius(cnt_path, content)
+    print(f"[report/board-status] {cnt_path} {'성공' if ok else '실패'}:", content)
+
+    if not ok:
+        return jsonify({"error": "mobius CIN 생성 실패"}), 502
+
+    # Mobius 성공 후에만 Redis 갱신 - 둘이 어긋난 상태로 안 남게
+    redis.set(f"stock:board_{color}", count)
+    return jsonify({"result": "ok"}), 200
+
+
+@app.route("/stock/board", methods=["GET"])
+def get_stock_board():
+    """
+    로봇암 PC가 시작할 때 현재 재고를 읽어오는 용도.
+    응답: {"red": 300, "yellow": 300, "blue": 300, "green": 300}
+    """
+    keys = [f"stock:board_{c}" for c in BOARD_COLORS]
+    values = redis.mget(*keys)
+    result = {c: int(v or 0) for c, v in zip(BOARD_COLORS, values)}
+    return jsonify(result), 200
 
 
 @app.route("/report/keycap-robot-arm", methods=["POST"])

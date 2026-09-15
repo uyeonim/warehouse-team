@@ -3,4 +3,4 @@ paho-mqtt
 python-dotenv
 gunicorn
 requests
-#upstash-redis
+upstash-redis
