@@ -29,18 +29,58 @@
 
 MQTT 수신 / Flask 보고 로직은 이전과 동일 (app.py 수정 불필요).
 
+주문 로직 - 키캡 디스펜서 아두이노(alreadyProcessed / jobQueue / 서버큐 /
+pickup 게이트) 패턴과 동일하게 맞춤:
+  - 중복방지: jobKey(order_id+color+status+retry) 최근 8개를 링버퍼로 기억,
+    같은 스냅샷 재전송이나 assigned/tray_reached가 여러 스냅샷에 걸쳐
+    남아있어도 큐에 두 번 안 넣음.
+    ⚠️ jobKey에 status/retry를 포함시킨 이유: tray_reached(최초 픽업)와
+    board_mismatched(재출고)가 같은 order_id+color를 쓰기 때문에, status를
+    안 넣으면 재출고 요청이 "이미 처리한 job"으로 오인되어 무시당함.
+    retry까지 넣은 이유는 재출고가 최대 2회 반복될 수 있는데(명세 8-2),
+    두 번째 재출고도 status는 똑같이 board_mismatched라서 status만으로는
+    구분이 안 됨 - 팀원 warehouse_server.py가 order.get("retry")로 이 문제를
+    풀었던 것과 동일한 방식. retry 필드가 실제로 오는지는 미확인이라, 없으면
+    None으로 처리되어 최초 1회 재출고까지는 정상 동작하고 그 이상 반복되는
+    재출고 구분만 안 될 수 있음(플랫폼팀 확인 필요).
+  - 로컬 큐 + 서버 큐(Redis, /queue/board/*) 동기화: tray_reached/
+    board_mismatched 감지 시 즉시 처리하지 않고 큐에 적재 -> 재부팅해도
+    GET /queue/board/next로 미완료 주문 복원 가능
+  - 유령주문 정리: 큐에 남은 job의 order_id가 스냅샷 orders에서 사라지면
+    로컬+서버 큐 양쪽에서 제거 (cnt_process 스펙상 진행 중 주문은 매
+    스냅샷마다 전부 실리므로, 한 번 빠지면 종료된 것으로 간주 가능)
+  - 픽업 게이트(안전망): 명세상 벨트가 주문 1건만 태우므로 tray_reached
+    시점엔 이전 주문 흔적이 있을 수 없어 정상 흐름에선 게이트가 항상
+    열려있는 상태로 즉시 통과함. 그래도 수동 테스트 스냅샷처럼 명세를
+    벗어난 입력 대비 안전장치로 유지. 픽업+컨베이어 직후(성공/실패 무관)
+    잠그고, 그 주문이 pickup_reached 이후 상태가 되거나 목록에서
+    사라지면 열림 (/gate/board/*)
+    ⚠️ GATE_OPEN_STATUSES는 키캡 코드 기준으로 옮긴 것 - 플랫폼 상태표와
+    실제 철자/대소문자 일치 여부 확인 필요. unclaimed(노쇼) 포함 여부도
+    노쇼 시 실제로 픽업 지점이 비워지는지에 달려있어 재검토 필요.
+
+⚠️ 미확인 설계 질문 (플랫폼팀/이사님 확인 필요, 코드는 일단 "비어있다"고 가정):
+  board_mismatched(재출고) 시점에 트레이 위에 이미 잘못된 보드가 놓여있는
+  상태인지, 아니면 플랫폼/다른 파트가 이미 치운 상태인지 확인 안 됨.
+  지금 pick_and_place_board_async는 트레이 자리가 비어있다는 전제로 그냥
+  다시 놓기만 함 - 이미 뭔가 놓여있으면 충돌·겹침 가능성 있음.
+
 전체 흐름
-  [보드 픽업 - tray_reached]
+  [보드 픽업 - tray_reached / board_mismatched(재출고)]
+    0. jobKey 중복체크 -> 로컬 큐 + 서버 큐 적재 (게이트 열렸을 때만 실제 처리)
     1. cnt_board_status/cnt_{색} = busy
     2. 배출 (A안 높이계산)
     3. cnt_robot_arm/cnt_board_robot_arm = done/failed
     4. 성공 시 cnt_warehouse/cnt_board_dispense
     5. cnt_board_status/cnt_{색} = idle + count-1  -> 플랫폼이 board_packed로 전이
-  [트레이 컨베이어 - board_packed]
-    6. 컨베이어(Magic Box) section2 구간 구동
-    7. cnt_conveyor/cnt_tray_conveyor = {"order_id":..., "section2": "done"|"failed"}
+    6. 게이트 잠금 + 서버 큐에서 제거
+  [트레이 컨베이어 - keycap_packed(section1) / board_packed(section2)]
+    7. 컨베이어(Magic Box) 해당 section 구간 구동 (게이트/큐 없음 - 직접 반응이라 불필요)
+    8. cnt_conveyor/cnt_tray_conveyor = {"order_id":..., "sectionN": "done"|"failed"}
 
-같은 (order_id, status) 조합은 한 번만 처리 (MQTT 재전송 중복 실행 방지).
+같은 (order_id, status) 조합은 한 번만 처리 (MQTT 재전송 중복 실행 방지) -
+이건 컨베이어 트리거(keycap_packed/board_packed)에만 남겨둠. 픽업 트리거
+(tray_reached/board_mismatched)는 위 jobKey 링버퍼 방식으로 대체.
 
 실행 전 확인
   - DobotLab 연결 끊어둘 것 (COM 포트 충돌 방지)
@@ -83,8 +123,10 @@ if not FLASK_BASE_URL:
 FLASK_BASE_URL = FLASK_BASE_URL.rstrip("/")
 REPORT_TIMEOUT = 5
 
-STATUS_PICK = "tray_reached"
-STATUS_CONVEYOR = "board_packed"
+STATUS_PICK = "tray_reached"           # 보드 픽업 트리거
+STATUS_MISMATCH = "board_mismatched"   # 재출고 트리거 - tray_reached와 같은 핸들러로 처리
+STATUS_CONVEYOR_1 = "keycap_packed"    # 컨베이어 section1 - 보드 로봇암 앞까지 이동
+STATUS_CONVEYOR_2 = "board_packed"     # 컨베이어 section2 - 픽업대까지 이동
 
 DOBOT_PORT = "COM17"   # 팔 + 컨베이어(Magic Box) 공유 포트
 NAMESPACE_ARM = "MagicianLite"
@@ -105,12 +147,21 @@ PLACE_POSE = (189.7914, -280.7065, 21.5396, -82.0)
 HOME_POSE = (200.0, 0.0, 40.0, 0.0)
 
 # =================================================================
-# CONFIG - 트레이 컨베이어 (⚠️ 캘리브레이션 스크립트로 이미 확정된 값이면 여기 반영할 것)
+# CONFIG - 트레이 컨베이어 (⚠️ 캘리브레이션 스크립트로 확정 전 - 전부 placeholder)
+# 물리적으로 벨트 2개(STP1/STP2)를 이어붙여 "하나의 긴 벨트"로 씀 - 이 두 모터는
+# section1이든 section2든 항상 같이 구동/정지함 (아래 STP_1/STP_2가 그 둘).
+#
+# 그 "하나의 긴 벨트"가 두 구간을 담당함 (이건 모터 개수랑 무관한 별개의 구분):
+#   section1: keycap_packed 감지 시 구동 - 보드 로봇암 앞까지 이동
+#   section2: board_packed  감지 시 구동 - 픽업대까지 이동
+# 두 구간 이동 거리가 다를 수 있어 구동 시간을 따로 둠 (속도는 공통값으로 시작)
 # =================================================================
-TRAY_CONVEYOR_INDEX = 0
+TRAY_CONVEYOR_STP_1 = 0   # Magic Box STP1 포트
+TRAY_CONVEYOR_STP_2 = 0   # Magic Box STP2 포트 (벨트 1개만 연결된 동안은 STP1과 동일값)
 TRAY_CONVEYOR_SPEED_MM_S = 30
-TRAY_CONVEYOR_RUN_TIME = 3.0
-TRAY_CONVEYOR_SECTION = "2"
+
+TRAY_CONVEYOR_RUN_TIME_SECTION1 = 6.0   # keycap_packed -> 보드 로봇암 앞까지
+TRAY_CONVEYOR_RUN_TIME_SECTION2 = 5.0   # board_packed -> 픽업대까지
 
 # =================================================================
 # CONFIG - 이동 타이밍 (pydobot 버전 검증값 참고)
@@ -133,7 +184,48 @@ def mm_per_sec_to_pulses(speed_mm_s):
 snapshot_queue: "queue.Queue" = queue.Queue()
 last_seq = -1
 local_stock = {}
-handled_status = {}
+handled_status = {}   # (order_id -> status) - 컨베이어(keycap_packed/board_packed) 트리거 전용 dedup
+
+# ---- 픽업 job 중복방지 (키캡 alreadyProcessed 패턴) ----
+JOB_HISTORY_SIZE = 8
+processed_job_keys = []  # 최근 처리(큐 적재)한 jobKey 링버퍼
+
+
+def already_processed(job_key):
+    return job_key in processed_job_keys
+
+
+def mark_processed(job_key):
+    processed_job_keys.append(job_key)
+    if len(processed_job_keys) > JOB_HISTORY_SIZE:
+        processed_job_keys.pop(0)
+
+
+def build_job_key(order_id, color, status, retry):
+    """
+    tray_reached(최초)와 board_mismatched(재출고)가 같은 order_id+color를
+    쓰므로 status를 반드시 포함해야 재출고가 "이미 처리한 job"으로 오인되어
+    무시되는 걸 막을 수 있음. retry까지 포함하는 이유는 재출고가 최대 2회
+    반복될 수 있는데(명세 8-2) 두 번째 재출고도 status는 똑같이
+    board_mismatched라서 status만으로는 구분이 안 되기 때문 - retry 필드가
+    없으면(None) 두 번째 재출고부터는 dedup에 걸려 무시될 수 있음, 플랫폼이
+    실제로 retry를 내려주는지 확인 필요.
+    """
+    return f"{order_id}_{color}_{status}_{retry}"
+
+
+# ---- 픽업 로컬 큐 (서버 큐와 동기화) ----
+job_queue = []  # [{"order_id":..., "color":...}, ...] FIFO - pop(0)으로 소비
+
+# ---- 픽업 게이트 (안전망) ----
+gate_open = True
+gate_order_id = ""
+
+# pickup_reached 및 그 이후 전 단계 - 이 목록에 들면 게이트 오픈.
+# ⚠️ 플랫폼 상태표 기준 철자 재확인 필요, unclaimed 포함 여부도 재검토 필요.
+GATE_OPEN_STATUSES = (
+    "pickup_reached", "loaded", "arrived", "unclaimed", "verified", "received", "completed"
+)
 
 
 def log(tag, msg):
@@ -253,6 +345,72 @@ def report_conveyor_tray(order_id, section, status):
         return False
 
 
+# ---- 픽업 큐 서버 동기화 (키캡의 enqueueToServer/completeOnServer 대응) ----
+def fetch_queue_from_server():
+    try:
+        resp = requests.get(f"{FLASK_BASE_URL}/queue/board/next", timeout=REPORT_TIMEOUT)
+        resp.raise_for_status()
+        items = resp.json()
+        log("QUEUE", f"서버 큐 복원: {items}")
+        return items
+    except Exception as e:
+        log("QUEUE", f"서버 큐 조회 실패: {e} - 빈 큐로 시작")
+        return []
+
+
+def enqueue_to_server(order_id, color):
+    try:
+        resp = requests.post(
+            f"{FLASK_BASE_URL}/queue/board/enqueue",
+            json={"order_id": order_id, "color": color},
+            timeout=REPORT_TIMEOUT,
+        )
+        return 200 <= resp.status_code < 300
+    except Exception as e:
+        log("QUEUE", f"서버 큐 적재 실패: {e}")
+        return False
+
+
+def complete_on_server(order_id, color):
+    try:
+        resp = requests.post(
+            f"{FLASK_BASE_URL}/queue/board/complete",
+            json={"order_id": order_id, "color": color},
+            timeout=REPORT_TIMEOUT,
+        )
+        return 200 <= resp.status_code < 300
+    except Exception as e:
+        log("QUEUE", f"서버 큐 제거 실패: {e}")
+        return False
+
+
+# ---- 픽업 게이트 서버 동기화 (키캡의 restoreGateFromServer 등 대응) ----
+def fetch_gate_from_server():
+    try:
+        resp = requests.get(f"{FLASK_BASE_URL}/gate/board", timeout=REPORT_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        log("GATE", f"서버 게이트 상태 복원: {data}")
+        return data
+    except Exception as e:
+        log("GATE", f"서버 게이트 조회 실패: {e} - 기본값(열림)으로 시작")
+        return {"locked": False}
+
+
+def lock_gate_on_server(order_id):
+    try:
+        requests.post(f"{FLASK_BASE_URL}/gate/board", json={"order_id": order_id}, timeout=REPORT_TIMEOUT)
+    except Exception as e:
+        log("GATE", f"서버 게이트 잠금 실패: {e}")
+
+
+def clear_gate_on_server():
+    try:
+        requests.post(f"{FLASK_BASE_URL}/gate/board/clear", timeout=REPORT_TIMEOUT)
+    except Exception as e:
+        log("GATE", f"서버 게이트 해제 실패: {e}")
+
+
 # ============================== DobotRPC 공용 헬퍼 ==============================
 async def safe_call(coro, timeout_sec=CALL_TIMEOUT):
     try:
@@ -351,34 +509,61 @@ async def pick_and_place_board_async(arm_api, color, count):
 
 
 # ============================== 컨베이어 로직 ==============================
-async def run_tray_conveyor_async(box_api):
+async def _set_conveyor(box_api, index, enable, speed_mm_s):
+    speed_pulses = mm_per_sec_to_pulses(speed_mm_s) if enable else 0
+    return await safe_call(box_api.SetEMotor(
+        portName=DOBOT_PORT, index=index, enable=enable, speed=speed_pulses, isQueued=False
+    ))
+
+
+async def run_tray_conveyor_async(box_api, run_time, section_label=""):
+    """
+    이어붙인 벨트 2개(STP1/STP2)를 거의 동시에 구동/정지, run_time초만큼.
+    gather로 두 SetEMotor 호출을 동시에 쏴서 타이밍 어긋남을 최소화함 -
+    순서대로 하나씩 보내면 두 번째 벨트가 몇백ms 늦게 시작/정지해서
+    이음매에서 트레이가 걸리거나 밀릴 수 있음.
+    """
     try:
-        speed_pulses = mm_per_sec_to_pulses(TRAY_CONVEYOR_SPEED_MM_S)
-        log("CONV", f"컨베이어 구동 시작 (index={TRAY_CONVEYOR_INDEX}, speed={TRAY_CONVEYOR_SPEED_MM_S}mm/s)")
-        start_res = await safe_call(box_api.SetEMotor(
-            portName=DOBOT_PORT, index=TRAY_CONVEYOR_INDEX,
-            enable=True, speed=speed_pulses, isQueued=False
-        ))
-        log("CONV", f"시작 명령 결과: {start_res}")
+        log("CONV", f"컨베이어 구동 시작{section_label} (STP1+STP2 동시, "
+                     f"speed={TRAY_CONVEYOR_SPEED_MM_S}mm/s, {run_time}초)")
+        start_res_1, start_res_2 = await asyncio.gather(
+            _set_conveyor(box_api, TRAY_CONVEYOR_STP_1, True, TRAY_CONVEYOR_SPEED_MM_S),
+            _set_conveyor(box_api, TRAY_CONVEYOR_STP_2, True, TRAY_CONVEYOR_SPEED_MM_S),
+        )
+        log("CONV", f"시작 명령 결과: STP1={start_res_1}, STP2={start_res_2}")
 
-        await asyncio.sleep(TRAY_CONVEYOR_RUN_TIME)
+        await asyncio.sleep(run_time)
 
-        stop_res = await safe_call(box_api.SetEMotor(
-            portName=DOBOT_PORT, index=TRAY_CONVEYOR_INDEX,
-            enable=False, speed=0, isQueued=False
-        ))
-        log("CONV", f"정지 명령 결과: {stop_res}")
+        stop_res_1, stop_res_2 = await asyncio.gather(
+            _set_conveyor(box_api, TRAY_CONVEYOR_STP_1, False, 0),
+            _set_conveyor(box_api, TRAY_CONVEYOR_STP_2, False, 0),
+        )
+        log("CONV", f"정지 명령 결과: STP1={stop_res_1}, STP2={stop_res_2}")
 
-        return is_ok(start_res) and is_ok(stop_res)
+        return all(is_ok(r) for r in (start_res_1, start_res_2, stop_res_1, stop_res_2))
     except Exception as e:
         log("CONV", f"예외 발생: {e}")
+        # 하나라도 켜진 채로 남는 것 방지 - 둘 다 강제 정지 시도
+        try:
+            await asyncio.gather(
+                _set_conveyor(box_api, TRAY_CONVEYOR_STP_1, False, 0),
+                _set_conveyor(box_api, TRAY_CONVEYOR_STP_2, False, 0),
+            )
+        except Exception:
+            pass
         return False
 
 
 # ============================== 주문 처리 (동기 래퍼) ==============================
-def handle_board_pick(loop, arm_api, order_id, color):
+def process_board_job(loop, arm_api, box_api, order_id, color):
+    """
+    큐에서 꺼낸 job 1건 처리 - 픽업 실행 후, 성공/실패 무관하게 게이트 잠금 + 서버 큐 제거.
+    """
+    global gate_open, gate_order_id
+
     if color not in BOARD_COLORS or color not in PICK_POSE_BASE:
         log("ARM", f"알 수 없는 색상 '{color}' - 중단")
+        complete_on_server(order_id, color)
         return
 
     count_before = local_stock.get(color, 0)
@@ -386,49 +571,113 @@ def handle_board_pick(loop, arm_api, order_id, color):
         log("ARM", f"[{color}] 재고 0 - 픽업 불가")
         report_board_status(order_id, color, "empty", count=0)
         report_board_robot_arm(order_id, "failed")
+    else:
+        report_board_status(order_id, color, "busy", count=count_before)
+        success = loop.run_until_complete(pick_and_place_board_async(arm_api, color, count_before))
+        report_board_robot_arm(order_id, "done" if success else "failed")
+
+        if not success:
+            report_board_status(order_id, color, "idle", count=count_before)
+        else:
+            report_board_dispense(order_id, color)
+            count_after = count_before - 1
+            local_stock[color] = count_after
+            report_board_status(order_id, color, "idle", count=count_after)
+            log("STOCK", f"[{color}] 재고 {count_before} -> {count_after}")
+
+    # 성공/실패/재고없음 관계없이 - 이 주문의 픽업 시도는 끝났으므로 게이트 잠금 + 큐 정리
+    gate_open = False
+    gate_order_id = order_id
+    lock_gate_on_server(order_id)
+    log("GATE", f"잠금: {order_id} (pickup_reached 이후 대기)")
+    complete_on_server(order_id, color)
+
+
+def handle_tray_conveyor(loop, box_api, order_id, section):
+    """section: "1" (keycap_packed -> 보드 로봇암 앞) 또는 "2" (board_packed -> 픽업대)."""
+    run_time = TRAY_CONVEYOR_RUN_TIME_SECTION1 if section == "1" else TRAY_CONVEYOR_RUN_TIME_SECTION2
+    log("CONV", f"{order_id}: 컨베이어 section{section} 구동 시작")
+    success = loop.run_until_complete(run_tray_conveyor_async(box_api, run_time, f" (section{section})"))
+    report_conveyor_tray(order_id, section, "done" if success else "failed")
+
+
+# ---- 게이트: 기다리던 주문이 pickup_reached(이후) 됐는지 확인, 맞으면 게이트 열기 ----
+def check_gate_against_orders(orders):
+    global gate_open, gate_order_id
+
+    if gate_open:
+        return
+    if not gate_order_id:
+        gate_open = True
         return
 
-    report_board_status(order_id, color, "busy", count=count_before)
-    success = loop.run_until_complete(pick_and_place_board_async(arm_api, color, count_before))
-    report_board_robot_arm(order_id, "done" if success else "failed")
-
-    if not success:
-        report_board_status(order_id, color, "idle", count=count_before)
+    if gate_order_id not in orders:
+        log("GATE", f"{gate_order_id} 목록에서 사라짐 -> 게이트 열림")
+        gate_open = True
+        gate_order_id = ""
+        clear_gate_on_server()
         return
 
-    report_board_dispense(order_id, color)
-    count_after = count_before - 1
-    local_stock[color] = count_after
-    report_board_status(order_id, color, "idle", count=count_after)
-    log("STOCK", f"[{color}] 재고 {count_before} -> {count_after}")
+    status = orders[gate_order_id].get("status")
+    if status in GATE_OPEN_STATUSES:
+        log("GATE", f"{gate_order_id} status={status} -> 게이트 열림")
+        gate_open = True
+        gate_order_id = ""
+        clear_gate_on_server()
 
 
-def handle_tray_conveyor(loop, box_api, order_id):
-    log("CONV", f"{order_id}: board_packed 감지 -> 트레이 컨베이어(section{TRAY_CONVEYOR_SECTION}) 구동")
-    success = loop.run_until_complete(run_tray_conveyor_async(box_api))
-    report_conveyor_tray(order_id, TRAY_CONVEYOR_SECTION, "done" if success else "failed")
+# ---- 큐에 남은 job 중 orders에서 사라진 것(유령주문) 정리 ----
+def prune_dead_jobs_from_queue(orders):
+    global job_queue
+    alive, removed = [], 0
+    for job in job_queue:
+        if job["order_id"] in orders:
+            alive.append(job)
+        else:
+            complete_on_server(job["order_id"], job["color"])
+            removed += 1
+    job_queue = alive
+    if removed:
+        log("QUEUE", f"orders에서 사라진 job {removed}건 제거함")
 
 
 def handle_snapshot(loop, arm_api, box_api, data):
     orders = data.get("orders", {})
+
+    # 1. 게이트 재평가
+    check_gate_against_orders(orders)
+
+    # 2. 유령주문 정리
+    prune_dead_jobs_from_queue(orders)
+
+    # 3. 새 주문 감지 - 픽업(tray_reached/board_mismatched)은 큐잉만,
+    #    컨베이어(keycap_packed/board_packed)는 즉시 반응(status 기반 dedup 유지)
     for order_id, order in list(orders.items()):
         if order.get("fault") is not None:
             handled_status.pop(order_id, None)
             continue
 
         status = order.get("status")
-        if handled_status.get(order_id) == status:
-            continue
 
-        if status == STATUS_PICK:
+        if status in (STATUS_PICK, STATUS_MISMATCH):
             color = order.get("board")
-            log("ARM", f"{order_id}: {STATUS_PICK} 감지 (색상={color}) -> 처리 시작")
-            handle_board_pick(loop, arm_api, order_id, color)
-            handled_status[order_id] = status
+            retry = order.get("retry")  # 재출고 횟수 - 명세에 필드명 미확정, 없으면 None
+            job_key = build_job_key(order_id, color, status, retry)
+            if not already_processed(job_key):
+                mark_processed(job_key)
+                job_queue.append({"order_id": order_id, "color": color})
+                enqueue_to_server(order_id, color)
+                log("QUEUE", f"{order_id}({color}, {status}, retry={retry}) 큐 적재 - 대기 {len(job_queue)}건")
 
-        elif status == STATUS_CONVEYOR:
-            handle_tray_conveyor(loop, box_api, order_id)
-            handled_status[order_id] = status
+        elif status == STATUS_CONVEYOR_1:
+            if handled_status.get(order_id) != status:
+                handle_tray_conveyor(loop, box_api, order_id, "1")
+                handled_status[order_id] = status
+
+        elif status == STATUS_CONVEYOR_2:
+            if handled_status.get(order_id) != status:
+                handle_tray_conveyor(loop, box_api, order_id, "2")
+                handled_status[order_id] = status
 
     for order_id in list(handled_status):
         if order_id not in orders:
@@ -437,8 +686,26 @@ def handle_snapshot(loop, arm_api, box_api, data):
 
 # ============================== 메인 ==============================
 def main():
-    global local_stock
+    global local_stock, job_queue, gate_open, gate_order_id
+
     local_stock = fetch_initial_stock()
+
+    # 서버(Redis)에서 큐/게이트 복원 - 재부팅 대비
+    restored_jobs = fetch_queue_from_server()
+    job_queue = restored_jobs
+    # 복원된 job의 원래 jobKey(status/retry 포함)는 서버 큐에 안 남아있어서
+    # 여기선 order_id+color 조합만 알 수 있음 - 재부팅 직후 딱 한 번, 정확히
+    # 같은 status+retry로 재전송되는 극히 좁은 경우만 중복 적재될 수 있는
+    # 트레이드오프로 남겨둠 (재고/게이트 안전성엔 영향 없음, 최악이어도 같은
+    # job이 큐에 두 번 들어가는 정도)
+
+    gate_state = fetch_gate_from_server()
+    if gate_state.get("locked"):
+        gate_open = False
+        gate_order_id = gate_state.get("order_id", "")
+    else:
+        gate_open = True
+        gate_order_id = ""
 
     mqtt_client = build_mqtt_client()
     mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
@@ -457,15 +724,23 @@ def main():
     if not is_ok(connect_res):
         log("INIT", "연결 실패 - DobotLab 연결 끊겨있는지, DobotLink.exe 켜져있는지 확인")
 
-    log("INIT", f"준비 완료 (픽업:{STATUS_PICK}, 컨베이어:{STATUS_CONVEYOR}) - 대기 시작. Ctrl+C로 종료")
+    log("INIT", f"준비 완료 (픽업:{STATUS_PICK}/{STATUS_MISMATCH}, 컨베이어1:{STATUS_CONVEYOR_1}, "
+                f"컨베이어2:{STATUS_CONVEYOR_2}, 큐 {len(job_queue)}건, "
+                f"게이트 {'닫힘' if not gate_open else '열림'}) - 대기 시작. Ctrl+C로 종료")
 
     try:
         while True:
             try:
                 data = snapshot_queue.get(timeout=1)
+                handle_snapshot(loop, arm_api, box_api, data)
             except queue.Empty:
-                continue
-            handle_snapshot(loop, arm_api, box_api, data)
+                pass
+
+            # 게이트 열려있고 큐에 대기 중인 job 있으면 하나 처리
+            if gate_open and job_queue:
+                job = job_queue.pop(0)
+                log("ARM", f"{job['order_id']}: 큐에서 꺼내 처리 시작 (색상={job['color']})")
+                process_board_job(loop, arm_api, box_api, job["order_id"], job["color"])
     except KeyboardInterrupt:
         log("SHUTDOWN", "Ctrl+C로 종료")
     finally:

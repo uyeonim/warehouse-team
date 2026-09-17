@@ -358,5 +358,88 @@ def report_conveyor(which):
     return jsonify({"result": "ok"}), 200
 
 
+# ============================================================
+# 보드 픽업 대기열 (재부팅 시 미완료 주문 복원용) - 키캡의 /queue/{board}/* 패턴과 동일.
+# 보드는 로봇암이 한 대뿐이라 {board} 자리는 고정값 "board" 하나만 씀.
+# ============================================================
+def _board_queue_item(order_id: str, color: str) -> str:
+    return json.dumps({"order_id": order_id, "color": color}, ensure_ascii=False)
+
+
+@app.route("/queue/board/next", methods=["GET"])
+def board_queue_next():
+    items = redis.lrange("queue:board", 0, -1)
+    result = [json.loads(item) for item in items]
+    return jsonify(result), 200
+
+
+@app.route("/queue/board/enqueue", methods=["POST"])
+def board_queue_enqueue():
+    data = request.get_json(force=True, silent=True) or {}
+    order_id = data.get("order_id")
+    color = data.get("color")
+    if not order_id or color not in BOARD_COLORS:
+        return jsonify({"error": f"order_id, color({'/'.join(BOARD_COLORS)})는 필수"}), 400
+
+    redis.rpush("queue:board", _board_queue_item(order_id, color))
+    return jsonify({"result": "ok"}), 200
+
+
+@app.route("/queue/board/complete", methods=["POST"])
+def board_queue_complete():
+    data = request.get_json(force=True, silent=True) or {}
+    order_id = data.get("order_id")
+    color = data.get("color")
+    if not order_id or color not in BOARD_COLORS:
+        return jsonify({"error": f"order_id, color({'/'.join(BOARD_COLORS)})는 필수"}), 400
+
+    redis.lrem("queue:board", 1, _board_queue_item(order_id, color))
+    return jsonify({"result": "ok"}), 200
+
+
+# ============================================================
+# 픽업 게이트 (안전망용) - 정상 흐름에서는 창고 벨트가 주문 1건만 태우므로
+# tray_reached 시점에 이전 주문 흔적이 있을 수 없어 사실상 항상 즉시 통과함.
+# 그래도 수동 테스트 스냅샷처럼 명세를 벗어난 입력이 들어올 경우를 대비한
+# 안전장치로 유지 - 키캡의 /gate/{board}/* 패턴과 동일, {board} 자리 고정값 "board".
+# Redis 키: gate:board (값 = 대기 중인 order_id, 키 자체가 없으면 "열림" 상태)
+# ============================================================
+def _board_gate_key() -> str:
+    return "gate:board"
+
+
+@app.route("/gate/board", methods=["GET"])
+def get_board_gate_status():
+    """
+    로봇암 PC 부팅 시 게이트 상태 복원용 조회.
+    응답: {"locked": true, "order_id": "order_test_8017"} 또는 {"locked": false}
+    """
+    order_id = redis.get(_board_gate_key())
+    if not order_id:
+        return jsonify({"locked": False}), 200
+    return jsonify({"locked": True, "order_id": order_id}), 200
+
+
+@app.route("/gate/board", methods=["POST"])
+def lock_board_gate():
+    """로봇암 PC가 픽업+컨베이어 직후(성공/실패 무관) 게이트를 잠글 때 호출."""
+    data = request.get_json(force=True, silent=True) or {}
+    order_id = data.get("order_id")
+    if not order_id:
+        return jsonify({"error": "order_id는 필수"}), 400
+
+    redis.set(_board_gate_key(), order_id)
+    print(f"[gate/board] 잠금: {order_id}")
+    return jsonify({"result": "ok"}), 200
+
+
+@app.route("/gate/board/clear", methods=["POST"])
+def clear_board_gate():
+    """로봇암 PC가 pickup_reached(이후) 확인해서 게이트를 열 때 호출."""
+    redis.delete(_board_gate_key())
+    print("[gate/board] 해제")
+    return jsonify({"result": "ok"}), 200
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
