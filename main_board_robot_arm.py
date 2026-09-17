@@ -136,12 +136,13 @@ STATUS_MISMATCH = "board_mismatched"   # 재출고 트리거 - tray_reached와 �
 STATUS_CONVEYOR_1 = "keycap_packed"    # 컨베이어 section1 - 보드 로봇암 앞까지 이동
 STATUS_CONVEYOR_2 = "board_packed"     # 컨베이어 section2 - 픽업대까지 이동
 
-# fault 값 -> 재시도 종류 매핑 (우리가 관리하는 fault만)
 FAULT_RETRY_MAP = {
     "board_pack_failed": "pick",
     "tray_01_belt_jammed": "conveyor1",
     "tray_02_belt_jammed": "conveyor2",
 }
+STAGE_TIMEOUT_FAULT = "stage_timeout"
+TRACKED_FAULTS = set(FAULT_RETRY_MAP) | {STAGE_TIMEOUT_FAULT}
 
 DOBOT_PORT = "COM17"   # 팔 + 컨베이어(Magic Box) 공유 포트
 NAMESPACE_ARM = "MagicianLite"
@@ -717,7 +718,7 @@ def check_gate_against_orders(orders):
         clear_gate_on_server()
 
 
-# ---- fault 추적: 있다가 없어지는 전이를 감지해서 해당 동작만 즉시 재시도 ----
+# ---- fault 추적: 전이 감지 시 재시도 ----
 def check_fault_transitions(loop, arm_api, box_api, orders):
     global current_fault_order_id, current_fault_value
 
@@ -725,70 +726,72 @@ def check_fault_transitions(loop, arm_api, box_api, orders):
         order = orders.get(current_fault_order_id)
 
         if order is None:
-            log("FAULT", f"{current_fault_order_id} 목록에서 사라짐 - 추적 해제")
             current_fault_order_id, current_fault_value = "", ""
             return
 
         if order.get("fault") is None:
             oid, fval = current_fault_order_id, current_fault_value
-            color = order.get("board")
-            log("FAULT", f"{oid}: {fval} 해제됨 -> 재시도 (색상={color})")
-            # 재시도 호출 전에 먼저 추적 해제 - 재시도 자체가 다시 실패해서
-            # fault가 또 걸리면 그건 "새로운 fault 감지"로 아래 루프에서 다시 잡힘
             current_fault_order_id, current_fault_value = "", ""
+            log("FAULT", f"{oid}: {fval} 해제")
+
+            if fval == STAGE_TIMEOUT_FAULT:
+                handle_stage_timeout_retry(oid, order)
+                return
 
             retry_kind = FAULT_RETRY_MAP.get(fval)
-            # ⚠️ 큐/게이트를 거치지 않고 직접 호출 - process_board_job/
-            # handle_tray_conveyor 안에서 필요한 보고는 알아서 다 함
+            color = order.get("board")
             if retry_kind == "pick":
                 process_board_job(loop, arm_api, box_api, oid, color)
             elif retry_kind == "conveyor1":
                 handle_tray_conveyor(loop, box_api, oid, "1")
             elif retry_kind == "conveyor2":
                 handle_tray_conveyor(loop, box_api, oid, "2")
-            else:
-                log("FAULT", f"'{fval}'은 우리가 관리하는 fault가 아님 - 재시도 안 함")
-        # else: 아직 fault 그대로 - 계속 대기, 아무것도 안 함
         return
 
-    # 추적 중인 게 없으면 - 우리가 관리하는 3종류 fault가 새로 떴는지 찾기
     for order_id, order in orders.items():
         fault = order.get("fault")
-        if fault in FAULT_RETRY_MAP:
+        if fault in TRACKED_FAULTS:
             current_fault_order_id = order_id
             current_fault_value = fault
-            log("FAULT", f"{order_id}: {fault} 감지 - 해제 대기 시작")
-            break  # 벨트가 주문 1건만 태우는 전제 - 한 번에 하나만 추적
+            log("FAULT", f"{order_id}: {fault} 감지")
+            break
 
 
-# ---- 재부팅 복구: fault 뜬 채로 재부팅되면 위 추적 로직이 "전이"를 볼 기회가
-# 없어서 놓침(재부팅 직후 첫 스냅샷에 이미 fault:null이면 "있다가 없어짐"을
-# 감지 못 함). 시작 후 딱 한 번만, 이 특정 빈틈만 별도로 메꿔줌. ----
+def handle_stage_timeout_retry(order_id, order):
+    status = order.get("status")
+    color = order.get("board")
+
+    if status in (STATUS_PICK, STATUS_MISMATCH):
+        job_key = build_job_key(order_id, color, status, order.get("retry"))
+        if not already_processed(job_key):
+            mark_processed(job_key)
+            job_queue.append({"order_id": order_id, "color": color})
+            enqueue_to_server(order_id, color)
+            log("QUEUE", f"{order_id}({color}) stage_timeout -> 큐 적재")
+
+
+# ---- 재부팅 시 fault 해제 전이를 놓친 경우 복구 ----
 startup_recovery_checked = False
 
 
 def check_startup_recovery(loop, arm_api, box_api, orders):
-    global startup_recovery_checked, gate_open, gate_order_id
+    global startup_recovery_checked
 
     if startup_recovery_checked:
         return
-    startup_recovery_checked = True  # 세션당 한 번만 시도
+    startup_recovery_checked = True
 
     if gate_open or not gate_order_id:
-        return  # 복구할 게 없음 (정상 상태로 시작)
+        return
 
     order = orders.get(gate_order_id)
-    if order is None:
-        return  # check_gate_against_orders가 알아서 열어줌
-
-    if order.get("fault") is not None:
-        return  # 아직 fault 있음 - check_fault_transitions가 정상적으로 새로 추적 시작함
+    if order is None or order.get("fault") is not None:
+        return
 
     status = order.get("status")
     if status in (STATUS_PICK, STATUS_MISMATCH):
         color = order.get("board")
-        log("GATE", f"재부팅 복구: {gate_order_id} 게이트 잠긴 채 fault 없음, "
-                     f"status={status} 그대로 -> 다운타임 중 fault 해제된 것으로 간주, 재시도")
+        log("GATE", f"재부팅 복구: {gate_order_id} 재시도")
         process_board_job(loop, arm_api, box_api, gate_order_id, color)
 
 
