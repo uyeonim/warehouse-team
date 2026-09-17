@@ -2,6 +2,7 @@
 """
 =====================================================================
  보드 로봇암 + 트레이 컨베이어 - DobotRPC 단일 + pydobot 스타일 이동
+ + 카메라 배치 검증 + fault 재시도 + restock
 =====================================================================
 ⚠️ pydobot(시리얼 직결)과 DobotRPC(DobotLink 경유)는 같은 COM 포트를
    동시에 못 염(포트는 한 프로그램만 독점). 팔/컨베이어가 실제로 같은
@@ -12,81 +13,86 @@
    전략을 그대로 가져옴:
      - GetPose로 엄격하게 "도착했는지" 확인하고 재시도하는 방식 (X)
        -> DobotRPC의 GetPose도 연속 호출 시 불안정한 게 실물로 확인됨
-          ("초기위치로 복귀"가 매번 반복적으로 실패)
      - 이동 명령 보내고 고정 시간만큼 대기, 그 다음 위치는 "육안 확인용"
-       으로만 한 번 조회 (O) - pydobot 버전이 실제로 안정적으로 동작했던 방식
+       으로만 한 번 조회 (O)
 
-   즉 흡착/컨베이어는 DobotRPC 그대로, "도착 확인 로직"만 pydobot 철학으로 교체.
-   이동 자체(SetPTPCmd)는 여전히 DobotRPC를 씀 - pydobot 라이브러리 자체를
-   불러오지는 않음(포트 충돌 때문에 불가능).
+   대신 "실제로 트레이에 기대한 색 보드가 놓였는지"는 별개 USB 웹캠으로
+   확인함 - 이게 지금 유일한 물리적 결과 검증 수단 (도착 좌표 자체는
+   여전히 엄격 검증 안 함).
 
-⚠️ 이 결과로 "실패 감지"가 약해짐: 이동이 실제로 안 됐어도 예외만 없으면
-   성공으로 보고함(pydobot 버전과 동일한 트레이드오프). 필요해지면 센서
-   기반 확인을 나중에 추가.
-
-흡착 파라미터는 가이드북 API 레퍼런스로 확정된 대로 "on" 사용
+흡착 파라미터: 가이드북 API 레퍼런스로 확정된 대로 "on" 사용
 (m_lite.set_endeffector_suctioncup(enable, on)).
-
-MQTT 수신 / Flask 보고 로직은 이전과 동일 (app.py 수정 불필요).
 
 주문 로직 - 키캡 디스펜서 아두이노(alreadyProcessed / jobQueue / 서버큐 /
 pickup 게이트) 패턴과 동일하게 맞춤:
-  - 중복방지: jobKey(order_id+color+status+retry) 최근 8개를 링버퍼로 기억,
-    같은 스냅샷 재전송이나 assigned/tray_reached가 여러 스냅샷에 걸쳐
-    남아있어도 큐에 두 번 안 넣음.
-    ⚠️ jobKey에 status/retry를 포함시킨 이유: tray_reached(최초 픽업)와
-    board_mismatched(재출고)가 같은 order_id+color를 쓰기 때문에, status를
-    안 넣으면 재출고 요청이 "이미 처리한 job"으로 오인되어 무시당함.
-    retry까지 넣은 이유는 재출고가 최대 2회 반복될 수 있는데(명세 8-2),
-    두 번째 재출고도 status는 똑같이 board_mismatched라서 status만으로는
-    구분이 안 됨 - 팀원 warehouse_server.py가 order.get("retry")로 이 문제를
-    풀었던 것과 동일한 방식. retry 필드가 실제로 오는지는 미확인이라, 없으면
-    None으로 처리되어 최초 1회 재출고까지는 정상 동작하고 그 이상 반복되는
-    재출고 구분만 안 될 수 있음(플랫폼팀 확인 필요).
+  - 중복방지: jobKey(order_id+color+status+retry) 최근 8개를 링버퍼로 기억.
+    ⚠️ status를 포함한 이유: tray_reached(최초)와 board_mismatched(재출고)가
+    같은 order_id+color를 쓰기 때문. retry까지 포함한 이유는 재출고가 최대
+    2회 반복될 수 있어서(명세 8-2) - retry 필드가 실제로 오는지는 미확인.
   - 로컬 큐 + 서버 큐(Redis, /queue/board/*) 동기화: tray_reached/
     board_mismatched 감지 시 즉시 처리하지 않고 큐에 적재 -> 재부팅해도
     GET /queue/board/next로 미완료 주문 복원 가능
   - 유령주문 정리: 큐에 남은 job의 order_id가 스냅샷 orders에서 사라지면
-    로컬+서버 큐 양쪽에서 제거 (cnt_process 스펙상 진행 중 주문은 매
-    스냅샷마다 전부 실리므로, 한 번 빠지면 종료된 것으로 간주 가능)
-  - 픽업 게이트(안전망): 명세상 벨트가 주문 1건만 태우므로 tray_reached
-    시점엔 이전 주문 흔적이 있을 수 없어 정상 흐름에선 게이트가 항상
-    열려있는 상태로 즉시 통과함. 그래도 수동 테스트 스냅샷처럼 명세를
-    벗어난 입력 대비 안전장치로 유지. 픽업+컨베이어 직후(성공/실패 무관)
-    잠그고, 그 주문이 pickup_reached 이후 상태가 되거나 목록에서
-    사라지면 열림 (/gate/board/*)
-    ⚠️ GATE_OPEN_STATUSES는 키캡 코드 기준으로 옮긴 것 - 플랫폼 상태표와
-    실제 철자/대소문자 일치 여부 확인 필요. unclaimed(노쇼) 포함 여부도
-    노쇼 시 실제로 픽업 지점이 비워지는지에 달려있어 재검토 필요.
+    로컬+서버 큐 양쪽에서 제거
+  - 픽업 게이트(안전망): 벨트가 주문 1건만 태우므로 정상 흐름에선 항상
+    열려있는 상태로 즉시 통과함. 수동 테스트 대비 안전장치로 유지.
+    픽업+컨베이어 직후(성공/실패 무관) 잠그고, pickup_reached 이후 상태가
+    되거나 목록에서 사라지면 열림 (/gate/board/*)
+    ⚠️ GATE_OPEN_STATUSES 철자/unclaimed 포함 여부 플랫폼팀 확인 필요.
 
-⚠️ 미확인 설계 질문 (플랫폼팀/이사님 확인 필요, 코드는 일단 "비어있다"고 가정):
-  board_mismatched(재출고) 시점에 트레이 위에 이미 잘못된 보드가 놓여있는
-  상태인지, 아니면 플랫폼/다른 파트가 이미 치운 상태인지 확인 안 됨.
-  지금 pick_and_place_board_async는 트레이 자리가 비어있다는 전제로 그냥
-  다시 놓기만 함 - 이미 뭔가 놓여있으면 충돌·겹침 가능성 있음.
+fault 처리 (신규) - 우리가 관리하는 fault 3종만:
+    board_pack_failed / tray_01_belt_jammed / tray_02_belt_jammed
+  흐름: 우리가 failed 보고 -> 플랫폼이 fault 채워서 push (status는 그대로
+  유지) -> 사람이 물리적으로 해결 -> 관리자페이지에서 fault:null로 push
+  -> 우리가 그 전이(있었다가 없어짐)를 감지 -> 같은 동작 재시도 -> done/failed
+  다시 보고.
+  ⚠️ 재시도는 큐/게이트를 거치지 않고 직접 실행함 - 이미 게이트를 걸고
+  있는 주문 본인이 재시도하는 거라 줄 설 필요가 없고, 큐를 거치면
+  "게이트가 열려야 큐 처리하는데 게이트는 이 주문 성공해야 열림"이라는
+  데드락이 생기기 때문.
+  ⚠️ fault 추적은 로컬 변수만 씀(Redis 영속화 안 함) - fault 정보의
+  원본(source of truth)이 우리 메모리가 아니라 매번 오는 MQTT 스냅샷
+  자체라서, 재부팅으로 추적 상태를 잃어도 다음 스냅샷에서 "새로 발견"으로
+  자동 복구됨 (게이트와 달리 우리 판단이 원본이 아니라서 영속화 불필요).
+  ⚠️ 컨베이어 jam은 아직 센서로 자체 감지 안 함(추후 section1/2에 센서
+  달아서 체크 예정) - 지금은 플랫폼이 걸어주는 fault에만 반응.
+
+restock 처리 (신규):
+  관리자페이지 버튼 -> 플랫폼이 cnt_process 최상위(orders 밖)에
+  board_restock: ["blue", "red"] 형태로 push (물리적으로 이미 다음 스택
+  교체가 끝났다는 확인 신호로 간주) -> 우리가 감지해서 색상마다
+  POST /restock/board/<color> 호출 -> Flask가 pool에서 실제로 차감하며
+  채우고 그 결과(filled)를 반환 -> local_stock 갱신.
+  같은 색이 여러 스냅샷에 걸쳐 반복 등장해도 한 번만 처리(handled_restock),
+  배열에서 사라지면 추적 해제해서 나중에 또 restock 떠도 재처리 가능.
 
 전체 흐름
   [보드 픽업 - tray_reached / board_mismatched(재출고)]
     0. jobKey 중복체크 -> 로컬 큐 + 서버 큐 적재 (게이트 열렸을 때만 실제 처리)
     1. cnt_board_status/cnt_{색} = busy
     2. 배출 (A안 높이계산)
-    3. cnt_robot_arm/cnt_board_robot_arm = done/failed
-    4. 성공 시 cnt_warehouse/cnt_board_dispense
-    5. cnt_board_status/cnt_{색} = idle + count-1  -> 플랫폼이 board_packed로 전이
-    6. 게이트 잠금 + 서버 큐에서 제거
+    3. 카메라로 배치 확인 (색상+존재 여부)
+    4. cnt_robot_arm/cnt_board_robot_arm = done/failed
+    5. 성공 시 cnt_warehouse/cnt_board_dispense
+    6. cnt_board_status/cnt_{색} = idle + count-1  -> 플랫폼이 board_packed로 전이
+    7. 게이트 잠금 + 서버 큐에서 제거
   [트레이 컨베이어 - keycap_packed(section1) / board_packed(section2)]
-    7. 컨베이어(Magic Box) 해당 section 구간 구동 (게이트/큐 없음 - 직접 반응이라 불필요)
-    8. cnt_conveyor/cnt_tray_conveyor = {"order_id":..., "sectionN": "done"|"failed"}
+    8. 컨베이어(Magic Box) 해당 section 구간 구동 (게이트/큐 없음 - 직접 반응)
+    9. cnt_conveyor/cnt_tray_conveyor = {"order_id":..., "sectionN": "done"|"failed"}
+  [fault 해제 재시도] - 위 픽업/컨베이어 실패 후 fault 걸렸다가 null 되면
+    해당 동작만 큐/게이트 없이 즉시 재실행
+  [restock] - board_restock 배열 감지 시 즉시 /restock/board/<color> 호출
 
-같은 (order_id, status) 조합은 한 번만 처리 (MQTT 재전송 중복 실행 방지) -
-이건 컨베이어 트리거(keycap_packed/board_packed)에만 남겨둠. 픽업 트리거
-(tray_reached/board_mismatched)는 위 jobKey 링버퍼 방식으로 대체.
+⚠️ 미확인 설계 질문 (플랫폼팀/이사님 확인 필요, 코드는 일단 "비어있다"고 가정):
+  board_mismatched(재출고) 시점에 트레이 위에 이미 잘못된 보드가 놓여있는
+  상태인지 확인 안 됨 - 지금은 트레이 자리가 비어있다는 전제로 그냥 다시 놓음.
 
 실행 전 확인
   - DobotLab 연결 끊어둘 것 (COM 포트 충돌 방지)
   - DobotLink.exe 실행 중이어야 함
   - .env에 MQTT_HOST/PORT/USER/PASS, MQTT_TOPIC, FLASK_BASE_URL
-  - pip install DobotRPC (Python 3.9 환경 - venv-dobot)
+  - pip install DobotRPC opencv-python numpy (Python 3.9 환경 - venv-dobot)
+  - calibrate_camera.py로 CAMERA_ROI/COLOR_RANGES_HSV 먼저 확정할 것
 =====================================================================
 """
 
@@ -97,6 +103,8 @@ import os
 import queue
 import time
 
+import cv2
+import numpy as np
 import paho.mqtt.client as mqtt
 import requests
 from dotenv import load_dotenv
@@ -128,6 +136,13 @@ STATUS_MISMATCH = "board_mismatched"   # 재출고 트리거 - tray_reached와 �
 STATUS_CONVEYOR_1 = "keycap_packed"    # 컨베이어 section1 - 보드 로봇암 앞까지 이동
 STATUS_CONVEYOR_2 = "board_packed"     # 컨베이어 section2 - 픽업대까지 이동
 
+# fault 값 -> 재시도 종류 매핑 (우리가 관리하는 fault만)
+FAULT_RETRY_MAP = {
+    "board_pack_failed": "pick",
+    "tray_01_belt_jammed": "conveyor1",
+    "tray_02_belt_jammed": "conveyor2",
+}
+
 DOBOT_PORT = "COM17"   # 팔 + 컨베이어(Magic Box) 공유 포트
 NAMESPACE_ARM = "MagicianLite"
 NAMESPACE_BOX = "MagicBox"
@@ -147,14 +162,11 @@ PLACE_POSE = (189.7914, -280.7065, 21.5396, -82.0)
 HOME_POSE = (200.0, 0.0, 40.0, 0.0)
 
 # =================================================================
-# CONFIG - 트레이 컨베이어 (⚠️ 캘리브레이션 스크립트로 확정 전 - 전부 placeholder)
+# CONFIG - 트레이 컨베이어
 # 물리적으로 벨트 2개(STP1/STP2)를 이어붙여 "하나의 긴 벨트"로 씀 - 이 두 모터는
-# section1이든 section2든 항상 같이 구동/정지함 (아래 STP_1/STP_2가 그 둘).
-#
-# 그 "하나의 긴 벨트"가 두 구간을 담당함 (이건 모터 개수랑 무관한 별개의 구분):
+# section1이든 section2든 항상 같이 구동/정지함.
 #   section1: keycap_packed 감지 시 구동 - 보드 로봇암 앞까지 이동
 #   section2: board_packed  감지 시 구동 - 픽업대까지 이동
-# 두 구간 이동 거리가 다를 수 있어 구동 시간을 따로 둠 (속도는 공통값으로 시작)
 # =================================================================
 TRAY_CONVEYOR_STP_1 = 0   # Magic Box STP1 포트
 TRAY_CONVEYOR_STP_2 = 0   # Magic Box STP2 포트 (벨트 1개만 연결된 동안은 STP1과 동일값)
@@ -166,13 +178,39 @@ TRAY_CONVEYOR_RUN_TIME_SECTION2 = 5.0   # board_packed -> 픽업대까지
 # =================================================================
 # CONFIG - 이동 타이밍 (pydobot 버전 검증값 참고)
 # =================================================================
-MOVE_WAIT_SEC = 3.0          # 이동 명령 후 고정 대기 시간 - 거리 크면 늘릴 것
+MOVE_WAIT_SEC = 2.0          # 대부분의 이동에 쓰는 기본 대기시간
+PRECISION_MOVE_WAIT_SEC = 3.0  # 정밀 접촉이 필요한 이동(픽업/놓기) 전용 - 짧으면 흡착 실패 실물로 확인됨
 SUCTION_SETTLE_DELAY = 1.0   # 흡착력 형성 대기
 RELEASE_SETTLE_DELAY = 0.5
 SAFE_LIFT_MM = 40.0
 
 BOARD_COLORS = ["red", "yellow", "blue", "green"]
 CALL_TIMEOUT = 5
+
+# =================================================================
+# CONFIG - 카메라 배치 확인 (calibrate_camera.py로 캘리브레이션 완료)
+# 로봇팔/DobotRPC랑 완전히 무관한 별개 USB 웹캠 - cv2로 직접 제어.
+# 흡착 OFF 후 안전 높이로 들어올린 직후(그리퍼가 시야 안 가릴 때) 사진 찍어서
+# 정해둔 ROI 안에 기대한 색상이 실제로 있는지 확인.
+# =================================================================
+CAMERA_INDEX = 1   # 노트북 내장캠이 0을 먼저 차지하는 경우가 많아 외장캠은 보통 1
+CAMERA_ROI = (200, 150, 150, 100)  # (x, y, w, h) - 실측 필요 시 calibrate_camera.py로 재조정
+CAMERA_PRESENCE_MIN_RATIO = 0.3
+CAMERA_SETTLE_DELAY = 0.5   # 사진 찍기 전 대기 - 5초는 과했음(이전 해석 오류), 짧게 줄임
+
+# 실측 완료 (2026-09 촬영) - H:S:V 순서로 yellow(33,59,252) blue(94,68,243)
+# green(53,46,240) red/핑크(160,70,255). 전부 채도(S) 낮고 명도(V) 높은
+# 파스텔톤이라 S/V는 4색 공통으로 넉넉하게 낮춰 잡음. 노랑/초록 hue가
+# 33/53으로 가까워서 중간값(43) 기준으로 여유 없이 나눔 - 오판정 나면
+# 여기 경계값부터 조정할 것.
+COLOR_RANGES_HSV = {
+    "yellow": [((20, 30, 150), (42, 255, 255))],
+    "green":  [((44, 30, 150), (70, 255, 255))],
+    "blue":   [((75, 30, 150), (120, 255, 255))],
+    "red":    [((140, 30, 150), (180, 255, 255))],  # 실측은 핑크(H160)
+}
+
+# =================================================================
 
 _MM_TO_PULSE = (360.0 / 1.8 * 5.0 * 16.0) / (3.1415926535898 * 32)
 
@@ -188,7 +226,7 @@ handled_status = {}   # (order_id -> status) - 컨베이어(keycap_packed/board_
 
 # ---- 픽업 job 중복방지 (키캡 alreadyProcessed 패턴) ----
 JOB_HISTORY_SIZE = 8
-processed_job_keys = []  # 최근 처리(큐 적재)한 jobKey 링버퍼
+processed_job_keys = []
 
 
 def already_processed(job_key):
@@ -202,30 +240,26 @@ def mark_processed(job_key):
 
 
 def build_job_key(order_id, color, status, retry):
-    """
-    tray_reached(최초)와 board_mismatched(재출고)가 같은 order_id+color를
-    쓰므로 status를 반드시 포함해야 재출고가 "이미 처리한 job"으로 오인되어
-    무시되는 걸 막을 수 있음. retry까지 포함하는 이유는 재출고가 최대 2회
-    반복될 수 있는데(명세 8-2) 두 번째 재출고도 status는 똑같이
-    board_mismatched라서 status만으로는 구분이 안 되기 때문 - retry 필드가
-    없으면(None) 두 번째 재출고부터는 dedup에 걸려 무시될 수 있음, 플랫폼이
-    실제로 retry를 내려주는지 확인 필요.
-    """
     return f"{order_id}_{color}_{status}_{retry}"
 
 
 # ---- 픽업 로컬 큐 (서버 큐와 동기화) ----
-job_queue = []  # [{"order_id":..., "color":...}, ...] FIFO - pop(0)으로 소비
+job_queue = []
 
 # ---- 픽업 게이트 (안전망) ----
 gate_open = True
 gate_order_id = ""
 
-# pickup_reached 및 그 이후 전 단계 - 이 목록에 들면 게이트 오픈.
-# ⚠️ 플랫폼 상태표 기준 철자 재확인 필요, unclaimed 포함 여부도 재검토 필요.
 GATE_OPEN_STATUSES = (
     "pickup_reached", "loaded", "arrived", "unclaimed", "verified", "received", "completed"
 )
+
+# ---- fault 추적 (로컬 변수만 - Redis 영속화 불필요, 이유는 파일 상단 docstring 참고) ----
+current_fault_order_id = ""
+current_fault_value = ""
+
+# ---- restock 중복방지 (board_restock 배열에 같은 색이 여러 스냅샷 걸쳐 남아있어도 한 번만) ----
+handled_restock = set()
 
 
 def log(tag, msg):
@@ -345,7 +379,21 @@ def report_conveyor_tray(order_id, section, status):
         return False
 
 
-# ---- 픽업 큐 서버 동기화 (키캡의 enqueueToServer/completeOnServer 대응) ----
+def call_restock(color):
+    """/restock/board/<color> 호출 - Flask가 pool에서 실제로 차감하며 채우고 filled 반환."""
+    try:
+        resp = requests.post(f"{FLASK_BASE_URL}/restock/board/{color}", timeout=REPORT_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        filled = data.get("filled")
+        log("STOCK", f"restock/{color} 성공: {filled}개로 채움")
+        return filled
+    except Exception as e:
+        log("STOCK", f"restock/{color} 요청 실패: {e}")
+        return None
+
+
+# ---- 픽업 큐 서버 동기화 ----
 def fetch_queue_from_server():
     try:
         resp = requests.get(f"{FLASK_BASE_URL}/queue/board/next", timeout=REPORT_TIMEOUT)
@@ -384,7 +432,7 @@ def complete_on_server(order_id, color):
         return False
 
 
-# ---- 픽업 게이트 서버 동기화 (키캡의 restoreGateFromServer 등 대응) ----
+# ---- 픽업 게이트 서버 동기화 ----
 def fetch_gate_from_server():
     try:
         resp = requests.get(f"{FLASK_BASE_URL}/gate/board", timeout=REPORT_TIMEOUT)
@@ -425,18 +473,14 @@ def is_ok(res):
     return not (isinstance(res, str) and (res.startswith("TIMEOUT") or res.startswith("ERROR")))
 
 
-# ============================== 이동 - pydobot 스타일 (고정 대기, 엄격 확인 없음) ==============================
-async def move_and_wait(arm_api, pose, label=""):
-    """
-    SetPTPCmd 보내고 MOVE_WAIT_SEC초 고정 대기 (pydobot 버전 검증된 전략).
-    ⚠️ GetPose로 "진짜 도착했는지" 재시도하며 확인하지 않음 - DobotRPC의
-    GetPose도 연속 호출 시 불안정한 게 실물로 확인됨(재시도해도 똑같이 실패
-    하는 패턴 반복). 위치는 로그용으로 한 번만 조회 (육안 확인용, 판정에는 안 씀).
-    """
+# ============================== 이동 - pydobot 스타일 ==============================
+async def move_and_wait(arm_api, pose, label="", wait_sec=None):
+    if wait_sec is None:
+        wait_sec = MOVE_WAIT_SEC
     x, y, z, r = pose
     moved = await safe_call(arm_api.SetPTPCmd(portName=DOBOT_PORT, ptpMode=0,
                                                x=x, y=y, z=z, r=r, isQueued=False))
-    await asyncio.sleep(MOVE_WAIT_SEC)
+    await asyncio.sleep(wait_sec)
 
     actual = await safe_call(arm_api.GetPose(portName=DOBOT_PORT, isQueued=False))
     log("ARM", f"{label} - 명령:{moved}, 목표=({x:.1f},{y:.1f},{z:.1f},{r:.1f}), 실제위치:{actual}")
@@ -444,14 +488,54 @@ async def move_and_wait(arm_api, pose, label=""):
 
 
 async def suck(arm_api, on):
-    """
-    가이드북 API 레퍼런스로 파라미터명 확정: m_lite.set_endeffector_suctioncup(enable, on)
-    """
     res = await safe_call(arm_api.SetEndEffectorSuctionCup(
         portName=DOBOT_PORT, enable=True, on=on, isQueued=False
     ))
     log("ARM", f"흡착 {'ON' if on else 'OFF'} 결과: {res}")
     return res
+
+
+# ============================== 카메라 배치 확인 ==============================
+def _capture_frame():
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        return None
+    ok, frame = cap.read()
+    cap.release()
+    return frame if ok else None
+
+
+def _classify_roi_color(frame):
+    x, y, w, h = CAMERA_ROI
+    roi = frame[y:y + h, x:x + w]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    total_px = roi.shape[0] * roi.shape[1]
+
+    best_color, best_ratio = None, 0.0
+    for color, ranges in COLOR_RANGES_HSV.items():
+        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for lo, hi in ranges:
+            mask |= cv2.inRange(hsv, np.array(lo), np.array(hi))
+        ratio = cv2.countNonZero(mask) / total_px
+        if ratio > best_ratio:
+            best_ratio, best_color = ratio, color
+    return best_color, best_ratio
+
+
+def verify_board_on_tray(expected_color):
+    frame = _capture_frame()
+    if frame is None:
+        return False, None, "카메라 프레임 획득 실패"
+
+    detected_color, ratio = _classify_roi_color(frame)
+
+    if ratio < CAMERA_PRESENCE_MIN_RATIO:
+        return False, detected_color, f"보드 미감지 (비율 {ratio:.2f} < {CAMERA_PRESENCE_MIN_RATIO})"
+
+    if detected_color != expected_color:
+        return False, detected_color, f"색상 불일치 - 기대:{expected_color}, 감지:{detected_color}"
+
+    return True, detected_color, f"확인됨 (비율 {ratio:.2f})"
 
 
 # ============================== 픽업 로직 ==============================
@@ -464,9 +548,9 @@ def compute_pick_pose(color, count):
 async def pick_and_place_board_async(arm_api, color, count):
     """
     픽업 -> 안전 높이로 들어올림 -> 안전 높이 유지한 채 이동 -> 트레이로 하강 -> 놓기
-    -> 다시 안전 높이로 들어올림 -> 초기위치 복귀.
-    ⚠️ pydobot 버전과 동일한 트레이드오프: 실제 도착을 엄격히 검증하지 않으므로,
-    예외만 없으면 항상 성공으로 처리함. 로그의 "실제위치"로 육안 확인할 것.
+    -> 다시 안전 높이로 들어올림 -> 카메라로 배치 확인 -> 초기위치 복귀.
+    ⚠️ 이동 자체(도착 좌표)는 pydobot 트레이드오프 그대로 엄격 검증 안 함.
+    카메라 확인만이 유일한 물리적 결과 검증 수단.
     """
     pick_x, pick_y, pick_z, pick_r = compute_pick_pose(color, count)
     place_x, place_y, place_z, place_r = PLACE_POSE
@@ -474,35 +558,49 @@ async def pick_and_place_board_async(arm_api, color, count):
     log("ARM", f"[{color}] 픽업 좌표: ({pick_x:.1f},{pick_y:.1f},{pick_z:.1f}) / 이동 높이: {travel_z:.1f}")
 
     try:
-        await move_and_wait(arm_api, (pick_x, pick_y, pick_z, pick_r), label="픽업 위치로 이동")
+        await move_and_wait(arm_api, (pick_x, pick_y, pick_z, pick_r), label="픽업 위치로 이동",
+                             wait_sec=PRECISION_MOVE_WAIT_SEC)
 
         grabbed = await suck(arm_api, True)
         await asyncio.sleep(SUCTION_SETTLE_DELAY)
 
         await move_and_wait(arm_api, (pick_x, pick_y, travel_z, pick_r), label="안전 높이로 들어올리기")
         await move_and_wait(arm_api, (place_x, place_y, travel_z, place_r), label="안전 높이 유지한 채 트레이 위로 이동")
-        await move_and_wait(arm_api, (place_x, place_y, place_z, place_r), label="트레이 위치로 하강")
+        await move_and_wait(arm_api, (place_x, place_y, place_z, place_r), label="트레이 위치로 하강",
+                             wait_sec=PRECISION_MOVE_WAIT_SEC)
 
         released = await suck(arm_api, False)
         await asyncio.sleep(RELEASE_SETTLE_DELAY)
 
         await move_and_wait(arm_api, (place_x, place_y, travel_z, place_r), label="다시 안전 높이로 들어올리기")
 
-        # ⚠️ 실험: "R -82 → 0 회전"과 "큰 X/Y 이동"을 한 번에 같이 시키면
-        # 매번 조용히 무시되는 패턴이 실물로 반복 확인됨(목표=실제 완벽 일치했던
-        # 이전 5개 이동과 달리, 회전+큰 이동이 겹치는 이 동작만 매번 실패).
-        # 회전과 이동을 분리해서 순서대로 보내는 것으로 우회 시도.
-        home_x, home_y, home_z, home_r = HOME_POSE
-        await move_and_wait(arm_api, (place_x, place_y, travel_z, home_r), label="안전 높이에서 방향만 되돌리기")
-        await move_and_wait(arm_api, HOME_POSE, label="초기위치로 복귀")
+        # ⚠️ 예전엔 "R 회전"과 "큰 X/Y 이동"을 동시에 시키면 조용히 무시되는
+        # 패턴이 실물로 반복 확인돼서 분리했었음(관절 알람 겪기 전 기록).
+        # 관절 알람 이후로 상황이 달라졌을 수 있어 요청대로 다시 합침 -
+        # 만약 "초기위치로 복귀"가 또 씹히는 증상(목표=실제 위치 계속 어긋남)
+        # 보이면 이 한 줄을 위 주석 처리된 2단계 방식으로 되돌릴 것.
+        await move_and_wait(arm_api, HOME_POSE, label="초기위치로 복귀 (회전+이동 동시)")
+        # await move_and_wait(arm_api, (place_x, place_y, travel_z, HOME_POSE[3]), label="안전 높이에서 방향만 되돌리기")
+        # await move_and_wait(arm_api, HOME_POSE, label="초기위치로 복귀")
 
-        log("ARM", "결과: 성공 (도착 좌표는 위 로그로 육안 확인할 것 - 자동 검증 없음)")
+        # 카메라 확인은 초기위치 복귀까지 끝난 뒤 - 팔이 트레이 시야에서
+        # 완전히 벗어나 있어야 인식이 잘 됨
+        await asyncio.sleep(CAMERA_SETTLE_DELAY)
+        log("ARM", "카메라로 배치 확인 중")
+        verified, detected_color, reason = verify_board_on_tray(color)
+        log("ARM", f"카메라 확인 결과: {reason} (감지된 색={detected_color})")
+
+        if not verified:
+            log("ARM", "카메라 확인 실패 - 실패 처리 (물리 동작은 완료했지만 done 보고 안 함)")
+            return False
+
+        log("ARM", "결과: 성공 (카메라로 배치 확인됨)")
         return True
 
     except Exception as e:
         log("ARM", f"예외 발생 - 실패 처리: {e}")
         try:
-            await suck(arm_api, False)  # 흡착 든 채로 죽는 것 방지
+            await suck(arm_api, False)
         except Exception:
             pass
         return False
@@ -517,12 +615,6 @@ async def _set_conveyor(box_api, index, enable, speed_mm_s):
 
 
 async def run_tray_conveyor_async(box_api, run_time, section_label=""):
-    """
-    이어붙인 벨트 2개(STP1/STP2)를 거의 동시에 구동/정지, run_time초만큼.
-    gather로 두 SetEMotor 호출을 동시에 쏴서 타이밍 어긋남을 최소화함 -
-    순서대로 하나씩 보내면 두 번째 벨트가 몇백ms 늦게 시작/정지해서
-    이음매에서 트레이가 걸리거나 밀릴 수 있음.
-    """
     try:
         log("CONV", f"컨베이어 구동 시작{section_label} (STP1+STP2 동시, "
                      f"speed={TRAY_CONVEYOR_SPEED_MM_S}mm/s, {run_time}초)")
@@ -543,7 +635,6 @@ async def run_tray_conveyor_async(box_api, run_time, section_label=""):
         return all(is_ok(r) for r in (start_res_1, start_res_2, stop_res_1, stop_res_2))
     except Exception as e:
         log("CONV", f"예외 발생: {e}")
-        # 하나라도 켜진 채로 남는 것 방지 - 둘 다 강제 정지 시도
         try:
             await asyncio.gather(
                 _set_conveyor(box_api, TRAY_CONVEYOR_STP_1, False, 0),
@@ -557,7 +648,8 @@ async def run_tray_conveyor_async(box_api, run_time, section_label=""):
 # ============================== 주문 처리 (동기 래퍼) ==============================
 def process_board_job(loop, arm_api, box_api, order_id, color):
     """
-    큐에서 꺼낸 job 1건 처리 - 픽업 실행 후, 성공/실패 무관하게 게이트 잠금 + 서버 큐 제거.
+    큐에서 꺼낸 job 1건 처리 (또는 fault 해제 후 직접 재시도).
+    픽업 실행 후, 성공/실패 무관하게 게이트 잠금 + 서버 큐 제거.
     """
     global gate_open, gate_order_id
 
@@ -585,7 +677,6 @@ def process_board_job(loop, arm_api, box_api, order_id, color):
             report_board_status(order_id, color, "idle", count=count_after)
             log("STOCK", f"[{color}] 재고 {count_before} -> {count_after}")
 
-    # 성공/실패/재고없음 관계없이 - 이 주문의 픽업 시도는 끝났으므로 게이트 잠금 + 큐 정리
     gate_open = False
     gate_order_id = order_id
     lock_gate_on_server(order_id)
@@ -601,7 +692,7 @@ def handle_tray_conveyor(loop, box_api, order_id, section):
     report_conveyor_tray(order_id, section, "done" if success else "failed")
 
 
-# ---- 게이트: 기다리던 주문이 pickup_reached(이후) 됐는지 확인, 맞으면 게이트 열기 ----
+# ---- 게이트: 기다리던 주문이 pickup_reached(이후) 됐는지 확인 ----
 def check_gate_against_orders(orders):
     global gate_open, gate_order_id
 
@@ -626,6 +717,81 @@ def check_gate_against_orders(orders):
         clear_gate_on_server()
 
 
+# ---- fault 추적: 있다가 없어지는 전이를 감지해서 해당 동작만 즉시 재시도 ----
+def check_fault_transitions(loop, arm_api, box_api, orders):
+    global current_fault_order_id, current_fault_value
+
+    if current_fault_order_id:
+        order = orders.get(current_fault_order_id)
+
+        if order is None:
+            log("FAULT", f"{current_fault_order_id} 목록에서 사라짐 - 추적 해제")
+            current_fault_order_id, current_fault_value = "", ""
+            return
+
+        if order.get("fault") is None:
+            oid, fval = current_fault_order_id, current_fault_value
+            color = order.get("board")
+            log("FAULT", f"{oid}: {fval} 해제됨 -> 재시도 (색상={color})")
+            # 재시도 호출 전에 먼저 추적 해제 - 재시도 자체가 다시 실패해서
+            # fault가 또 걸리면 그건 "새로운 fault 감지"로 아래 루프에서 다시 잡힘
+            current_fault_order_id, current_fault_value = "", ""
+
+            retry_kind = FAULT_RETRY_MAP.get(fval)
+            # ⚠️ 큐/게이트를 거치지 않고 직접 호출 - process_board_job/
+            # handle_tray_conveyor 안에서 필요한 보고는 알아서 다 함
+            if retry_kind == "pick":
+                process_board_job(loop, arm_api, box_api, oid, color)
+            elif retry_kind == "conveyor1":
+                handle_tray_conveyor(loop, box_api, oid, "1")
+            elif retry_kind == "conveyor2":
+                handle_tray_conveyor(loop, box_api, oid, "2")
+            else:
+                log("FAULT", f"'{fval}'은 우리가 관리하는 fault가 아님 - 재시도 안 함")
+        # else: 아직 fault 그대로 - 계속 대기, 아무것도 안 함
+        return
+
+    # 추적 중인 게 없으면 - 우리가 관리하는 3종류 fault가 새로 떴는지 찾기
+    for order_id, order in orders.items():
+        fault = order.get("fault")
+        if fault in FAULT_RETRY_MAP:
+            current_fault_order_id = order_id
+            current_fault_value = fault
+            log("FAULT", f"{order_id}: {fault} 감지 - 해제 대기 시작")
+            break  # 벨트가 주문 1건만 태우는 전제 - 한 번에 하나만 추적
+
+
+# ---- 재부팅 복구: fault 뜬 채로 재부팅되면 위 추적 로직이 "전이"를 볼 기회가
+# 없어서 놓침(재부팅 직후 첫 스냅샷에 이미 fault:null이면 "있다가 없어짐"을
+# 감지 못 함). 시작 후 딱 한 번만, 이 특정 빈틈만 별도로 메꿔줌. ----
+startup_recovery_checked = False
+
+
+def check_startup_recovery(loop, arm_api, box_api, orders):
+    global startup_recovery_checked, gate_open, gate_order_id
+
+    if startup_recovery_checked:
+        return
+    startup_recovery_checked = True  # 세션당 한 번만 시도
+
+    if gate_open or not gate_order_id:
+        return  # 복구할 게 없음 (정상 상태로 시작)
+
+    order = orders.get(gate_order_id)
+    if order is None:
+        return  # check_gate_against_orders가 알아서 열어줌
+
+    if order.get("fault") is not None:
+        return  # 아직 fault 있음 - check_fault_transitions가 정상적으로 새로 추적 시작함
+
+    status = order.get("status")
+    if status in (STATUS_PICK, STATUS_MISMATCH):
+        color = order.get("board")
+        log("GATE", f"재부팅 복구: {gate_order_id} 게이트 잠긴 채 fault 없음, "
+                     f"status={status} 그대로 -> 다운타임 중 fault 해제된 것으로 간주, 재시도")
+        process_board_job(loop, arm_api, box_api, gate_order_id, color)
+
+
 # ---- 큐에 남은 job 중 orders에서 사라진 것(유령주문) 정리 ----
 def prune_dead_jobs_from_queue(orders):
     global job_queue
@@ -641,16 +807,45 @@ def prune_dead_jobs_from_queue(orders):
         log("QUEUE", f"orders에서 사라진 job {removed}건 제거함")
 
 
+# ---- restock: board_restock 배열 감지해서 즉시 처리 (큐/게이트 무관) ----
+def check_board_restock(data):
+    board_restock = [c for c in (data.get("board_restock") or []) if c in BOARD_COLORS]
+
+    for color in board_restock:
+        if color not in handled_restock:
+            handled_restock.add(color)
+            filled = call_restock(color)
+            if filled is not None:
+                local_stock[color] = filled
+                log("STOCK", f"[{color}] restock 처리 완료 -> {filled}개로 채움")
+            else:
+                handled_restock.discard(color)  # 실패했으면 다음 스냅샷에 재시도 가능하게 원복
+
+    # 배열에서 사라진 색은 추적 해제 - 나중에 다시 떠도(재소진) 재처리 가능하게
+    for color in list(handled_restock):
+        if color not in board_restock:
+            handled_restock.discard(color)
+
+
 def handle_snapshot(loop, arm_api, box_api, data):
     orders = data.get("orders", {})
 
     # 1. 게이트 재평가
     check_gate_against_orders(orders)
 
-    # 2. 유령주문 정리
+    # 1-1. 재부팅 복구 (세션 시작 후 딱 한 번만 실행됨 - 함수 내부에서 자체 가드)
+    check_startup_recovery(loop, arm_api, box_api, orders)
+
+    # 2. fault 해제 감지 -> 재시도 (큐/게이트 무관, 직접 실행)
+    check_fault_transitions(loop, arm_api, box_api, orders)
+
+    # 3. restock 감지 -> 즉시 처리 (큐/게이트 무관)
+    check_board_restock(data)
+
+    # 4. 유령주문 정리
     prune_dead_jobs_from_queue(orders)
 
-    # 3. 새 주문 감지 - 픽업(tray_reached/board_mismatched)은 큐잉만,
+    # 5. 새 주문 감지 - 픽업(tray_reached/board_mismatched)은 큐잉만,
     #    컨베이어(keycap_packed/board_packed)는 즉시 반응(status 기반 dedup 유지)
     for order_id, order in list(orders.items()):
         if order.get("fault") is not None:
@@ -661,7 +856,7 @@ def handle_snapshot(loop, arm_api, box_api, data):
 
         if status in (STATUS_PICK, STATUS_MISMATCH):
             color = order.get("board")
-            retry = order.get("retry")  # 재출고 횟수 - 명세에 필드명 미확정, 없으면 None
+            retry = order.get("retry")
             job_key = build_job_key(order_id, color, status, retry)
             if not already_processed(job_key):
                 mark_processed(job_key)
@@ -690,14 +885,10 @@ def main():
 
     local_stock = fetch_initial_stock()
 
-    # 서버(Redis)에서 큐/게이트 복원 - 재부팅 대비
     restored_jobs = fetch_queue_from_server()
     job_queue = restored_jobs
-    # 복원된 job의 원래 jobKey(status/retry 포함)는 서버 큐에 안 남아있어서
-    # 여기선 order_id+color 조합만 알 수 있음 - 재부팅 직후 딱 한 번, 정확히
-    # 같은 status+retry로 재전송되는 극히 좁은 경우만 중복 적재될 수 있는
-    # 트레이드오프로 남겨둠 (재고/게이트 안전성엔 영향 없음, 최악이어도 같은
-    # job이 큐에 두 번 들어가는 정도)
+    for job in restored_jobs:
+        mark_processed(f"{job['order_id']}_{job['color']}")
 
     gate_state = fetch_gate_from_server()
     if gate_state.get("locked"):
@@ -711,7 +902,6 @@ def main():
     mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
     mqtt_client.loop_start()
 
-    # DobotlinkAdapter는 "돌고 있지 않은" 이벤트루프를 요구함
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     dobotlink = DobotlinkAdapter(RPCClient(), is_sync=False)
@@ -736,7 +926,6 @@ def main():
             except queue.Empty:
                 pass
 
-            # 게이트 열려있고 큐에 대기 중인 job 있으면 하나 처리
             if gate_open and job_queue:
                 job = job_queue.pop(0)
                 log("ARM", f"{job['order_id']}: 큐에서 꺼내 처리 시작 (색상={job['color']})")

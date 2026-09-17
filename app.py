@@ -27,13 +27,18 @@ redis = Redis(
 #
 # 보드는 카트리지·아두이노가 없어서, 이 릴레이가 board 재고(Redis)도
 # 같이 관리함 - 로봇암 PC가 busy/idle+count를 보고하면 여기서 캐싱.
-# Upstash Redis는 키캡 팀 계정과 동일 인스턴스, 키 프리픽스만 다름
-# (stock:board_{color} vs 키캡의 stock:{letter_color}).
+#
+# ⚠️ Redis 키 네이밍: 실제 초기 재고 시드 스크립트(seed_board_stock.py 등)가
+# stock:board_{코드}, pool:board_{코드}, status:board_{코드} (코드=r/y/b/g
+# 한 글자)로 이미 실제 데이터를 심어놨음 - 이 Flask도 반드시 같은 코드
+# 체계를 써야 진짜 재고 데이터를 읽고 씀. (전에 stock:board_{전체이름}으로
+# 잘못 짜여있던 버그를 여기서 수정함 - 키캡과 동일하게 코드 기준으로 통일)
 # ============================================================
 
 BOARD_COLORS = ["red", "yellow", "blue", "green"]
 BOARD_STATUS_VALUES = ("idle", "busy", "disable", "empty")  # idle/busy/disable(오배출)/empty(재고부족)
-BOARD_COLOR_CODE = {"red": "r", "yellow": "y", "blue": "b", "green": "g"}  # cnt_warehouse/cnt_board_status 밑 실제 컨테이너명
+BOARD_COLOR_CODE = {"red": "r", "yellow": "y", "blue": "b", "green": "g"}  # Redis 키 + Mobius 컨테이너명 공용
+BOARD_CARTRIDGE_CAPACITY = 3  # 한 번에 진열하는 단위 개수 (restock 시 pool에서 이만큼씩 채움)
 
 MQTT_HOST = os.getenv("MQTT_HOST")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 8883))
@@ -42,7 +47,7 @@ MQTT_PASS = os.getenv("MQTT_PASS")
 
 # 컨테이너 종류 -> MQTT 토픽 (Mobius --웹훅--> Flask --publish--> MQTT)
 # /notify/process 는 con 내용을 파싱하지 않고 그대로 relay만 함.
-# 로봇암 PC(robot_worker.py 등)가 이 토픽을 구독해서 자기 status에 반응함.
+# 로봇암 PC(board_robot_arm.py)가 이 토픽을 구독해서 자기 status에 반응함.
 TOPICS = {
     "process": os.getenv("MQTT_TOPIC", "sjuiot/warehouse/robotarm"),
 }
@@ -138,7 +143,7 @@ def hello():
 # ============================================================
 # 인바운드: Mobius --웹훅--> Flask --publish--> MQTT
 # con 내용은 파싱하지 않고 그대로 relay만 함
-# (status별 로봇암 동작 분기는 robot_worker.py 쪽에서 처리)
+# (status별 로봇암 동작 분기는 board_robot_arm.py 쪽에서 처리)
 # ============================================================
 @app.route("/notify/<kind>", methods=["POST"])
 def notify(kind):
@@ -198,6 +203,9 @@ def report_board_robot_arm():
     보드 로봇암 -> 트레이 직접 투입 결과 보고.
     body: {"order_id": "...", "board": "done" | "failed"}
     스펙 필드명이 "board" (status 아님) - COSS 명세 cnt_board_robot_arm 그대로.
+    실패 시 플랫폼이 fault:board_pack_failed 로 판정하고, 사람이 원인 해결 후
+    fault:null 로 넘어오면 board_robot_arm.py가 재시도하고 이 라우트를 다시 호출함
+    (재시도도 이 라우트를 그대로 재사용 - Flask 쪽 변경 불필요).
     색상 실측(cnt_board_dispense)은 /report/board-dispense 에서 별도 보고.
     """
     data = request.get_json(force=True, silent=True) or {}
@@ -244,21 +252,23 @@ def report_board_status():
     """
     보드 색상별 카트리지(레일) 상태 보고 (아두이노가 없어서 로봇암 PC가 대신 보고).
     body: {"order_id": "...", "board": "blue", "status": "idle"|"busy"|"disable"|"empty", "count": 5}
-    - order_id: 이 레일을 마지막으로 사용한 주문
+    - order_id: 이 레일을 마지막으로 사용한 주문 (restock 등 주문 무관 이벤트는 null)
     - count: 현재 재고 수량
     - status: idle(대기) / busy(배출 중) / disable(오배출) / empty(재고 부족)
     스펙: cnt_warehouse/cnt_board_status/cnt_{r|y|b|g}  예) cnt_warehouse/cnt_board_status/cnt_r
-         (컨테이너 이름은 한 글자 색상 코드 - 키캡의 cnt_keycap_status/cnt_E_r 등과 같은 패턴)
+
+    Redis: stock:board_{코드}(현재 수량), status:board_{코드}(재부팅 시 마지막 상태
+    복원용 - board_robot_arm.py는 직접 안 읽고, 사람이 현황 확인용으로 조회 가능하게 남김)
     """
     data = request.get_json(force=True, silent=True) or {}
-    order_id = data.get("order_id")
+    order_id = data.get("order_id")  # None 허용 (restock 등 주문 무관 이벤트)
     color = data.get("board")
     status = data.get("status")
     count = data.get("count")
 
-    if not order_id or color not in BOARD_COLORS or status not in BOARD_STATUS_VALUES:
+    if color not in BOARD_COLORS or status not in BOARD_STATUS_VALUES:
         return jsonify({
-            "error": f"order_id, board({'/'.join(BOARD_COLORS)}), status({'/'.join(BOARD_STATUS_VALUES)})는 필수"
+            "error": f"board({'/'.join(BOARD_COLORS)}), status({'/'.join(BOARD_STATUS_VALUES)})는 필수"
         }), 400
     if count is None:
         return jsonify({"error": "count는 필수"}), 400
@@ -274,7 +284,8 @@ def report_board_status():
         return jsonify({"error": "mobius CIN 생성 실패"}), 502
 
     # Mobius 성공 후에만 Redis 갱신 - 둘이 어긋난 상태로 안 남게
-    redis.set(f"stock:board_{color}", count)
+    redis.set(f"stock:board_{code}", count)
+    redis.set(f"status:board_{code}", status)
     return jsonify({"result": "ok"}), 200
 
 
@@ -282,12 +293,46 @@ def report_board_status():
 def get_stock_board():
     """
     로봇암 PC가 시작할 때 현재 재고를 읽어오는 용도.
-    응답: {"red": 300, "yellow": 300, "blue": 300, "green": 300}
+    응답: {"red": 3, "yellow": 3, "blue": 3, "green": 3}
+    (HTTP 계약은 전체 색상명 유지 - Redis 키 내부 표현(코드)와 분리)
     """
-    keys = [f"stock:board_{c}" for c in BOARD_COLORS]
+    keys = [f"stock:board_{BOARD_COLOR_CODE[c]}" for c in BOARD_COLORS]
     values = redis.mget(*keys)
     result = {c: int(v or 0) for c, v in zip(BOARD_COLORS, values)}
     return jsonify(result), 200
+
+
+@app.route("/restock/board/<color>", methods=["POST"])
+def restock_board(color):
+    """
+    board_restock 감지 시 로봇암 PC가 호출 - 키캡의 /restock/<letter>/<color>와
+    동일한 패턴(pool에서 실제로 차감하며 채움, 고정값으로 덮어쓰지 않음).
+    color: red/yellow/blue/green (전체 이름 - URL 경로 가독성 위해 코드 아님)
+    응답: {"filled": N}  (로봇암 PC가 로컬 재고 갱신에 사용)
+    """
+    if color not in BOARD_COLORS:
+        return jsonify({"error": f"color는 {'/'.join(BOARD_COLORS)} 중 하나"}), 400
+
+    code = BOARD_COLOR_CODE[color]
+    pool_key = f"pool:board_{code}"
+    stock_key = f"stock:board_{code}"
+
+    pool_qty = int(redis.get(pool_key) or 0)
+    fill_amount = min(BOARD_CARTRIDGE_CAPACITY, pool_qty)
+
+    redis.set(stock_key, fill_amount)
+    if fill_amount > 0:
+        redis.decrby(pool_key, fill_amount)
+    redis.set(f"status:board_{code}", "idle")
+
+    content = {"order_id": None, "count": fill_amount, "status": "idle"}
+    ok = post_cin_to_mobius(f"cnt_warehouse/cnt_board_status/cnt_{code}", content)
+    print(f"[restock/board/{color}] {fill_amount}개로 채움 (pool 남음 {pool_qty - fill_amount}), "
+          f"모비우스 {'성공' if ok else '실패'}")
+
+    if not ok:
+        return jsonify({"error": "mobius CIN 생성 실패"}), 502
+    return jsonify({"filled": fill_amount}), 200
 
 
 @app.route("/report/keycap-robot-arm", methods=["POST"])
@@ -323,7 +368,9 @@ def report_conveyor(which):
       body: {"order_id": "...", "keycap1": "done", "keycap2": "done",
              "keycap3": "done", "keycap4": "failed"}  (4개 다 명시)
 
-    tray 컨베이어: section1 / section2 각각 별도 보고
+    tray 컨베이어: section1 / section2 각각 별도 보고. 실패 시 플랫폼이
+      fault:tray_01_belt_jammed(section1) / tray_02_belt_jammed(section2)로 판정.
+      fault 해제 후 재시도도 이 라우트를 그대로 재사용.
       body: {"order_id": "...", "section": "1" | "2", "status": "done" | "failed"}
     """
     data = request.get_json(force=True, silent=True) or {}
@@ -403,6 +450,11 @@ def board_queue_complete():
 # 그래도 수동 테스트 스냅샷처럼 명세를 벗어난 입력이 들어올 경우를 대비한
 # 안전장치로 유지 - 키캡의 /gate/{board}/* 패턴과 동일, {board} 자리 고정값 "board".
 # Redis 키: gate:board (값 = 대기 중인 order_id, 키 자체가 없으면 "열림" 상태)
+#
+# ⚠️ fault→null 재시도(board_pack_failed 등)는 이 게이트를 거치지 않고
+# board_robot_arm.py가 직접 재실행함 - 이미 게이트를 걸고 있는 주문 본인이
+# 재시도하는 것이라 줄 설 필요가 없고, 큐를 거치면 "게이트가 열려야 큐를
+# 처리하는데 게이트는 이 주문이 성공해야 열린다"는 데드락이 생기기 때문.
 # ============================================================
 def _board_gate_key() -> str:
     return "gate:board"
