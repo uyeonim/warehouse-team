@@ -149,18 +149,31 @@ NAMESPACE_ARM = "MagicianLite"
 NAMESPACE_BOX = "MagicBox"
 
 # =================================================================
-# CONFIG - 로봇암 좌표 (실측 완료)
+# CONFIG - 로봇암 좌표
+# ⚠️ 2026-09-18 실측 갱신(1차): PICK_POSE_BASE의 X/Z/R을 4색 공통값으로 통일.
+#    X:290.0 / Z:-35.0(count=1 기준) / R:0.0 통일. Y는 색상별 실측값 유지.
+# ⚠️ 2026-09-18 재실측(2차): 보드 3개 적재(count=3) 기준으로 재측정.
+#    - X: 이번엔 통일 안 함 - 색상별 실측값 그대로 사용
+#    - Y: 항상 색상별 실측값 유지 (컨베이어 위 레일 위치라 통일 대상 아님)
+#    - Z: 실측값은 count=3 기준이라 (3-1)*BOARD_THICKNESS_MM(=40mm)를 빼서
+#      count=1 기준 base_z로 환산 후, 4색 평균(-33.27)으로 통일
+#      (red -33.4577 / green -33.9360 / blue -32.4397 / yellow -33.2272 평균)
+#    - R: 0.0 통일 폐기 - 이번엔 실측값을 그대로 사용(회전축이라 적재 개수와 무관)
+#    PLACE_POSE는 재실측 반영, CAMERA_CHECK_POSE는 로봇암 장착 카메라용 재실측 위치
+#    (2026-09-18, 이동시간 부족으로 도착 못 하고 지나치던 문제 확인 후
+#    CAMERA_MOVE_WAIT_SEC 4.0초로 별도 분리 - 아래 이동 타이밍 CONFIG 참고).
 # =================================================================
 PICK_POSE_BASE = {
-    "red":    (248.1, 147.3137, -38.1, 0.0),
-    "green":  (248.1,  41.7095, -38.1, 0.0),
-    "blue":   (248.1, -51.7989, -38.1, 0.0),
-    "yellow": (248.1, -137.9115, -38.1, 0.0),
+    "red":    (215.5975, 134.2798, -37.27, 31.9158),
+    "green":  (249.1647,  48.9685, -37.27, 11.1187),
+    "blue":   (248.0774, -36.6399, -37.27, -8.4016),
+    "yellow": (205.0976, -132.5483, -37.27, -32.8733),
 }
 BOARD_THICKNESS_MM = 20.0
 
-PLACE_POSE = (189.7914, -280.7065, 21.5396, -82.0)
-HOME_POSE = (200.0, 0.0, 40.0, 0.0)
+PLACE_POSE = (-152.0347, -263.0365, 0.4450, -120.0278)
+CAMERA_CHECK_POSE = (-122.3321, -200.4390, 58.4218, -121.3965)
+HOME_POSE = (240.0, 0.0, 150.0, 0.0)
 
 # =================================================================
 # CONFIG - 트레이 컨베이어
@@ -170,17 +183,22 @@ HOME_POSE = (200.0, 0.0, 40.0, 0.0)
 #   section2: board_packed  감지 시 구동 - 픽업대까지 이동
 # =================================================================
 TRAY_CONVEYOR_STP_1 = 0   # Magic Box STP1 포트
-TRAY_CONVEYOR_STP_2 = 0   # Magic Box STP2 포트 (벨트 1개만 연결된 동안은 STP1과 동일값)
-TRAY_CONVEYOR_SPEED_MM_S = 30
+TRAY_CONVEYOR_STP_2 = 1   # Magic Box STP2 포트 (벨트 2개 실배선 반영, 2026-09-18)
+TRAY_CONVEYOR_SPEED_MM_S = 50
 
-TRAY_CONVEYOR_RUN_TIME_SECTION1 = 6.0   # keycap_packed -> 보드 로봇암 앞까지
-TRAY_CONVEYOR_RUN_TIME_SECTION2 = 5.0   # board_packed -> 픽업대까지
+TRAY_CONVEYOR_RUN_TIME_SECTION1 = 11.0   # keycap_packed -> 보드 로봇암 앞까지
+TRAY_CONVEYOR_RUN_TIME_SECTION2 = 6.5   # board_packed -> 픽업대까지
 
 # =================================================================
 # CONFIG - 이동 타이밍 (pydobot 버전 검증값 참고)
 # =================================================================
 MOVE_WAIT_SEC = 2.0          # 대부분의 이동에 쓰는 기본 대기시간
 PRECISION_MOVE_WAIT_SEC = 3.0  # 정밀 접촉이 필요한 이동(픽업/놓기) 전용 - 짧으면 흡착 실패 실물로 확인됨
+CAMERA_MOVE_WAIT_SEC = 4.0    # 카메라 체크 위치 이동 전용 - place_pose -> CAMERA_CHECK_POSE 이동거리(~107mm)가
+                              # 다른 구간보다 커서 MOVE_WAIT_SEC(2.0초)로는 도착 전에 다음 명령이 덮어써 그냥
+                              # 지나쳐버리는 문제 확인됨(2026-09-18) - 정확히 도착해야 사진이 의미 있어서 넉넉하게 설정
+HOME_MOVE_WAIT_SEC = 5.0      # 카메라 체크 위치 -> HOME 복귀 전용 - XY 이동거리(~380mm)에 R 회전(~121도)까지
+                              # 겹쳐서 MOVE_WAIT_SEC(2.0초)로는 부족해 복귀가 안 되던 문제 확인됨(2026-09-18)
 SUCTION_SETTLE_DELAY = 1.0   # 흡착력 형성 대기
 RELEASE_SETTLE_DELAY = 0.5
 SAFE_LIFT_MM = 40.0
@@ -189,13 +207,19 @@ BOARD_COLORS = ["red", "yellow", "blue", "green"]
 CALL_TIMEOUT = 5
 
 # =================================================================
-# CONFIG - 카메라 배치 확인 (calibrate_camera.py로 캘리브레이션 완료)
-# 로봇팔/DobotRPC랑 완전히 무관한 별개 USB 웹캠 - cv2로 직접 제어.
-# 흡착 OFF 후 안전 높이로 들어올린 직후(그리퍼가 시야 안 가릴 때) 사진 찍어서
-# 정해둔 ROI 안에 기대한 색상이 실제로 있는지 확인.
+# CONFIG - 카메라 배치 확인
+# ⚠️ 2026-09-18 변경: 카메라를 로봇암에 직접 장착하는 방식으로 변경됨.
+#    이전(별개 고정 USB 웹캠, cv2로 직접 제어, HOME_POSE 복귀 후 확인)과 달리
+#    이제는 보드를 놓은 직후 CAMERA_CHECK_POSE로 이동해서 그 자리에서 확인.
+#    장치 접근 방식(cv2.VideoCapture)과 CAMERA_INDEX 자체는 그대로 유지 -
+#    카메라 장치가 바뀐 게 아니라 장착 위치만 팔로 옮겨간 것으로 간주.
+# ⚠️ CAMERA_ROI 재보정 필요 - 카메라 위치가 완전히 바뀌었는데 아래 값은
+#    기존(고정 웹캠 기준) 값 그대로 남겨둔 상태. CAMERA_CHECK_POSE에서 실물로
+#    calibrate_camera.py 다시 돌려서 새 ROI 값으로 교체할 것 - 재보정 전까지는
+#    색상 판정이 엉뚱한 영역을 보고 있을 수 있음.
 # =================================================================
 CAMERA_INDEX = 1   # 노트북 내장캠이 0을 먼저 차지하는 경우가 많아 외장캠은 보통 1
-CAMERA_ROI = (200, 150, 150, 100)  # (x, y, w, h) - 실측 필요 시 calibrate_camera.py로 재조정
+CAMERA_ROI = (200, 150, 150, 100)  # (x, y, w, h) - ⚠️ 재보정 필요, 위 주석 참고
 CAMERA_PRESENCE_MIN_RATIO = 0.3
 CAMERA_SETTLE_DELAY = 0.5   # 사진 찍기 전 대기 - 5초는 과했음(이전 해석 오류), 짧게 줄임
 
@@ -575,21 +599,22 @@ async def pick_and_place_board_async(arm_api, color, count):
 
         await move_and_wait(arm_api, (place_x, place_y, travel_z, place_r), label="다시 안전 높이로 들어올리기")
 
-        # ⚠️ 예전엔 "R 회전"과 "큰 X/Y 이동"을 동시에 시키면 조용히 무시되는
-        # 패턴이 실물로 반복 확인돼서 분리했었음(관절 알람 겪기 전 기록).
-        # 관절 알람 이후로 상황이 달라졌을 수 있어 요청대로 다시 합침 -
-        # 만약 "초기위치로 복귀"가 또 씹히는 증상(목표=실제 위치 계속 어긋남)
-        # 보이면 이 한 줄을 위 주석 처리된 2단계 방식으로 되돌릴 것.
-        await move_and_wait(arm_api, HOME_POSE, label="초기위치로 복귀 (회전+이동 동시)")
-        # await move_and_wait(arm_api, (place_x, place_y, travel_z, HOME_POSE[3]), label="안전 높이에서 방향만 되돌리기")
-        # await move_and_wait(arm_api, HOME_POSE, label="초기위치로 복귀")
+        # ⚠️ 2026-09-18 변경: 카메라가 로봇암에 장착돼서, 보드를 놓은 직후
+        # CAMERA_CHECK_POSE로 먼저 이동해서 그 자리에서 확인 - HOME 복귀는
+        # 확인 이후로 미룸(이전엔 순서가 반대: HOME 복귀 후 고정 웹캠으로 확인).
+        await move_and_wait(arm_api, CAMERA_CHECK_POSE, label="카메라 체크 위치로 이동",
+                             wait_sec=CAMERA_MOVE_WAIT_SEC)
 
-        # 카메라 확인은 초기위치 복귀까지 끝난 뒤 - 팔이 트레이 시야에서
-        # 완전히 벗어나 있어야 인식이 잘 됨
         await asyncio.sleep(CAMERA_SETTLE_DELAY)
         log("ARM", "카메라로 배치 확인 중")
         verified, detected_color, reason = verify_board_on_tray(color)
         log("ARM", f"카메라 확인 결과: {reason} (감지된 색={detected_color})")
+
+        # ⚠️ 2026-09-18: CAMERA_CHECK_POSE -> HOME_POSE 구간 R 회전폭이 커서
+        # (약 121도) "R+XY 동시 이동 씹힘" 의심했었으나, 실제 원인은 대기시간
+        # 부족이었음 확인됨 - 2단계 분리 대신 HOME_MOVE_WAIT_SEC로 충분히 대기.
+        await move_and_wait(arm_api, HOME_POSE, label="초기위치로 복귀",
+                             wait_sec=HOME_MOVE_WAIT_SEC)
 
         if not verified:
             log("ARM", "카메라 확인 실패 - 실패 처리 (물리 동작은 완료했지만 done 보고 안 함)")

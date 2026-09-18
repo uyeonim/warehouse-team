@@ -476,6 +476,15 @@ bool pcaDriverFailed = false;
 unsigned long lastPcaCheckMs = 0;
 const unsigned long PCA_CHECK_INTERVAL_MS = 1000; // I2C 버스 부담 줄이려고 매 loop()가 아니라 1초 간격으로만 확인
 
+// 고장 감지 시점에 큐 맨 앞에 있던(=order_id가 실제로 붙었던) job을 기억해둠.
+// 복구 감지 시, 이 레일만은 즉시 원복하지 않고 disable 그대로 둬서 - 그 주문의
+// fault가 실제로 플랫폼에서 풀릴 때(handleOrderFaults)만 재배출되도록 함.
+// 나머지 7개 레일은 애초에 특정 주문에 안 걸려있어서(order_id null) 기다릴
+// fault 자체가 없으므로 복구 즉시 원복해도 됨.
+// (DispenseJob 타입 인스턴스는 struct DispenseJob 전체 정의 뒤에서 선언해야
+// 해서 pcaRelatedJob 변수는 "배출 대기열" 섹션 아래에 별도로 선언함)
+bool pcaHasRelatedOrder = false;
+
 // ============================== 플랫폼(Mobius) fault 추적/재배출 ==============================
 // fault 두 종류가 있는데 처리 방식이 다름:
 //   - tray_jam류: 우리가 이미 disable/실패를 보고했기 때문에 플랫폼이 그걸
@@ -502,6 +511,10 @@ struct DispenseJob {
 #define JOB_QUEUE_SIZE 8
 DispenseJob jobQueue[JOB_QUEUE_SIZE];
 uint8_t jobHead = 0, jobTail = 0;
+
+// PCA 복구 시 "관련 레일 1개만 disable 유지"를 위해 고장 시점 job을 기억해두는
+// 변수 - struct DispenseJob 정의 뒤에 선언해야 함 (위 pcaHasRelatedOrder 참고)
+DispenseJob pcaRelatedJob;
 
 bool queuePush(const DispenseJob& job) {
   uint8_t next = (jobTail + 1) % JOB_QUEUE_SIZE;
@@ -1028,28 +1041,42 @@ void runDispenseStateMachine() {
       if (!pcaOk && !pcaDriverFailed) {
         pcaDriverFailed = true;
         // 대기열 맨 앞 job이 있으면 그 주문과 관련된 레일에만 order_id, 나머지 7개는 null
-        bool hasRelated = (jobHead != jobTail);
-        DispenseJob relatedJob;
-        if (hasRelated) relatedJob = jobQueue[jobHead];
+        // 이 관련 job은 고장이 풀려도(PCA 복구) 즉시 재배출하지 않고, 그 주문의
+        // fault가 플랫폼에서 실제로 풀릴 때까지 기다려야 하므로 전역 변수에
+        // 기억해둠 (아래 복구 분기 및 handleOrderFaults()에서 사용).
+        pcaHasRelatedOrder = (jobHead != jobTail);
+        if (pcaHasRelatedOrder) pcaRelatedJob = jobQueue[jobHead];
 
         for (int l = 0; l < 2; l++) {
           for (int c = 0; c < 4; c++) {
             rail[l][c].status = RAIL_DISABLE;
-            bool isRelated = hasRelated && letterSlot(relatedJob.letter) == l && colorSlot(relatedJob.color) == c;
+            bool isRelated = pcaHasRelatedOrder && letterSlot(pcaRelatedJob.letter) == l && colorSlot(pcaRelatedJob.color) == c;
             reportRailStatus(letterOf(l), colorOf(c), RAIL_DISABLE,
-                              isRelated ? relatedJob.orderId : "", REASON_DRIVER_FAILED);
+                              isRelated ? pcaRelatedJob.orderId : "", REASON_DRIVER_FAILED);
           }
         }
         Serial.println("[PCA] 드라이버 응답 없음 - 8개 레일 전부 disable 보고");
       } else if (pcaOk && pcaDriverFailed) {
         pcaDriverFailed = false;
+        // fault도 다른 종류(카트리지 고장, stage_timeout)와 똑같이 "fault 필드가
+        // 실제로 풀릴 때만 재배출"해야 하므로, 관련 주문이 있던 레일 1개는
+        // 여기서 즉시 원복하지 않고 disable을 그대로 유지함 - 이 레일은
+        // handleOrderFaults()가 그 주문의 fault 해제를 감지했을 때만 원복+재배출됨.
+        // (그 job은 이 상태로 다음 DS_IDLE에서 큐 맨 앞으로 나오면 "disable이라
+        // 건너뜀"으로 한 번 폐기되고, 이후 fault 해제 시 handleOrderFaults()가
+        // 새 job을 다시 큐에 넣어주므로 중복 배출 걱정 없음)
+        // 나머지 7개 레일은 특정 주문에 안 걸려있어서(order_id null) 기다릴
+        // fault 자체가 없으므로 지금 바로 원복함.
         for (int l = 0; l < 2; l++) {
           for (int c = 0; c < 4; c++) {
+            bool isRelated = pcaHasRelatedOrder && letterSlot(pcaRelatedJob.letter) == l && colorSlot(pcaRelatedJob.color) == c;
+            if (isRelated) continue; // disable 유지, fault 해제 대기
             rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
             reportRailStatus(letterOf(l), colorOf(c), rail[l][c].status, "");
           }
         }
-        Serial.println("[PCA] 드라이버 복구됨 - 8개 레일 상태 원복 보고");
+        pcaHasRelatedOrder = false;
+        Serial.println("[PCA] 드라이버 복구됨 - 무관한 레일만 원복 보고, 관련 레일은 fault 해제될 때까지 disable 유지");
       }
     }
     if (pcaDriverFailed) return; // 드라이버 고장 중엔 새 배출 시작 안 함
@@ -1441,8 +1468,10 @@ void callRestock(int l, int c) {
   uint8_t filled = doc["filled"] | 0;
   rail[l][c].count = filled;
   rail[l][c].status = (filled == 0) ? RAIL_EMPTY : RAIL_IDLE;
-  reportRailStatus(letter, color, rail[l][c].status, "restock"); // 특정 order_id에 종속 안 되므로 식별용 문자열 사용
-
+  // Flask의 /restock/<letter>/<color> 엔드포인트가 이 호출 안에서 이미
+  // 모비우스에 CIN을 올려줌(order_id: null) - 여기서 reportRailStatus를
+  // 또 부르면 같은 restock 이벤트가 모비우스에 두 번 올라가는 중복 버그가
+  // 생겨서 이 호출은 제거함. 로컬 rail 상태(count/status)만 갱신하면 됨.
   Serial.println("[restock] " + letterColorKey(l, c) + " -> " + String(filled) + "개로 채워짐");
 }
 

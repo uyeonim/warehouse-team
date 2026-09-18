@@ -18,7 +18,7 @@
 import cv2
 import numpy as np
 
-CAMERA_INDEX = 1  # 웹캠이 여러 개면 0,1,2... 바꿔가며 찾을 것
+CAMERA_INDEX = 1 # 웹캠이 여러 개면 0,1,2... 바꿔가며 찾을 것
 
 # ⚠️ 트레이 위 보드가 보이는 화면 영역 - 픽셀 좌표로 실측 후 수정
 ROI_X, ROI_Y, ROI_W, ROI_H = 200, 150, 150, 100
