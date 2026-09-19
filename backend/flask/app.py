@@ -52,6 +52,9 @@ ORIGIN = os.getenv("ORIGIN")
 AE_NAME = os.getenv("AE_NAME")
 
 # ---- 재고 관리 상수 ----
+# "board" 라는 단어가 두 가지 의미로 쓰이는 점 주의:
+#   - BOARD_LETTERS 의 board: EI/NS/TF/PJ 축(키캡이 꽂히는 보드 종류)
+#   - BOARD_COLORS 의 board: 색상별로만 구분되는 피지컬 보드 "상품" 자체
 BOARD_LETTERS = {
     "EI": ["E", "I"],
     "NS": ["N", "S"],
@@ -60,6 +63,13 @@ BOARD_LETTERS = {
 }
 COLORS = ["r", "y", "b", "g"]  # r=핑크, y=옐로우, b=블루, g=그린
 RAIL_CAPACITY = 30  # 카트리지(stock) 최대 장전 개수, 아두이노 MAX_CAPACITY와 동일
+
+# 보드(피지컬 보드 상품) 재고 상수 — 알파벳 축 구분 없이 색상으로만 관리
+# 모비우스 cnt_board_status 밑 컨테이너가 cnt_r/cnt_y/cnt_b/cnt_g로 확인되어
+# 키캡과 동일한 한 글자 색상 코드를 그대로 재사용함 (cnt_red 같은 전체 단어 아님)
+BOARD_COLORS = COLORS  # ["r", "y", "b", "g"]
+BOARD_CARTRIDGE_CAPACITY = 3  # 카트리지에 실제로 장전되는 재고
+BOARD_POOL_TOTAL = 300  # 색상별 전체 재고 총량(카트리지 포함) — 창고 pool = 이 값 - 카트리지분
 
 app = Flask(__name__)
 
@@ -89,6 +99,7 @@ def post_cin_to_mobius(cnt_path: str, content: dict) -> bool:
     예: "cnt_warehouse/cnt_keycap_status/cnt_E_r", "cnt_warehouse/cnt_keycap_dispense"
     실제 트리: {AE}/cnt_warehouse/cnt_keycap_status/cnt_E_r · cnt_S_y · … (32개)
              {AE}/cnt_warehouse/cnt_keycap_dispense
+             {AE}/cnt_warehouse/cnt_board_status/cnt_r · cnt_y · cnt_b · cnt_g (4개)
     """
     url = f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/{cnt_path.strip('/')}"
     headers = {
@@ -116,6 +127,15 @@ def post_cin_to_mobius(cnt_path: str, content: dict) -> bool:
     except Exception as e:
         print("[Mobius] 요청 오류:", e)
         return False
+
+
+def get_last_status(status_key: str) -> str:
+    """
+    가장 최근 /report/*-status로 보고된 status를 반환.
+    아직 한 번도 보고된 적 없으면(신규 설치 등) "idle"로 폴백.
+    """
+    value = redis.get(status_key)
+    return value if value else "idle"
 
 
 @app.route("/")
@@ -186,6 +206,7 @@ def report_keycap_status():
     order_id = data.get("order_id")
     count = data.get("count")
     status = data.get("status")
+    reason = data.get("reason", "")  # disable 사유: keycap_cartridge_failed / keycap_driver_failed / 플랫폼 fault 문자열 등
 
     if not letter_color or status is None:
         return jsonify({"error": "letter_color, status는 필수"}), 400
@@ -193,8 +214,12 @@ def report_keycap_status():
     # 아두이노가 보고한 값 그대로 덮어씀 (재고 원본은 Redis, 아두이노는 캐시)
     if count is not None:
         redis.set(f"stock:{letter_color}", count)
+    # status(정상/고장 등)도 같이 저장해둠 — restock/모비우스 리셋 시 이 값을 그대로 씀
+    redis.set(f"status:{letter_color}", status)
 
     content = {"order_id": order_id, "count": count, "status": status}
+    if status == "disable" and reason:
+        content["reason"] = reason
     cnt_path = f"cnt_warehouse/cnt_keycap_status/cnt_{letter_color}"
 
     ok = post_cin_to_mobius(cnt_path, content)
@@ -229,7 +254,9 @@ def report_keycap_dispense():
 
 # ============================================================
 # 아두이노 부팅 시 재고 초기 조회
-# 응답 형식: {"E_r":8,"E_y":8,"E_b":8,"E_g":8,"I_r":8,"I_y":8,"I_b":8,"I_g":8}
+# 원래 count만 주는 형태였는데, 아두이노가 재부팅 시 disable 상태까지
+# 복원하려면 status도 같이 필요해서 {count, status} 중첩 구조로 응답함.
+# 응답 형식: {"E_r": {"count": 8, "status": "idle"}, "E_y": {...}, ...}
 # ============================================================
 @app.route("/stock/keycap", methods=["GET"])
 def get_stock_keycap():
@@ -237,14 +264,121 @@ def get_stock_keycap():
     if board not in BOARD_LETTERS:
         return jsonify({"error": "board는 EI/NS/TF/PJ 중 하나여야 함"}), 400
 
-    keys = [f"stock:{letter}_{color}" for letter in BOARD_LETTERS[board] for color in COLORS]
-    values = redis.mget(*keys)
+    letter_colors = [f"{letter}_{color}" for letter in BOARD_LETTERS[board] for color in COLORS]
+    stock_keys = [f"stock:{lc}" for lc in letter_colors]
+    status_keys = [f"status:{lc}" for lc in letter_colors]
+
+    stock_values = redis.mget(*stock_keys)
+    status_values = redis.mget(*status_keys)
 
     result = {}
-    for key, value in zip(keys, values):
-        letter_color = key.split(":", 1)[1]
-        result[letter_color] = int(value or 0)
+    for lc, count, status in zip(letter_colors, stock_values, status_values):
+        result[lc] = {
+            "count": int(count or 0),
+            "status": status if status else "idle",
+        }
     return jsonify(result), 200
+
+
+# ============================================================
+# 보드(피지컬 보드 상품) 재고 관리
+# 키캡과 달리 알파벳 축 구분 없이 색상으로만 관리함.
+# 카트리지 재고(stock)는 BOARD_CARTRIDGE_CAPACITY개, 전체 재고(pool)는
+# 색상당 BOARD_POOL_TOTAL개 — 키캡 카트리지 방식과 동일한 구조.
+# ============================================================
+@app.route("/report/board-status", methods=["POST"])
+def report_board_status():
+    data = request.get_json(force=True, silent=True) or {}
+
+    color = data.get("color")  # 예: "r" (키캡과 동일한 한 글자 색상 코드)
+    order_id = data.get("order_id")
+    count = data.get("count")
+    status = data.get("status")
+    reason = data.get("reason", "")  # disable 사유
+
+    if color not in BOARD_COLORS or status is None:
+        return jsonify({"error": f"color({'/'.join(BOARD_COLORS)} 중 하나), status는 필수"}), 400
+
+    # 아두이노/컨베이어 쪽이 보고한 값 그대로 덮어씀 (재고 원본은 Redis)
+    if count is not None:
+        redis.set(f"stock:board_{color}", count)
+    # status(정상/고장 등)도 같이 저장해둠 — restock/모비우스 리셋 시 이 값을 그대로 씀
+    redis.set(f"status:board_{color}", status)
+
+    content = {"order_id": order_id, "count": count, "status": status}
+    if status == "disable" and reason:
+        content["reason"] = reason
+    cnt_path = f"cnt_warehouse/cnt_board_status/cnt_{color}"
+
+    ok = post_cin_to_mobius(cnt_path, content)
+    print(f"[report/board-status] {cnt_path} {'성공' if ok else '실패'}:", content)
+
+    if not ok:
+        return jsonify({"error": "mobius CIN 생성 실패"}), 502
+    return jsonify({"result": "ok"}), 200
+
+
+# ============================================================
+# 아두이노/컨베이어 부팅 시 보드 재고 초기 조회
+# 키캡 쪽과 동일하게 count+status 같이 응답함 (재부팅 시 disable 복원용)
+# 응답 형식: {"r": {"count": 3, "status": "idle"}, "y": {...}, ...}
+# ============================================================
+@app.route("/stock/board", methods=["GET"])
+def get_stock_board():
+    stock_keys = [f"stock:board_{color}" for color in BOARD_COLORS]
+    status_keys = [f"status:board_{color}" for color in BOARD_COLORS]
+
+    stock_values = redis.mget(*stock_keys)
+    status_values = redis.mget(*status_keys)
+
+    result = {}
+    for color, count, status in zip(BOARD_COLORS, stock_values, status_values):
+        result[color] = {
+            "count": int(count or 0),
+            "status": status if status else "idle",
+        }
+    return jsonify(result), 200
+
+
+# ============================================================
+# 보드 restock: 키캡의 /restock/<letter>/<color> 와 동일한 로직.
+# pool에서 카트리지로 채워 넣고, 채운 양을 응답으로 반환
+# 응답 형식: {"filled": 3}
+# ============================================================
+@app.route("/restock/board/<color>", methods=["POST"])
+def restock_board(color):
+    if color not in BOARD_COLORS:
+        abort(404)
+
+    # 리필 시점의 status를 body로 명시적으로 받을 수도 있음 (예: 고장 상태에서도
+    # 재고만 채워야 하는 경우). 안 보내주면 "마지막 저장값"이 아니라 방금 채운
+    # 개수 기준으로 새로 계산함 (키캡 쪽과 동일한 이유).
+    data = request.get_json(force=True, silent=True) or {}
+    status_key = f"status:board_{color}"
+    status = data.get("status")
+
+    pool_key = f"pool:board_{color}"
+    stock_key = f"stock:board_{color}"
+
+    pool_qty = int(redis.get(pool_key) or 0)
+    fill_amount = min(BOARD_CARTRIDGE_CAPACITY, pool_qty)
+
+    redis.set(stock_key, fill_amount)
+    if fill_amount > 0:
+        redis.decrby(pool_key, fill_amount)
+
+    if status is None:
+        status = "empty" if fill_amount == 0 else "idle"
+    redis.set(status_key, status)
+
+    # 채운 결과를 order_id=null로 모비우스에 업로드 (여기서 한 번만 올림 -
+    # 아두이노 쪽에서 이 호출 이후 또 보고하면 같은 restock이 중복으로
+    # 올라가므로 절대 여기 말고 다른 곳에서 또 올리지 않도록 유지할 것)
+    content = {"order_id": None, "count": fill_amount, "status": status}
+    ok = post_cin_to_mobius(f"cnt_warehouse/cnt_board_status/cnt_{color}", content)
+
+    print(f"[restock] board_{color}: {fill_amount}개로 채움 (pool 남음 {pool_qty - fill_amount}, status={status}, 모비우스 업로드 {'성공' if ok else '실패'})")
+    return jsonify({"filled": fill_amount, "status": status, "mobius_ok": ok}), 200
 
 
 # ============================================================
@@ -303,6 +437,16 @@ def queue_complete(board):
 @app.route("/restock/<letter>/<color>", methods=["POST"])
 def restock_letter_color(letter, color):
     letter_color = f"{letter}_{color}"
+
+    # 리필 시점의 status를 body로 명시적으로 받을 수도 있음 (예: 고장 상태에서도
+    # 재고만 채워야 하는 경우). 안 보내주면 "마지막 저장값"이 아니라 방금 채운
+    # 개수 기준으로 새로 계산함 - restock은 보통 재고가 empty였을 때 일어나는데,
+    # 마지막 저장값을 그대로 쓰면 다 채워놓고도 status가 옛날 empty로 잘못
+    # 올라가는 문제가 있었음.
+    data = request.get_json(force=True, silent=True) or {}
+    status_key = f"status:{letter_color}"
+    status = data.get("status")
+
     pool_key = f"pool:{letter_color}"  # 색상별로 분리 (예: pool:E_r), 글자 단위 pool:E 아님
 
     pool_qty = int(redis.get(pool_key) or 0)
@@ -312,8 +456,18 @@ def restock_letter_color(letter, color):
     if fill_amount > 0:
         redis.decrby(pool_key, fill_amount)
 
-    print(f"[restock] {letter_color}: {fill_amount}개로 채움 (pool 남음 {pool_qty - fill_amount})")
-    return jsonify({"filled": fill_amount}), 200
+    if status is None:
+        status = "empty" if fill_amount == 0 else "idle"
+    redis.set(status_key, status)
+
+    # 채운 결과를 order_id=null로 모비우스에 업로드 (여기서 한 번만 올림 -
+    # 아두이노 쪽에서 이 호출 이후 또 보고하면 같은 restock이 중복으로
+    # 올라가므로 절대 여기 말고 다른 곳에서 또 올리지 않도록 유지할 것)
+    content = {"order_id": None, "count": fill_amount, "status": status}
+    ok = post_cin_to_mobius(f"cnt_warehouse/cnt_keycap_status/cnt_{letter_color}", content)
+
+    print(f"[restock] {letter_color}: {fill_amount}개로 채움 (pool 남음 {pool_qty - fill_amount}, status={status}, 모비우스 업로드 {'성공' if ok else '실패'})")
+    return jsonify({"filled": fill_amount, "status": status, "mobius_ok": ok}), 200
 
 
 # ============================================================
@@ -372,6 +526,99 @@ def clear_gate(board):
     redis.delete(_gate_key(board))
     print(f"[gate] {board} 해제")
     return jsonify({"result": "ok"}), 200
+
+
+# ============================================================
+# 재고 초기화
+#
+# - 모비우스 리셋 (/reset/mobius): Redis는 건드리지 않고, 현재 Redis에 있는
+#   재고값을 "그대로" order_id=null로, status는 마지막으로 보고된 값(고장 상태면
+#   고장 상태 그대로) 그대로 모비우스에 재업로드만 함
+#   (우리 쪽 값 확인 후 모비우스에 채워 넣는 용도)
+#
+# - 하드 리셋 (/reset/hard): Redis 자체를 카트리지 기본값(키캡 RAIL_CAPACITY,
+#   보드 BOARD_CARTRIDGE_CAPACITY)과 보드 전체 재고(BOARD_POOL_TOTAL)로 되돌리고,
+#   진행 중이던 큐/게이트도 전부 비운 뒤, order_id=null / status=null로 모비우스에
+#   업로드함. status 캐시(status:{key})는 그대로 유지함 — 재고 초기화가 고장난
+#   하드웨어를 고쳐주는 건 아니므로, 실제 마지막 상태 정보를 잃어버리면 안 됨.
+#
+# 주의: 키캡의 pool:{letter}_{color}(전체 재고) 총량은 이 코드에서 관리하지 않으므로
+# 하드 리셋에서도 건드리지 않음.
+# ============================================================
+def _all_keycap_letter_colors():
+    return [
+        f"{letter}_{color}"
+        for letters in BOARD_LETTERS.values()
+        for letter in letters
+        for color in COLORS
+    ]
+
+
+@app.route("/reset/mobius", methods=["POST"])
+def reset_mobius():
+    keycap_lcs = _all_keycap_letter_colors()
+    keycap_keys = [f"stock:{lc}" for lc in keycap_lcs]
+    board_keys = [f"stock:board_{color}" for color in BOARD_COLORS]
+
+    keycap_values = redis.mget(*keycap_keys)
+    board_values = redis.mget(*board_keys)
+
+    results = {}
+
+    for lc, value in zip(keycap_lcs, keycap_values):
+        count = int(value or 0)
+        status = get_last_status(f"status:{lc}")
+        content = {"order_id": None, "count": count, "status": status}
+        ok = post_cin_to_mobius(f"cnt_warehouse/cnt_keycap_status/cnt_{lc}", content)
+        results[lc] = ok
+
+    for color, value in zip(BOARD_COLORS, board_values):
+        count = int(value or 0)
+        status = get_last_status(f"status:board_{color}")
+        content = {"order_id": None, "count": count, "status": status}
+        ok = post_cin_to_mobius(f"cnt_warehouse/cnt_board_status/cnt_{color}", content)
+        results[f"board_{color}"] = ok
+
+    failed = [k for k, ok in results.items() if not ok]
+    print(f"[reset/mobius] 동기화 완료, 실패: {failed if failed else '없음'}")
+    return jsonify({"result": "ok" if not failed else "partial_fail", "failed": failed}), (200 if not failed else 207)
+
+
+@app.route("/reset/hard", methods=["POST"])
+def reset_hard():
+    # 1) 키캡 카트리지 재고 → 최대치(RAIL_CAPACITY)로 리셋
+    keycap_lcs = _all_keycap_letter_colors()
+    for lc in keycap_lcs:
+        redis.set(f"stock:{lc}", RAIL_CAPACITY)
+
+    # 2) 보드 카트리지 재고 → 최대치로, 창고 pool → 전체 재고에서 카트리지분을 뺀 값으로 리셋
+    for color in BOARD_COLORS:
+        redis.set(f"stock:board_{color}", BOARD_CARTRIDGE_CAPACITY)
+        redis.set(f"pool:board_{color}", BOARD_POOL_TOTAL - BOARD_CARTRIDGE_CAPACITY)
+
+    # 3) 진행 중이던 주문 상태(큐/게이트) 전부 비움
+    for board in BOARD_LETTERS:
+        redis.delete(f"queue:{board}")
+        redis.delete(f"gate:{board}")
+
+    # 4) 리셋된 값을 order_id=null, status=null로 모비우스에 업로드
+    #    (status 캐시는 지우지 않음 — 재고 초기화가 고장 상태를 고쳐주는 게 아니라서,
+    #    지워버리면 다음 restock 때 실제로는 disable인데 idle로 잘못 올라갈 수 있음)
+    results = {}
+
+    for lc in keycap_lcs:
+        content = {"order_id": None, "count": RAIL_CAPACITY, "status": None}
+        ok = post_cin_to_mobius(f"cnt_warehouse/cnt_keycap_status/cnt_{lc}", content)
+        results[lc] = ok
+
+    for color in BOARD_COLORS:
+        content = {"order_id": None, "count": BOARD_CARTRIDGE_CAPACITY, "status": None}
+        ok = post_cin_to_mobius(f"cnt_warehouse/cnt_board_status/cnt_{color}", content)
+        results[f"board_{color}"] = ok
+
+    failed = [k for k, ok in results.items() if not ok]
+    print(f"[reset/hard] 하드 리셋 완료, 모비우스 업로드 실패: {failed if failed else '없음'}")
+    return jsonify({"result": "ok" if not failed else "partial_fail", "failed": failed}), (200 if not failed else 207)
 
 
 if __name__ == "__main__":

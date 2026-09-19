@@ -234,6 +234,168 @@
      DS_WAIT_IR로 넘어가기 전 서보가 홈 위치에 물리적으로 도달할 최소 시간만
      보장하는 순수 정착 대기로 역할이 축소됨.
 
+  [2026-09-18 disable 사유(reason) 필드 + PCA 드라이버 헬스체크 + 플랫폼 fault
+   기반 disable/재배출 추가]
+   - disable 보고에 reason 필드 추가: IR 판정 실패(끼임/서보모터 고장)는
+     REASON_CARTRIDGE_FAILED("keycap_cartridge_failed"), PCA9685 I2C 응답
+     없음은 REASON_DRIVER_FAILED("keycap_driver_failed")로 구분해서 보냄.
+   - PCA9685는 이 보드의 8개 레일을 전부 구동하는 단일 드라이버라, 고장나면
+     8개 레일이 다 같이 영향받음. checkPcaHealthy()로 1초 간격 헬스체크,
+     고장 감지 시 8개 레일 전부 disable 보고하되, 그 순간 처리하려던 주문과
+     관련된 레일 1개에만 order_id를 채우고 나머지 7개는 order_id를 null로 보냄
+     (reportRailStatus에 빈 문자열을 넘기면 JSON null로 직렬화되도록 처리).
+     복구되면 8개 레일 전부 재고 기준 상태(idle/empty)로 원복 보고.
+   - 플랫폼(Mobius)이 주문 객체에 "fault": "..." 문자열을 올리면(예:
+     tray_01_belt_jammed), handleOrderFaults()가 매 스냅샷마다 우리 축 담당
+     주문인지 확인해서: fault가 새로 생기면 해당 레일을 disable(reason=fault
+     문자열 그대로)로 보고, 이후 같은 order_id에서 fault가 사라지면 그 레일만
+     재고 기준 상태로 되돌리고 같은 order_id로 재배출 job을 큐에 다시 넣음
+     (재고 0이면 job은 넣지 않고 상태만 원복). fault와 무관한 레일은
+     이 로직이 아예 건드리지 않음.
+
+  [2026-09-19 fault 처리 방식 재설계 - disable 기반 -> 추적/조건부 재배출 기반]
+   - 위 09-18 항목에서 설명한 "fault 등장 시 disable 보고" 방식은 폐기함.
+     실제로는 fault가 두 종류로, 성격이 다름이 확인됨:
+       - tray_jam류: 우리가 이미 실패/disable을 보고했기 때문에 플랫폼이
+         그걸 보고 채워주는 것(우리 상태의 메아리) - 우리가 또 disable을
+         보고할 이유가 없음(이미 아는 정보를 되돌려받는 것뿐).
+       - stage_timeout류: 같은 status가 60초 유지되면 플랫폼이 자동으로
+         붙임 - 정상적으로 배출 대기 중(큐에서 순서 기다리는 중)이어도
+         뜰 수 있어서, 이것만 보고 disable로 판단할 근거가 없음.
+   - 대응: fault 등장 시엔 disable/보고를 전혀 하지 않고, "이 주문에 fault가
+     있다"는 사실만 faultActive[]/faultOrderId[]로 추적. fault가 사라지는
+     시점에만 그 주문의 현재 status로 갈라서 처리:
+       - status가 아직 "assigned"면(stage_timeout이 대기 중 뜬 경우 등)
+         아무것도 안 함 - handleOrdersField()가 정상 경로로 알아서 주워감.
+       - status가 assigned를 이미 지났으면(배출 끝난 뒤 걸린 tray_jam류)
+         정상 경로가 다시 안 주워가므로 재배출 job을 직접 큐에 넣음.
+   - 참고: 보드 로봇암 쪽 파이썬 코드(팀원 작성)도 같은 원리로 "fault 등장
+     시 무보고, 해제 시에만 재시도"로 짜여있음을 확인 - 다만 그쪽은 큐/게이트
+     없이 함수를 직접 재호출하는 방식(게이트가 재시도 대상 주문 자신에게
+     걸려있어 큐를 거치면 데드락 위험이 있어서)이고, 여기 키캡 아두이노는
+     배출 자체가 상태머신 기반이라 여전히 큐에 넣는 방식을 씀 - 이 경우
+     게이트가 재배출 대상 주문 자신에게 걸려있는 상황이 실제로 나올 수
+     있는지는 미확인이라, 만약 그런 경우가 생기면 재배출 job이 게이트가
+     열릴 때까지 큐에서 대기만 하다가 못 나갈 위험이 있음 (실기 확인 필요).
+
+  [2026-09-19 fault 재배출 시 실기에서 확인된 문제 2건 수정]
+   - (자기 자신 게이트 데드락) 위에서 "미확인"이라 적었던 우려가 실기에서
+     그대로 발생함 확인: 재배출 대상 주문이 마침 게이트를 걸고 있는 그
+     주문 자신인 경우, 큐에 넣어도 게이트가 영원히 안 열려 실행이 안 됨.
+     대응: 재배출 큐잉 직전에 gateOrderId == orderId면 게이트를 먼저 풀어줌
+     (이 주문이 pickup_reached 되길 기다릴 이유가 없음 - 배출 자체를 다시
+     하는 거라서).
+   - (disable 상태 방치) 재배출 job을 큐에 넣어도, 그 레일이 여전히
+     RAIL_DISABLE 상태로 남아있으면 DS_IDLE이 꺼내자마자 "disable이라
+     건너뜀"으로 또 조용히 버려버리는 문제 확인. 대응: 재배출 큐잉 직전에
+     레일이 disable이면 REPAIR 명령과 동일하게 재고 기준 상태(idle/empty)로
+     원복시킴 - fault가 풀렸다는 신호 자체를 "사람이 고쳤다"는 신뢰로 보고
+     엶. PCA 드라이버 고장이었을 경우 다음 배출 시도 직전 PCA 헬스체크가
+     다시 확인하므로, 진짜 안 고쳐졌으면 즉시 재차 disable되는 안전망이 있음.
+   - [이스케이프 버그 확인] 팀원분이 지적한 '\\0'/'\\n' 더블 백슬래시 버그를
+     확인한 결과, 지금 올라온 원본 기준으로는 NS가 아니라 EI 쪽에 있었음
+     (EI에서 수정함). 이 NS 파일은 원래도 '\0'/'\n'로 정상이라 이 부분은
+     그대로 둠 - 팀원이 본 버전과 다를 수 있으니 서로 확인 필요.
+
+  [2026-09-19 stage_timeout fault는 등장 즉시 큐에서 제거 + 영구 재큐잉 차단]
+   - 배경: stage_timeout은 "우리 레일의 실제 성공/실패"와 무관하게, 어떤
+     단계든 정해진 시간(60초) 안에 다음 단계로 못 넘어가면 플랫폼이 자동으로
+     붙이는 타임아웃 표시일 뿐임. 이제 이 경우는 사람이 수동으로 폐기 처리
+     하기로 결정됨 - 즉 stage_timeout이 뜬 주문은 우리가 다시 배출을 시도할
+     이유가 없음.
+   - 최종 방식(해제 시점 판단 -> 등장 시점 즉시 처리로 단순화): 처음엔 fault
+     해제 시점에 rail 상태를 보고 재배출 여부를 가르려 했으나, stage_timeout은
+     우리 rail 상태와 무관하게 뜰 수 있어 판단 기준이 되지 못함이 확인됨. 더
+     단순하게, stage_timeout이 **등장하는 즉시** 그 주문을 처리해버리는 쪽으로
+     방향을 바꿈 - 해제 시점엔 아무 것도 할 필요가 없어짐(할 일을 이미 등장
+     시점에 다 끝내버렸으므로).
+   - 대응: stage_timeout이 뜨면(handleOrderFaults) 그 자리에서 바로
+     ① 이 주문의 jobKey를 markProcessed()로 등록해 handleOrdersField()가
+     앞으로 절대 이 주문을 다시 큐에 넣지 않도록 영구 차단하고,
+     ② removeOrderFromQueue()로 로컬 큐(jobQueue)에 이 주문이 대기 중이면
+     즉시 꺼내서 completeOnServer()로 서버 큐에서도 같이 제거함.
+     지금 한창 배출 중인 주문(currentJob)은 이미 큐 밖으로 나와 진행 중이라
+     이 처리와 무관 - 물리적으로 멈출 수 없으니 그대로 끝까지 진행되고,
+     끝난 뒤엔 원래 흐름대로 completeOnServer()가 불려서 서버 큐에서도
+     알아서 빠짐.
+   - keycap_cartridge_failed/keycap_driver_failed는 기존 방식(등장 시엔
+     추적만, 해제 시 rail이 disable이었으면 재배출) 그대로 유지 - 이 둘은
+     우리가 이미 disable을 보고한 것의 메아리라 등장 시점에 즉시 처리할
+     필요가 없고, 오히려 해제 시점에 rail 상태를 보고 판단하는 게 맞음.
+   - 게이트: 별도 처리 안 함 - 폐기된 주문이 마침 게이트를 잡고 있었다면
+     checkGateAgainstOrders()가 기존 기준(orders에서 사라짐 또는
+     GATE_OPEN_STATUSES) 그대로 알아서 열어줌. 단, 플랫폼이 폐기 처리 시
+     실제로 orders에서 그 주문을 지우는지, 아니면 별도 status만 남기고
+     목록엔 계속 두는지는 미확인 - 후자라면 그 status가 GATE_OPEN_STATUSES에
+     없을 경우 게이트가 영원히 안 열리는 위험이 있으므로 플랫폼팀 확인 후
+     필요 시 화이트리스트에 추가할 것.
+   - [알려진 채로 남겨두는 구멍, 지금은 손 안 댐] 배출 도중(서보 동작 중)
+     아두이노 자체가 멈추거나 재부팅되면, 그 job은 completeOnServer가 안
+     불려서 서버 큐엔 "대기 중"으로 남음. 그 사이 stage_timeout -> 폐기가
+     되면, 재부팅 후 restoreQueueFromServer()가 이 죽은 job을 다시 로컬
+     큐에 채우는데, 그걸 걸러낼 다음 MQTT 스냅샷이 오기 전까지의 아주 짧은
+     시간 동안은 이 job이 살아있는 것처럼 배출을 시작해버릴 수 있음(반대로
+     살아있는 주문은 이 시간차와 무관하게 정상적으로 바로 재배출돼야 함).
+     지금은 이 경우를 다루지 않기로 함 - 나중에 필요해지면 부팅 시 Flask가
+     들고 있는 최신 cnt_process 스냅샷을 한 번 조회해서 큐를 미리 거르는
+     방식을 검토할 것.
+
+  [2026-09-19 서보 각도/방향 실측값 반영 - 대기 90도->170도, 배출 방향 반전]
+   - 배경: 별도 캘리브레이션용 테스트 스케치(Servo_Push_Cycle_Test)로 실측한
+     결과, 기존 SERVO_HOME_ANGLE=90(대기)이 실제로는 디스펜서가 카트리지
+     출구 아래까지 나와있는 위치였음이 확인됨. 대기 각도는 170도, 배출
+     (푸시) 각도는 70도가 적절함이 확인됨 - 즉 각도가 "증가"가 아니라
+     "감소"하면서 배출되는 방향으로 뒤바뀜.
+   - 대응: SERVO_HOME_ANGLE을 170으로 변경, 배출 목표 각도를 상수화한
+     PUSH_ANGLE(70)을 새로 추가. DS_HOMING의 브레이크어웨이 킥 방향을
+     `+BREAKAWAY_KICK_DEG`에서 `-BREAKAWAY_KICK_DEG`로, DS_SWEEPING의
+     스텝 방향을 `sweepAngle++`에서 `sweepAngle--`로, 종료 조건을
+     `sweepAngle >= 180`에서 `sweepAngle <= PUSH_ANGLE`로 각각 반전.
+     SWEEP_STEP_DELAY_MS도 실측값 기준 15 -> 10으로 조정.
+   - SERVO_MIN_PULSE/SERVO_MAX_PULSE, RETURN_DELAY_MS, DISPENSE_HOLD_MS,
+     BREAKAWAY_SETTLE_MS 등 나머지 서보 타이밍 값은 이번 실측 대상이
+     아니었으므로 그대로 둠 - 배출이 실기에서 이상하면 이 값들도 순서대로
+     재검토할 것.
+
+  [2026-09-19 IR_MIN_BREAK_MS 실측값 반영 - 20ms -> 5ms]
+   - 배경: 별도 IR 센서 테스트 스케치(IR_Sensor_Test)로 N_r 레일에서 키캡
+     낙하 시 실제 빔 끊김 지속시간을 반복 측정한 결과 7~19ms 범위로 나왔고,
+     추가 측정에서 최소 7ms까지 확인됨. 기존 IR_MIN_BREAK_MS=20ms는 이 값들
+     보다 높아서, 짧게 끊기는 정상적인 통과까지 디바운스에서 걸러져 실패로
+     오판정하고 있었을 가능성이 확인됨(이게 "센서가 감지를 잘 못 한다"고
+     느꼈던 원인으로 추정).
+   - 대응: 실측 최소값(7ms)보다 여유를 두고 IR_MIN_BREAK_MS를 5로 낮춤.
+     0에 가깝게 낮추지 않은 이유는, 이 디바운스가 원래 서보 PWM 스위칭 등
+     전기적 노이즈를 걸러내기 위한 목적도 겸하고 있어서 - 너무 낮추면 반대로
+     노이즈를 진짜 통과로 오판정할 위험이 생김. 다만 이번 실측에서는 노이즈
+     자체의 지속시간을 직접 재보지는 못했음(서보 구동 중 IR 핀 노이즈 동시
+     관찰은 별도 통합 테스트가 필요해 보류함) - 실기에서 오탐지(가만히
+     있는데 배출 성공으로 잘못 판정되는 경우)가 관찰되면 이 값을 다시 올릴 것.
+   - IR_POLL_WINDOW_MS(4500ms)는 이번 실측 대상이 아니었으므로 그대로 둠.
+   - 편차가 큰 원인(7~19ms로 거의 3배 차이)이 디바운스만으로는 완전히
+     해결 안 될 수 있음 - 낙하 경로가 매번 빔을 정확히 지나가지 않아서
+     아예 감지 자체가 안 되는 경우도 관찰됨(디바운스 값과 무관한 별개
+     문제). 슈트 내 빔 위치/가이드 등 기구적 정렬 확인이 필요할 수 있음.
+
+  [2026-09-19 IR_SENSOR_INSTALLED 0 -> 1로 활성화]
+   - N_r 레일 실측(디바운스 값 확정)이 끝나 최상위 스위치를 켬. 이제
+     `#if IR_SENSOR_INSTALLED` 블록이 실제로 컴파일에 포함되고,
+     IR_INSTALLED[0][0]=true인 N_r 레일만 실제 IR 판정 로직이 동작함.
+     나머지 7개 레일은 IR_INSTALLED가 false라 여전히 무조건 성공 처리됨.
+
+  [2026-09-19 IR_INSTALLED[0][0] false로 되돌아가 있던 것 수정]
+   - 위에서 IR_SENSOR_INSTALLED(최상위 스위치)만 1로 켜고, 정작 레일별
+     스위치인 IR_INSTALLED[0][0](N_r)은 true로 바꾸는 걸 누락함. 그 결과
+     실제 배출 후 `if (IR_INSTALLED[l][c])` 조건을 항상 통과 못 해서
+     `#if IR_SENSOR_INSTALLED` 블록 안 판정 로직 자체가 매번 스킵되고,
+     success 기본값(true)이 그대로 채택돼 키캡이 실제로 안 떨어졌어도
+     계속 idle(성공)로 보고되는 증상이 발생함 - IR_MIN_BREAK_MS를 아무리
+     바꿔도 이 줄이 안 읽히니 전혀 반영이 안 됐던 것.
+   - 대응: IR_INSTALLED[0][0]을 true로 수정. 이제 센서 관련 스위치는
+     IR_SENSOR_INSTALLED(보드 전체) / IR_INSTALLED[l][c](레일별) /
+     IR_MIN_BREAK_MS(디바운스) 세 곳 모두 맞춰야 실제 판정이 동작함 -
+     다음에 새 레일 배선 추가할 때도 이 세 곳을 다 확인할 것.
+
   다른 3개 보드는 이 파일을 복사한 뒤 "보드별 설정" 블록만 아래 표대로
   바꿔서 각 보드에 업로드하면 됩니다. (지금 이 파일은 NS 보드용입니다)
 
@@ -270,12 +432,12 @@ struct DispenseJob;
 
 // ============================== [보드별 설정] ==============================
 // 이 블록만 축마다 바꿔서 4개 보드에 각각 업로드합니다.
-#define AXIS_NAME               "NS"
-const char  LETTER_0            = 'N';
-const char  LETTER_1            = 'S';
-const uint8_t AXIS_INDEX        = 1;      // keycap 문자열에서의 내 축 위치 (E/I=0, N/S=1, T/F=2, P/J=3)
-const char* MQTT_CLIENT_ID      = "arduino_NS";
-const char* BOARD_NAME           = "NS";  // /queue/{board}/*, /stock/keycap?board=*, /gate/{board} 에 그대로 씀
+#define AXIS_NAME               "EI"
+const char  LETTER_0            = 'E';
+const char  LETTER_1            = 'I';
+const uint8_t AXIS_INDEX        = 0;      // keycap 문자열에서의 내 축 위치 (E/I=0, N/S=1, T/F=2, P/J=3)
+const char* MQTT_CLIENT_ID      = "arduino_EI";
+const char* BOARD_NAME           = "EI";  // /queue/{board}/*, /stock/keycap?board=*, /gate/{board} 에 그대로 씀
 // ===========================================================================
 
 // ---- 색상 순서 (colors 배열/보드 내부 인덱싱과 동일 순서로 고정) ----
@@ -296,13 +458,14 @@ const uint8_t IR_PIN[2][4] = {
 // ---- 서보 동작 파라미터 (실측 후 조정) ----
 #define SERVO_MIN_PULSE       150
 #define SERVO_MAX_PULSE       600
-#define SERVO_HOME_ANGLE       90   // 실측 확정값
-#define SWEEP_STEP_DELAY_MS    15   // 1도 이동마다 대기 (구버전 실기 테스트값)
+#define SERVO_HOME_ANGLE      170   // 대기 각도 (실측 확정값 - Servo_Push_Cycle_Test로 찾음)
+#define PUSH_ANGLE             70   // 배출(푸시) 각도 (실측 확정값) - 대기(170)에서 이 값까지 "감소"하며 이동함에 주의
+#define SWEEP_STEP_DELAY_MS    10   // 1도 이동마다 대기 (실측 확정값)
 #define RETURN_DELAY_MS       400   // 복귀 명령 후 실제 도달까지 대기
-#define DISPENSE_HOLD_MS      400   // 180도(완전 배출) 도달 후 유지 시간
+#define DISPENSE_HOLD_MS      400   // 푸시 각도 도달 후 유지 시간
 #define IR_CHECK_DELAY_MS     200   // DS_RETURNING에서 DS_WAIT_IR로 넘어가기 전 최소 물리 정착 대기 (IR 감시 자체는 이미 모터 시작 시점부터 계속 진행 중)
 #define IR_DETECT_LEVEL       LOW   // 센서가 "감지됨(빔 끊김)"일 때 주는 레벨 (실측 후 조정)
-#define BREAKAWAY_KICK_DEG      4   // 스윕 시작 시 정지마찰을 넘기기 위한 초기 킥 각도
+#define BREAKAWAY_KICK_DEG      4   // 스윕 시작 시 정지마찰을 넘기기 위한 초기 킥 각도 (대기->푸시 방향, 즉 감소 방향으로 킥)
 #define BREAKAWAY_SETTLE_MS    60   // 킥 이동 후 실제 도달까지 대기
 
 // ---- [브레이크빔(송신부/수신부 분리형) 센서 판정 파라미터] ----
@@ -316,7 +479,7 @@ const uint8_t IR_PIN[2][4] = {
 // 길이 - 실제 서보 동작 시퀀스(복귀대기+킥+스윕+홀드+복귀대기 ≈ 3.5~4초)를
 // 전부 덮고도 여유가 남도록 넉넉하게 잡음.
 #define IR_POLL_WINDOW_MS  4500   // 모터 시작 시각 기준 전체 감시 윈도우 (약 4.5초, 넉넉하게) - 실측 후 조정
-#define IR_MIN_BREAK_MS      20   // 이 이상 연속으로 끊겨야 유효 통과로 인정(노이즈 필터) - 실측 후 조정
+#define IR_MIN_BREAK_MS       7   // 이 이상 연속으로 끊겨야 유효 통과로 인정(노이즈 필터) - IR_Sensor_Test로 실측(7~19ms)한 결과 반영, 여유 두고 7로 설정
 
 // ---- [IR 센서 장착 여부 토글 - 보드 전체] ----
 // 1 = 이 보드에 브레이크빔 IR 센서가 최소 1개 이상 배선됨 (판정 로직 컴파일 포함)
@@ -334,12 +497,30 @@ const uint8_t IR_PIN[2][4] = {
 // 이 표만 갱신하면 됨 - IR_PIN 배열과 인덱스([글자슬롯][색상슬롯])가 동일하게 대응.
 // ※ 현재 배선 완료: N_r 1개 레일만 (IR_INSTALLED[0][0], 수신부 신호선을 핀 2에 연결)
 const bool IR_INSTALLED[2][4] = {
-  {true,  false, false, false},  // N: r(핀2)만 배선됨, y/b/g는 미배선
-  {false, false, false, false}   // S: 전부 미배선
+  {true, false, false, false},  // 이 보드는 센서 미배선
+  {false, false, false, false}
 };
 
 // ---- 카트리지 최대 용량 (restock 시 이 값까지 채움, 전체 풀 부족하면 서버가 그보다 적게 응답) ----
 #define MAX_CAPACITY 30
+
+// ---- disable 사유 문자열 (report 시 reason 필드에 실려 나감) ----
+const char* REASON_CARTRIDGE_FAILED = "keycap_cartridge_failed"; // 끼임/서보모터 고장 (IR 판정 실패)
+const char* REASON_DRIVER_FAILED    = "keycap_driver_failed";    // PCA9685 드라이버 고장 (I2C 통신 실패)
+
+// ---- 우리가 반응하는 fault 화이트리스트 (실제 판정 함수는 RailStatus 등
+// 타입 선언 뒤로 옮겨둠 - 함수 정의를 여기 두면 Arduino IDE가 자동 생성하는
+// 함수 프로토타입 삽입 위치가 앞당겨져서 RailStatus 등 뒤에 나오는 타입을
+// 쓰는 함수들이 "선언 안 됨" 컴파일 에러를 냄. 배열 자체는 상수 데이터라
+// 여기 있어도 무방.) ----
+// 플랫폼이 orders[].fault에 뭘 채워 올리든 다 반응하면 안 됨 - 예를 들어
+// 보드(피지컬 보드 상품) 쪽 fault(board_pack_failed 등)가 같은 order 객체에
+// 실려 올 경우 우리가 착각하고 반응할 위험이 있음. 그래서 키캡이 실제로
+// 받는 fault 3종류만 화이트리스트로 걸러서 그 외는 아예 무시함.
+const char* KNOWN_FAULTS[] = {
+  "keycap_cartridge_failed", "keycap_driver_failed", "stage_timeout"
+};
+const uint8_t KNOWN_FAULTS_COUNT = sizeof(KNOWN_FAULTS) / sizeof(KNOWN_FAULTS[0]);
 
 // ---- 레일 상태 (부팅 시 서버에서 조회해서 채움, 배출/restock마다 서버와 동기화) ----
 enum RailStatus : uint8_t { RAIL_IDLE, RAIL_BUSY, RAIL_EMPTY, RAIL_DISABLE };
@@ -354,6 +535,13 @@ char letterOf(int l) { return (l == 0) ? LETTER_0 : LETTER_1; }
 char colorOf(int c)  { return COLOR_LIST[c]; }
 String letterColorKey(int l, int c) {
   return String(letterOf(l)) + "_" + String(colorOf(c));
+}
+
+bool isKnownFault(const char* fault) {
+  for (uint8_t i = 0; i < KNOWN_FAULTS_COUNT; i++) {
+    if (strcmp(fault, KNOWN_FAULTS[i]) == 0) return true;
+  }
+  return false;
 }
 
 // ============================== 최근 처리한 주문 기록 (중복 배출 방지) ==============================
@@ -378,6 +566,38 @@ void markProcessed(const String& jobKey) {
 // 등장할 때 새 restock 이벤트로 인식해서 재호출 가능해짐.
 bool restockInProgress[2][4] = { {false, false, false, false}, {false, false, false, false} };
 
+// ============================== PCA9685 드라이버 헬스체크 ==============================
+// PCA9685 한 개가 이 보드의 8개 레일(글자 2 × 색상 4) 전부를 구동하므로,
+// 드라이버 자체가 죽으면 8개 레일이 전부 영향을 받음. 그래서 고장 감지 시
+// 8개 레일 전부에 disable을 보고하되, 지금 처리하려던 주문과 관련된 레일에만
+// order_id를 채우고 나머지 7개는 order_id를 null로 보냄.
+bool pcaDriverFailed = false;
+unsigned long lastPcaCheckMs = 0;
+const unsigned long PCA_CHECK_INTERVAL_MS = 1000; // I2C 버스 부담 줄이려고 매 loop()가 아니라 1초 간격으로만 확인
+
+// 고장 감지 시점에 큐 맨 앞에 있던(=order_id가 실제로 붙었던) job을 기억해둠.
+// 복구 감지 시, 이 레일만은 즉시 원복하지 않고 disable 그대로 둬서 - 그 주문의
+// fault가 실제로 플랫폼에서 풀릴 때(handleOrderFaults)만 재배출되도록 함.
+// 나머지 7개 레일은 애초에 특정 주문에 안 걸려있어서(order_id null) 기다릴
+// fault 자체가 없으므로 복구 즉시 원복해도 됨.
+// (DispenseJob 타입 인스턴스는 struct DispenseJob 전체 정의 뒤에서 선언해야
+// 해서 pcaRelatedJob 변수는 "배출 대기열" 섹션 아래에 별도로 선언함)
+bool pcaHasRelatedOrder = false;
+
+// ============================== 플랫폼(Mobius) fault 추적/재배출 ==============================
+// fault 두 종류가 있는데 처리 방식이 다름:
+//   - tray_jam류(keycap_cartridge_failed/keycap_driver_failed): 우리가 이미
+//     disable/실패를 보고했기 때문에 플랫폼이 그걸 보고 채워주는 것(우리
+//     상태의 메아리) - 등장 시엔 추적만 해두고, 해제 시점에 그때 주문 status/
+//     rail 상태를 보고 필요하면 재배출함 (기존 방식 그대로 유지).
+//   - stage_timeout: 같은 status가 일정 시간(60초) 유지되면 플랫폼이 자동으로
+//     붙임 - 우리 rail 상태와 무관하게 뜰 수 있어서 해제 시점 rail 상태로는
+//     판단할 수 없음. 이제 사람이 수동으로 폐기 처리하기로 했으므로, 아예
+//     "해제 시점 판단" 자체를 안 하고 **등장하는 즉시** 그 주문을 큐에서
+//     빼고 영구 재큐잉 차단함 (아래 handleOrderFaults 참고).
+bool   faultActive[2][4] = { {false, false, false, false}, {false, false, false, false} };
+String faultOrderId[2][4];
+
 // ============================== 배출 대기열 (로컬 캐시, 서버 큐와 동기화) ==============================
 struct DispenseJob {
   String orderId;
@@ -387,6 +607,10 @@ struct DispenseJob {
 #define JOB_QUEUE_SIZE 8
 DispenseJob jobQueue[JOB_QUEUE_SIZE];
 uint8_t jobHead = 0, jobTail = 0;
+
+// PCA 복구 시 "관련 레일 1개만 disable 유지"를 위해 고장 시점 job을 기억해두는
+// 변수 - struct DispenseJob 정의 뒤에 선언해야 함 (위 pcaHasRelatedOrder 참고)
+DispenseJob pcaRelatedJob;
 
 bool queuePush(const DispenseJob& job) {
   uint8_t next = (jobTail + 1) % JOB_QUEUE_SIZE;
@@ -419,6 +643,9 @@ String gateOrderId = "";
 //   일치 여부 반드시 확인할 것. assigned/dispensing 등 이전 단계는 절대 포함 금지.
 // ※ unclaimed(노쇼) 포함 여부는 노쇼 시 실제로 픽업 지점이 비워지는지에 달려있음 -
 //   로봇암/컨베이어 운영 방식 확정되면 재검토.
+// ※ stage_timeout으로 폐기된 주문이 orders 목록에서 실제로 사라지는지, 아니면
+//   별도 status만 남기고 목록엔 남는지 아직 미확인 - 후자라면 그 status를
+//   여기 추가해야 게이트가 안 막힘 (플랫폼팀 확인 필요).
 const char* GATE_OPEN_STATUSES[] = {
   "pickup_reached", "loaded", "arrived", "unclaimed", "verified", "received", "completed"
 };
@@ -473,13 +700,17 @@ bool tryConnectMQTT();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void handleOrdersField(JsonObject orders);
 void handleRestockField(JsonArray restock);
+void handleOrderFaults(JsonObject orders);
+bool getOrderLetterColor(JsonObject order, char& letter, char& color);
 void checkGateAgainstOrders(JsonObject orders);
 void pruneDeadJobsFromQueue(JsonObject orders);
+void removeOrderFromQueue(const String& orderId);
 void handleAssignedOrder(const String& orderId, const char* keycap, JsonArray colors);
 void runDispenseStateMachine();
 void pollIrForCurrentJob();
+bool checkPcaHealthy();
 void moveServoAngle(uint8_t channel, uint8_t angle);
-void reportRailStatus(char letter, char color, RailStatus status, const String& orderId);
+void reportRailStatus(char letter, char color, RailStatus status, const String& orderId, const char* reason = "");
 void reportDispenseResult(const String& orderId, char letter, char color);
 int  letterSlot(char c);
 int  colorSlot(char c);
@@ -636,6 +867,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // 큐에 남아있던 job 중 이번 스냅샷 orders에 없는 것들(종료/유령 주문) 정리
   pruneDeadJobsFromQueue(orders);
 
+  // fault 등장/해제 먼저 처리 - 특히 fault가 풀렸는데 주문 status가 여전히
+  // "assigned"인 경우(예: stage_timeout), 아래 handleOrdersField()가 같은
+  // 주문을 정상 경로로 또 큐에 넣기 전에 먼저 처리해서 markProcessed로
+  // 중복 방지 기록을 남겨야 함 (안 그러면 같은 주문이 두 번 큐에 들어감)
+  handleOrderFaults(orders);
+
   handleOrdersField(orders);
 
   JsonArray restock = doc["keycap_restock"];
@@ -695,6 +932,35 @@ void pruneDeadJobsFromQueue(JsonObject orders) {
 
   if (removed > 0) {
     Serial.println("[큐] orders에서 사라진 job " + String(removed) + "건 제거함");
+  }
+}
+
+// ---- 특정 order_id의 job이 로컬 큐(jobQueue)에 대기 중이면 즉시 꺼내서
+// 서버 큐에서도 같이 제거함. stage_timeout fault가 뜬 주문을 등장 즉시
+// 큐에서 빼기 위해 씀(handleOrderFaults 참고). currentJob(이미 큐 밖으로
+// 나와 배출 진행 중인 것)은 건드리지 않음 - 물리적으로 멈출 방법이 없어서
+// 그대로 끝까지 진행되도록 둠.
+void removeOrderFromQueue(const String& orderId) {
+  DispenseJob temp[JOB_QUEUE_SIZE];
+  uint8_t tempCount = 0;
+  bool removed = false;
+
+  DispenseJob job;
+  while (queuePop(job)) {
+    if (job.orderId == orderId) {
+      completeOnServer(job); // 서버 큐에서도 제거
+      removed = true;
+    } else {
+      temp[tempCount++] = job;
+    }
+  }
+
+  for (uint8_t i = 0; i < tempCount; i++) {
+    queuePush(temp[i]);
+  }
+
+  if (removed) {
+    Serial.println("[큐] " + orderId + " stage_timeout으로 큐에서 즉시 제거함");
   }
 }
 
@@ -772,7 +1038,133 @@ void handleRestockField(JsonArray restock) {
   }
 }
 
-// ============================== 배출 상태 머신 (90->180도 non-blocking 스윕 + 시작 스티션 킥 + 게이트) ==============================
+// ---- orders의 한 항목에서 이 보드(축) 담당 letter/color를 뽑아냄 ----
+// status 무관하게(assigned가 아니어도) 동작함 - fault는 tray_reached 등
+// 배출 이후 단계에서도 올라올 수 있기 때문. 담당 아니거나 파싱 불가면 false.
+bool getOrderLetterColor(JsonObject order, char& letter, char& color) {
+  const char* keycap = order["keycap"] | "";
+  JsonArray colors = order["colors"].as<JsonArray>();
+  if ((uint8_t)strlen(keycap) <= AXIS_INDEX || colors.size() <= AXIS_INDEX) return false;
+
+  letter = keycap[AXIS_INDEX];
+  if (letterSlot(letter) < 0) return false;
+
+  const char* colorStr = colors[AXIS_INDEX];
+  if (colorStr == nullptr || colorStr[0] == '\0') return false;
+  color = colorStr[0];
+  if (colorSlot(color) < 0) return false;
+
+  return true;
+}
+
+// ---- fault 필드 처리: 우리 축 담당 주문의 fault 등장/해제를 감지 ----
+// stage_timeout: rail 상태와 무관하게 뜰 수 있어서 해제 시점 판단이 불가능함
+// (사람이 수동 폐기하기로 결정됨) -> **등장하는 즉시** 큐에서 빼고 영구
+// 재큐잉 차단. 해제 시점엔 할 일이 없음(이미 등장 시점에 다 처리했으므로).
+// keycap_cartridge_failed/keycap_driver_failed: 등장 시엔 추적만 하고
+// disable/보고는 하지 않음(우리가 이미 보고한 것의 메아리라서). 해제 시(같은
+// order_id에서 fault가 다시 null이 되면) 그 시점 주문 status로 갈라서 처리 -
+// "assigned"면 정상 경로(handleOrdersField)에 맡기고 아무것도 안 함, 아니면
+// (이미 assigned를 지났으면) 정상 경로가 다시 안 주워가므로 우리가 직접
+// 재배출 job을 큐에 넣음. fault가 없었던 레일은 안 건드림.
+void handleOrderFaults(JsonObject orders) {
+  for (JsonPair kv : orders) {
+    JsonObject order = kv.value().as<JsonObject>();
+
+    char letter, color;
+    if (!getOrderLetterColor(order, letter, color)) continue; // 우리 축 담당 아님
+
+    int l = letterSlot(letter);
+    int c = colorSlot(color);
+    String orderId = String(kv.key().c_str());
+
+    const char* faultStr = order["fault"] | "";
+    bool hasFault = !order["fault"].isNull() && isKnownFault(faultStr);
+
+    if (hasFault && strcmp(faultStr, "stage_timeout") == 0) {
+      // stage_timeout 등장 - 그 자리에서 바로 폐기 취급: 큐에 있으면 즉시
+      // 빼고(있으면 completeOnServer까지 같이), jobKey를 markProcessed로
+      // 등록해 앞으로 이 주문이 다시 큐에 안 들어가게 영구 차단함.
+      // 지금 배출 진행 중(currentJob)인 경우는 물리적으로 멈출 수 없어서
+      // 그대로 두고 건드리지 않음 - 끝나면 원래 흐름대로 알아서 정리됨.
+      String jobKey = orderId + "_" + String(letter) + "_" + String(color);
+      if (!alreadyProcessed(jobKey)) {
+        markProcessed(jobKey);
+      }
+      removeOrderFromQueue(orderId);
+      // 이 주문은 더 이상 fault 추적 대상이 아님(해제 시점에 할 일이 없으므로)
+      if (faultActive[l][c] && faultOrderId[l][c] == orderId) {
+        faultActive[l][c] = false;
+        faultOrderId[l][c] = "";
+      }
+      continue;
+    }
+
+    if (hasFault) {
+      // 등장 시엔 추적만 하고 disable/보고는 하지 않음 (이유는 위 주석 참고)
+      faultActive[l][c] = true;
+      faultOrderId[l][c] = orderId;
+    } else {
+      if (faultActive[l][c] && faultOrderId[l][c] == orderId) {
+        faultActive[l][c] = false;
+        faultOrderId[l][c] = "";
+
+        // "아직 한 번도 시도 안 된 job인지"는 status가 아니라 alreadyProcessed로
+        // 판단해야 정확함 - status=="assigned"이어도 이미 배출을 한 번 시도했다가
+        // (예: IR 실패로 disable됐다가) fault가 걸린 경우엔 jobKey가 이미
+        // processedJobKeys에 있어서 handleOrdersField()가 정상적으로 다시
+        // 안 주워감. 그러니 "이미 시도됐는가"만 보고 우리가 직접 넣을지 정함.
+        String jobKey = orderId + "_" + String(letter) + "_" + String(color);
+
+        if (!alreadyProcessed(jobKey)) {
+          // 한 번도 시도된 적 없는 job(진짜 stage_timeout류가 대기 중에 뜬 경우
+          // 등) - handleOrdersField()가 이번 스냅샷에서 정상 경로로 알아서
+          // 주워가므로 여기선 아무것도 안 함
+          Serial.println("[fault] " + letterColorKey(l, c) + " " + orderId + " 해제 (미시도 상태, 정상 경로에 맡김)");
+        } else if (rail[l][c].status != RAIL_DISABLE) {
+          // 이미 시도는 됐지만 우리 레일 결과 자체는 disable이 아니었음(=우리
+          // 쪽은 이미 성공/정상 완료된 상태) - 이 fault는 같은 order의 다른
+          // 축(다른 보드)이 실패해서 order 전체에 걸린 것일 뿐, 우리 레일
+          // 문제가 아니므로 재배출할 필요 없음. rail[l][c].status는 우리가
+          // 직접 겪은 결과를 그대로 들고 있는 값이라 이게 진짜 기준.
+          Serial.println("[fault] " + letterColorKey(l, c) + " " + orderId + " 해제 (우리 레일은 disable 아니었음 - 재배출 불필요)");
+        } else {
+          // 이미 시도됐고 그 결과가 disable이었음 - 진짜 우리 레일이 실패한
+          // 경우이므로 재배출
+          Serial.println("[fault] " + letterColorKey(l, c) + " " + orderId + " 해제 (우리 레일 disable이었음) -> 재배출 큐 적재");
+
+          if (rail[l][c].count > 0) {
+            // disable -> 재배출 전에 먼저 사용 가능한 상태로 되돌림. fault가
+            // 풀렸다는 것 자체가 "사람이 고쳤다"는 신호이므로 REPAIR 명령과
+            // 동일하게 신뢰하고 엶 (PCA 드라이버 고장이었을 경우 다음 배출
+            // 시도 직전 PCA 헬스체크가 다시 확인하므로, 진짜 안 고쳐졌으면
+            // 즉시 재차 disable되는 안전망이 있음).
+            rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
+
+            // 게이트가 바로 이 주문 자신을 기다리며 잠겨있으면 영원히 안 풀림
+            // (이 주문이 pickup_reached 되기를 기다리는 중인데, 그 배출 자체를
+            // 다시 하려는 거라 애초에 기다릴 이유가 없음) - 먼저 풀어줌
+            if (!gateOpen && gateOrderId == orderId) {
+              gateOpen = true;
+              gateOrderId = "";
+              clearGateOnServer();
+              Serial.println("[fault] " + orderId + " 이 게이트를 걸고 있었음 -> 재배출 위해 게이트 해제");
+            }
+
+            DispenseJob job{orderId, letter, color};
+            if (queuePush(job)) {
+              enqueueToServer(job);
+            } else {
+              Serial.println("[fault] 재배출 큐 적재 실패 - 큐 가득 참");
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ============================== 배출 상태 머신 (170->70도 non-blocking 스윕 + 시작 스티션 킥 + 게이트) ==============================
 void runDispenseStateMachine() {
   // 지금 배출 진행 중(DS_IDLE이 아님)이면, 상태 단계와 무관하게 매 loop()마다
   // IR 핀을 계속 폴링함 - 키캡이 스윕 도중/홀드 중/복귀 중 언제 떨어질지
@@ -784,6 +1176,58 @@ void runDispenseStateMachine() {
   }
 
   if (dsState == DS_IDLE) {
+    // PCA9685 드라이버 헬스체크 - 큐에 job이 있을 때만(=배출을 시도할 상황일 때만)
+    // 확인함. job이 없으면 아무도 이 값에 의존하지 않으니 체크 자체를 스킵.
+    // job이 있는 동안엔 dsState가 계속 DS_IDLE에 머물면서 loop()가 초당 수백~
+    // 수천 번 도는데, 매번 체크하면 disable 리포트 HTTP 요청까지 그만큼
+    // 나가버려서(최대 8초 블로킹) 오히려 시스템이 멈출 수 있음 - 그래서
+    // "job이 있을 때만" + "1초 간격"을 같이 적용함.
+    bool hasJob = (jobHead != jobTail);
+    unsigned long nowMs = millis();
+    if (hasJob && (nowMs - lastPcaCheckMs >= PCA_CHECK_INTERVAL_MS)) {
+      lastPcaCheckMs = nowMs;
+      bool pcaOk = checkPcaHealthy();
+
+      if (!pcaOk && !pcaDriverFailed) {
+        pcaDriverFailed = true;
+        // 대기열 맨 앞 job이 있으면 그 주문과 관련된 레일에만 order_id, 나머지 7개는 null
+        // 이 관련 job은 고장이 풀려도(PCA 복구) 즉시 재배출하지 않고, 그 주문의
+        // fault가 플랫폼에서 실제로 풀릴 때까지 기다려야 하므로 전역 변수에
+        // 기억해둠 (아래 복구 분기 및 handleOrderFaults()에서 사용).
+        pcaHasRelatedOrder = (jobHead != jobTail);
+        if (pcaHasRelatedOrder) pcaRelatedJob = jobQueue[jobHead];
+
+        for (int l = 0; l < 2; l++) {
+          for (int c = 0; c < 4; c++) {
+            rail[l][c].status = RAIL_DISABLE;
+            bool isRelated = pcaHasRelatedOrder && letterSlot(pcaRelatedJob.letter) == l && colorSlot(pcaRelatedJob.color) == c;
+            reportRailStatus(letterOf(l), colorOf(c), RAIL_DISABLE,
+                              isRelated ? pcaRelatedJob.orderId : "", REASON_DRIVER_FAILED);
+          }
+        }
+        Serial.println("[PCA] 드라이버 응답 없음 - 8개 레일 전부 disable 보고");
+      } else if (pcaOk && pcaDriverFailed) {
+        pcaDriverFailed = false;
+        // fault도 다른 종류(카트리지 고장, stage_timeout)와 똑같이 "fault 필드가
+        // 실제로 풀릴 때만 재배출"해야 하므로, 관련 주문이 있던 레일 1개는
+        // 여기서 즉시 원복하지 않고 disable을 그대로 유지함 - 이 레일은
+        // handleOrderFaults()가 그 주문의 fault 해제를 감지했을 때만 원복+재배출됨.
+        // 나머지 7개 레일은 특정 주문에 안 걸려있어서(order_id null) 기다릴
+        // fault 자체가 없으므로 지금 바로 원복함.
+        for (int l = 0; l < 2; l++) {
+          for (int c = 0; c < 4; c++) {
+            bool isRelated = pcaHasRelatedOrder && letterSlot(pcaRelatedJob.letter) == l && colorSlot(pcaRelatedJob.color) == c;
+            if (isRelated) continue; // disable 유지, fault 해제 대기
+            rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
+            reportRailStatus(letterOf(l), colorOf(c), rail[l][c].status, "");
+          }
+        }
+        pcaHasRelatedOrder = false;
+        Serial.println("[PCA] 드라이버 복구됨 - 무관한 레일만 원복 보고, 관련 레일은 fault 해제될 때까지 disable 유지");
+      }
+    }
+    if (pcaDriverFailed) return; // 드라이버 고장 중엔 새 배출 시작 안 함
+
     if (!gateOpen) return; // 직전 주문이 pickup_reached(이후) 되기 전까지 다음 배출 금지
 
     DispenseJob job;
@@ -823,7 +1267,7 @@ void runDispenseStateMachine() {
     int l = letterSlot(currentJob.letter);
     int c = colorSlot(currentJob.color);
 
-    sweepAngle = SERVO_HOME_ANGLE + BREAKAWAY_KICK_DEG;
+    sweepAngle = SERVO_HOME_ANGLE - BREAKAWAY_KICK_DEG; // 방향 반전: 대기(170)->푸시(70)는 감소 방향이라 킥도 뺌
     moveServoAngle(SERVO_CHANNEL[l][c], sweepAngle);
     dsTimer = millis();
     dsState = DS_BREAKAWAY_WAIT;
@@ -844,10 +1288,10 @@ void runDispenseStateMachine() {
     int l = letterSlot(currentJob.letter);
     int c = colorSlot(currentJob.color);
 
-    sweepAngle++;
+    sweepAngle--; // 방향 반전: 감소시키며 PUSH_ANGLE까지 이동
     moveServoAngle(SERVO_CHANNEL[l][c], sweepAngle);
 
-    if (sweepAngle >= 180) {
+    if (sweepAngle <= PUSH_ANGLE) {
       dsTimer = millis();
       dsState = DS_HOLDING;
     }
@@ -900,7 +1344,8 @@ void runDispenseStateMachine() {
       rail[l][c].status = RAIL_DISABLE;
     }
 
-    reportRailStatus(currentJob.letter, currentJob.color, rail[l][c].status, currentJob.orderId);
+    reportRailStatus(currentJob.letter, currentJob.color, rail[l][c].status, currentJob.orderId,
+                      success ? "" : REASON_CARTRIDGE_FAILED);
     completeOnServer(currentJob); // 성공/실패 관계없이 서버 큐에서는 제거 (더 이상 대기열에 있을 이유 없음)
 
     // 게이트 잠금: 이 주문이 pickup_reached(이후) 될 때까지 다음 배출 시작 안 함
@@ -941,6 +1386,14 @@ void pollIrForCurrentJob() {
 void moveServoAngle(uint8_t channel, uint8_t angle) {
   uint16_t pulse = map(angle, 0, 180, SERVO_MIN_PULSE, SERVO_MAX_PULSE);
   pwm.setPWM(channel, 0, pulse);
+}
+
+// ---- PCA9685가 I2C로 정상 응답하는지 확인 (헬스체크) ----
+// pwm 객체(Adafruit_PWMServoDriver(0x40))와 동일한 I2C 주소로 확인함.
+// 주소를 바꾸면(하드웨어 주의사항 참고) 이 함수의 0x40도 같이 바꿔야 함.
+bool checkPcaHealthy() {
+  Wire.beginTransmission(0x40);
+  return Wire.endTransmission() == 0;
 }
 
 // ============================== Flask HTTPS 공통 통신 (실패 시 1회 재시도) ==============================
@@ -1020,7 +1473,11 @@ bool getJsonFromFlask(const char* path, String& responseOut) {
 }
 
 // ---- 부팅 시 재고 초기 조회 ----
-// 가정하는 응답 형식: {"E_r":8,"E_y":8,"E_b":8,"E_g":8,"I_r":8,"I_y":8,"I_b":8,"I_g":8}
+// 가정하는 응답 형식: {"N_r":{"count":8,"status":"idle"}, "N_y":{...}, ...}
+// count는 항상 로컬 count에 반영. status가 "disable"이면 재부팅 전 마지막
+// 상태를 그대로 이어받아 rail을 disable로 시작함(고장/fault 미해결 상태에서
+// 재부팅됐다가 모르고 새 배출을 시도하는 걸 막기 위함) - 그 외 status는
+// count 기준(0이면 empty, 아니면 idle)으로 로컬에서 새로 판단함.
 // (형식 다르면 Flask 쪽과 맞춰서 이 파싱부만 수정할 것)
 void fetchInitialStock() {
   String path = String("/stock/keycap?board=") + BOARD_NAME;
@@ -1036,7 +1493,7 @@ void fetchInitialStock() {
     return;
   }
 
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
   DeserializationError err = deserializeJson(doc, resp);
   if (err) {
     Serial.print("[재고] 응답 파싱 실패: ");
@@ -1048,10 +1505,21 @@ void fetchInitialStock() {
   for (int l = 0; l < 2; l++) {
     for (int c = 0; c < 4; c++) {
       String key = letterColorKey(l, c);
-      uint8_t count = doc[key] | 0;
+      JsonObject entry = doc[key].as<JsonObject>();
+      uint8_t count = entry["count"] | 0;
+      const char* serverStatus = entry["status"] | "idle";
+
       rail[l][c].count = count;
-      rail[l][c].status = (count == 0) ? RAIL_EMPTY : RAIL_IDLE;
-      Serial.println("  " + key + " = " + String(count));
+      if (strcmp(serverStatus, "disable") == 0) {
+        // 재부팅 전 disable 상태였음 - 원인(고장/fault)이 해결됐는지 여기선 알 수
+        // 없으므로 일단 disable로 시작. PCA 헬스체크는 살아있으면 자동 복구되고,
+        // fault는 다음 스냅샷에서 재평가되고, 카트리지/서보 고장은 REPAIR 명령
+        // 전까지 그대로 disable 유지됨(의도된 동작).
+        rail[l][c].status = RAIL_DISABLE;
+      } else {
+        rail[l][c].status = (count == 0) ? RAIL_EMPTY : RAIL_IDLE;
+      }
+      Serial.println("  " + key + " = count:" + String(count) + " status:" + String(serverStatus));
     }
   }
 }
@@ -1147,8 +1615,10 @@ void callRestock(int l, int c) {
   uint8_t filled = doc["filled"] | 0;
   rail[l][c].count = filled;
   rail[l][c].status = (filled == 0) ? RAIL_EMPTY : RAIL_IDLE;
-  reportRailStatus(letter, color, rail[l][c].status, "restock"); // 특정 order_id에 종속 안 되므로 식별용 문자열 사용
-
+  // Flask의 /restock/<letter>/<color> 엔드포인트가 이 호출 안에서 이미
+  // 모비우스에 CIN을 올려줌(order_id: null) - 여기서 reportRailStatus를
+  // 또 부르면 같은 restock 이벤트가 모비우스에 두 번 올라가는 중복 버그가
+  // 생겨서 이 호출은 제거함. 로컬 rail 상태(count/status)만 갱신하면 됨.
   Serial.println("[restock] " + letterColorKey(l, c) + " -> " + String(filled) + "개로 채워짐");
 }
 
@@ -1209,13 +1679,18 @@ void clearGateOnServer() {
 }
 
 // ============================== 상태 보고 ==============================
-void reportRailStatus(char letter, char color, RailStatus status, const String& orderId) {
+void reportRailStatus(char letter, char color, RailStatus status, const String& orderId, const char* reason) {
   int l = letterSlot(letter);
   int c = colorSlot(color);
   if (l < 0 || c < 0) return;
 
   StaticJsonDocument<256> doc;
-  doc["order_id"] = orderId;
+  if (orderId.length() == 0) {
+    doc["order_id"] = nullptr; // 빈 문자열로 넘어오면 명시적으로 JSON null 전송
+                                // (예: 드라이버 고장 시 이번 주문과 무관한 나머지 7개 레일)
+  } else {
+    doc["order_id"] = orderId;
+  }
   doc["letter_color"] = String(letter) + "_" + String(color);
   doc["count"] = rail[l][c].count;
   switch (status) {
@@ -1223,6 +1698,9 @@ void reportRailStatus(char letter, char color, RailStatus status, const String& 
     case RAIL_BUSY:    doc["status"] = "busy";    break;
     case RAIL_EMPTY:   doc["status"] = "empty";   break;
     case RAIL_DISABLE: doc["status"] = "disable"; break;
+  }
+  if (status == RAIL_DISABLE && reason != nullptr && reason[0] != '\0') {
+    doc["reason"] = reason; // disable일 때만 reason 필드를 실음
   }
 
   char payload[256];
@@ -1275,11 +1753,11 @@ void checkSerialCommand() {
     if (cmd == "SETEMPTY") {
       rail[l][c].count = 0;
       rail[l][c].status = RAIL_EMPTY;
-      reportRailStatus(letter, color, RAIL_EMPTY, "manual");
+      reportRailStatus(letter, color, RAIL_EMPTY, ""); // 시리얼 명령발 - order_id 없음(null)
       Serial.println("[명령] " + arg + " -> empty로 강제 설정, 서버에도 보고함");
     } else { // REPAIR
       rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
-      reportRailStatus(letter, color, rail[l][c].status, "manual");
+      reportRailStatus(letter, color, rail[l][c].status, ""); // 시리얼 명령발 - order_id 없음(null)
       Serial.println("[명령] " + arg + " -> " + (rail[l][c].status == RAIL_EMPTY ? "empty" : "idle") + "로 복구, 서버에도 보고함");
     }
     return;
