@@ -1,6 +1,6 @@
 /*
   ================================================================================
-  키캡 배출 아두이노 - T/F 축 담당 (Arduino Uno R4 WiFi)
+  키캡 배출 아두이노 - N/S 축 담당 (Arduino Uno R4 WiFi)
   ================================================================================
   역할
    1) HiveMQ Cloud(MQTT, TLS)에 직접 연결해서 "sjuiot/warehouse/process" 구독
@@ -22,16 +22,16 @@
        바로 배출해버리는 문제가 있었음)
 
   ============================== 통신 대상 (Flask) ==============================
-   GET  /stock/keycap?board=TF         부팅 시 재고 8칸 초기 조회
-   GET  /queue/TF/next                 부팅 시 미완료 큐 복원
-   POST /queue/TF/enqueue              새 주문 감지 시 서버 큐에도 적재
-   POST /queue/TF/complete             배출 성공 후(또는 유령 주문 정리 시) 서버 큐에서 제거
+   GET  /stock/keycap?board=NS         부팅 시 재고 8칸 초기 조회
+   GET  /queue/NS/next                 부팅 시 미완료 큐 복원
+   POST /queue/NS/enqueue              새 주문 감지 시 서버 큐에도 적재
+   POST /queue/NS/complete             배출 성공 후(또는 유령 주문 정리 시) 서버 큐에서 제거
    POST /restock/{letter}/{color}                restock 감지 시 호출, 채워진 개수 응답받음
    POST /report/keycap-status              기존 그대로 (상태 보고, 성공/실패 무관 항상)
    POST /report/keycap-dispense            기존 그대로 (배출 성공했을 때만)
-   GET  /gate/TF                       부팅 시 게이트(픽업 대기) 상태 복원
-   POST /gate/TF                       게이트 잠글 때 서버에 기록 (body: order_id)
-   POST /gate/TF/clear                 게이트 열릴 때 서버 기록 해제
+   GET  /gate/NS                       부팅 시 게이트(픽업 대기) 상태 복원
+   POST /gate/NS                       게이트 잠글 때 서버에 기록 (body: order_id)
+   POST /gate/NS/clear                 게이트 열릴 때 서버 기록 해제
 
   ※ 위 신규 라우트(/stock, /queue/*, /restock/*, /gate/*)는 이번에 새로 정의한
     스펙이라 Flask 쪽 실제 응답 형식과 어긋나면 즉시 팀원과 맞춰서 파싱부만 고칠 것.
@@ -140,7 +140,7 @@
    - IR_SENSOR_INSTALLED 매크로로 제어: 1이면 기존처럼 IR_PIN을 실제로 읽어서
      성공/실패 판정, 0이면 DS_WAIT_IR 단계에서 핀을 읽지 않고 무조건 성공(idle)
      처리함. 센서 장착/배선 완료되는 대로 이 값만 1로 바꾸면 원래 동작으로
-     복귀함 - 이 보드(TF)의 현재 기본값은 아래 "보드별 설정" 블록에서
+     복귀함 - 이 보드(NS)의 현재 기본값은 아래 "보드별 설정" 블록에서
      확인/조정할 것.
 
   [2026-09-13 게이트 상태를 Redis에 영속화 (재부팅 복원)]
@@ -200,7 +200,7 @@
      테스트하며 조정할 것.
 
   [2026-09-13 IR 센서 배선 여부를 보드 단위 -> 레일 단위로 세분화]
-   - 배경: 센서 수량 부족으로 이 보드(TF)도 8개 레일 중 N_r 1개에만 먼저
+   - 배경: 센서 수량 부족으로 이 보드(NS)도 8개 레일 중 N_r 1개에만 먼저
      배선 완료됨. 기존 IR_SENSOR_INSTALLED는 보드 전체를 한 번에 켜고 끄는
      매크로라, 이 값을 1로 켜면 아직 미배선인 나머지 7개 레일까지 플로팅
      핀을 실제로 읽어 판정하려고 시도해서 오동작(랜덤 성공/실패)할 위험이 있었음.
@@ -294,17 +294,116 @@
      다시 확인하므로, 진짜 안 고쳐졌으면 즉시 재차 disable되는 안전망이 있음.
    - [이스케이프 버그 확인] 팀원분이 지적한 '\\0'/'\\n' 더블 백슬래시 버그를
      확인한 결과, 지금 올라온 원본 기준으로는 NS가 아니라 EI 쪽에 있었음
-     (EI에서 수정함). 이 TF 파일은 원래도 '\0'/'\n'로 정상이라 이 부분은
+     (EI에서 수정함). 이 NS 파일은 원래도 '\0'/'\n'로 정상이라 이 부분은
      그대로 둠 - 팀원이 본 버전과 다를 수 있으니 서로 확인 필요.
 
+  [2026-09-19 stage_timeout fault는 등장 즉시 큐에서 제거 + 영구 재큐잉 차단]
+   - 배경: stage_timeout은 "우리 레일의 실제 성공/실패"와 무관하게, 어떤
+     단계든 정해진 시간(60초) 안에 다음 단계로 못 넘어가면 플랫폼이 자동으로
+     붙이는 타임아웃 표시일 뿐임. 이제 이 경우는 사람이 수동으로 폐기 처리
+     하기로 결정됨 - 즉 stage_timeout이 뜬 주문은 우리가 다시 배출을 시도할
+     이유가 없음.
+   - 최종 방식(해제 시점 판단 -> 등장 시점 즉시 처리로 단순화): 처음엔 fault
+     해제 시점에 rail 상태를 보고 재배출 여부를 가르려 했으나, stage_timeout은
+     우리 rail 상태와 무관하게 뜰 수 있어 판단 기준이 되지 못함이 확인됨. 더
+     단순하게, stage_timeout이 **등장하는 즉시** 그 주문을 처리해버리는 쪽으로
+     방향을 바꿈 - 해제 시점엔 아무 것도 할 필요가 없어짐(할 일을 이미 등장
+     시점에 다 끝내버렸으므로).
+   - 대응: stage_timeout이 뜨면(handleOrderFaults) 그 자리에서 바로
+     ① 이 주문의 jobKey를 markProcessed()로 등록해 handleOrdersField()가
+     앞으로 절대 이 주문을 다시 큐에 넣지 않도록 영구 차단하고,
+     ② removeOrderFromQueue()로 로컬 큐(jobQueue)에 이 주문이 대기 중이면
+     즉시 꺼내서 completeOnServer()로 서버 큐에서도 같이 제거함.
+     지금 한창 배출 중인 주문(currentJob)은 이미 큐 밖으로 나와 진행 중이라
+     이 처리와 무관 - 물리적으로 멈출 수 없으니 그대로 끝까지 진행되고,
+     끝난 뒤엔 원래 흐름대로 completeOnServer()가 불려서 서버 큐에서도
+     알아서 빠짐.
+   - keycap_cartridge_failed/keycap_driver_failed는 기존 방식(등장 시엔
+     추적만, 해제 시 rail이 disable이었으면 재배출) 그대로 유지 - 이 둘은
+     우리가 이미 disable을 보고한 것의 메아리라 등장 시점에 즉시 처리할
+     필요가 없고, 오히려 해제 시점에 rail 상태를 보고 판단하는 게 맞음.
+   - 게이트: 별도 처리 안 함 - 폐기된 주문이 마침 게이트를 잡고 있었다면
+     checkGateAgainstOrders()가 기존 기준(orders에서 사라짐 또는
+     GATE_OPEN_STATUSES) 그대로 알아서 열어줌. 단, 플랫폼이 폐기 처리 시
+     실제로 orders에서 그 주문을 지우는지, 아니면 별도 status만 남기고
+     목록엔 계속 두는지는 미확인 - 후자라면 그 status가 GATE_OPEN_STATUSES에
+     없을 경우 게이트가 영원히 안 열리는 위험이 있으므로 플랫폼팀 확인 후
+     필요 시 화이트리스트에 추가할 것.
+   - [알려진 채로 남겨두는 구멍, 지금은 손 안 댐] 배출 도중(서보 동작 중)
+     아두이노 자체가 멈추거나 재부팅되면, 그 job은 completeOnServer가 안
+     불려서 서버 큐엔 "대기 중"으로 남음. 그 사이 stage_timeout -> 폐기가
+     되면, 재부팅 후 restoreQueueFromServer()가 이 죽은 job을 다시 로컬
+     큐에 채우는데, 그걸 걸러낼 다음 MQTT 스냅샷이 오기 전까지의 아주 짧은
+     시간 동안은 이 job이 살아있는 것처럼 배출을 시작해버릴 수 있음(반대로
+     살아있는 주문은 이 시간차와 무관하게 정상적으로 바로 재배출돼야 함).
+     지금은 이 경우를 다루지 않기로 함 - 나중에 필요해지면 부팅 시 Flask가
+     들고 있는 최신 cnt_process 스냅샷을 한 번 조회해서 큐를 미리 거르는
+     방식을 검토할 것.
+
+  [2026-09-19 서보 각도/방향 실측값 반영 - 대기 90도->170도, 배출 방향 반전]
+   - 배경: 별도 캘리브레이션용 테스트 스케치(Servo_Push_Cycle_Test)로 실측한
+     결과, 기존 SERVO_HOME_ANGLE=90(대기)이 실제로는 디스펜서가 카트리지
+     출구 아래까지 나와있는 위치였음이 확인됨. 대기 각도는 170도, 배출
+     (푸시) 각도는 70도가 적절함이 확인됨 - 즉 각도가 "증가"가 아니라
+     "감소"하면서 배출되는 방향으로 뒤바뀜.
+   - 대응: SERVO_HOME_ANGLE을 170으로 변경, 배출 목표 각도를 상수화한
+     PUSH_ANGLE(70)을 새로 추가. DS_HOMING의 브레이크어웨이 킥 방향을
+     `+BREAKAWAY_KICK_DEG`에서 `-BREAKAWAY_KICK_DEG`로, DS_SWEEPING의
+     스텝 방향을 `sweepAngle++`에서 `sweepAngle--`로, 종료 조건을
+     `sweepAngle >= 180`에서 `sweepAngle <= PUSH_ANGLE`로 각각 반전.
+     SWEEP_STEP_DELAY_MS도 실측값 기준 15 -> 10으로 조정.
+   - SERVO_MIN_PULSE/SERVO_MAX_PULSE, RETURN_DELAY_MS, DISPENSE_HOLD_MS,
+     BREAKAWAY_SETTLE_MS 등 나머지 서보 타이밍 값은 이번 실측 대상이
+     아니었으므로 그대로 둠 - 배출이 실기에서 이상하면 이 값들도 순서대로
+     재검토할 것.
+
+  [2026-09-19 IR_MIN_BREAK_MS 실측값 반영 - 20ms -> 5ms]
+   - 배경: 별도 IR 센서 테스트 스케치(IR_Sensor_Test)로 N_r 레일에서 키캡
+     낙하 시 실제 빔 끊김 지속시간을 반복 측정한 결과 7~19ms 범위로 나왔고,
+     추가 측정에서 최소 7ms까지 확인됨. 기존 IR_MIN_BREAK_MS=20ms는 이 값들
+     보다 높아서, 짧게 끊기는 정상적인 통과까지 디바운스에서 걸러져 실패로
+     오판정하고 있었을 가능성이 확인됨(이게 "센서가 감지를 잘 못 한다"고
+     느꼈던 원인으로 추정).
+   - 대응: 실측 최소값(7ms)보다 여유를 두고 IR_MIN_BREAK_MS를 5로 낮춤.
+     0에 가깝게 낮추지 않은 이유는, 이 디바운스가 원래 서보 PWM 스위칭 등
+     전기적 노이즈를 걸러내기 위한 목적도 겸하고 있어서 - 너무 낮추면 반대로
+     노이즈를 진짜 통과로 오판정할 위험이 생김. 다만 이번 실측에서는 노이즈
+     자체의 지속시간을 직접 재보지는 못했음(서보 구동 중 IR 핀 노이즈 동시
+     관찰은 별도 통합 테스트가 필요해 보류함) - 실기에서 오탐지(가만히
+     있는데 배출 성공으로 잘못 판정되는 경우)가 관찰되면 이 값을 다시 올릴 것.
+   - IR_POLL_WINDOW_MS(4500ms)는 이번 실측 대상이 아니었으므로 그대로 둠.
+   - 편차가 큰 원인(7~19ms로 거의 3배 차이)이 디바운스만으로는 완전히
+     해결 안 될 수 있음 - 낙하 경로가 매번 빔을 정확히 지나가지 않아서
+     아예 감지 자체가 안 되는 경우도 관찰됨(디바운스 값과 무관한 별개
+     문제). 슈트 내 빔 위치/가이드 등 기구적 정렬 확인이 필요할 수 있음.
+
+  [2026-09-19 IR_SENSOR_INSTALLED 0 -> 1로 활성화]
+   - N_r 레일 실측(디바운스 값 확정)이 끝나 최상위 스위치를 켬. 이제
+     `#if IR_SENSOR_INSTALLED` 블록이 실제로 컴파일에 포함되고,
+     IR_INSTALLED[0][0]=true인 N_r 레일만 실제 IR 판정 로직이 동작함.
+     나머지 7개 레일은 IR_INSTALLED가 false라 여전히 무조건 성공 처리됨.
+
+  [2026-09-19 IR_INSTALLED[0][0] false로 되돌아가 있던 것 수정]
+   - 위에서 IR_SENSOR_INSTALLED(최상위 스위치)만 1로 켜고, 정작 레일별
+     스위치인 IR_INSTALLED[0][0](N_r)은 true로 바꾸는 걸 누락함. 그 결과
+     실제 배출 후 `if (IR_INSTALLED[l][c])` 조건을 항상 통과 못 해서
+     `#if IR_SENSOR_INSTALLED` 블록 안 판정 로직 자체가 매번 스킵되고,
+     success 기본값(true)이 그대로 채택돼 키캡이 실제로 안 떨어졌어도
+     계속 idle(성공)로 보고되는 증상이 발생함 - IR_MIN_BREAK_MS를 아무리
+     바꿔도 이 줄이 안 읽히니 전혀 반영이 안 됐던 것.
+   - 대응: IR_INSTALLED[0][0]을 true로 수정. 이제 센서 관련 스위치는
+     IR_SENSOR_INSTALLED(보드 전체) / IR_INSTALLED[l][c](레일별) /
+     IR_MIN_BREAK_MS(디바운스) 세 곳 모두 맞춰야 실제 판정이 동작함 -
+     다음에 새 레일 배선 추가할 때도 이 세 곳을 다 확인할 것.
+
   다른 3개 보드는 이 파일을 복사한 뒤 "보드별 설정" 블록만 아래 표대로
-  바꿔서 각 보드에 업로드하면 됩니다. (지금 이 파일은 TF 보드용입니다)
+  바꿔서 각 보드에 업로드하면 됩니다. (지금 이 파일은 NS 보드용입니다)
 
   ------------------------------------------------------------------------------
    보드      LETTER_0 / LETTER_1   AXIS_INDEX   MQTT_CLIENT_ID   BOARD_NAME
   ------------------------------------------------------------------------------
    E/I       'E' / 'I'             0            "arduino_EI"     "EI"
-   N/S       'N' / 'S'             1            "arduino_TF"     "TF"
+   N/S       'N' / 'S'             1            "arduino_NS"     "NS"
    T/F       'T' / 'F'             2            "arduino_TF"     "TF"
    P/J       'P' / 'J'             3            "arduino_PJ"     "PJ"
   ------------------------------------------------------------------------------
@@ -359,13 +458,14 @@ const uint8_t IR_PIN[2][4] = {
 // ---- 서보 동작 파라미터 (실측 후 조정) ----
 #define SERVO_MIN_PULSE       150
 #define SERVO_MAX_PULSE       600
-#define SERVO_HOME_ANGLE       90   // 실측 확정값
-#define SWEEP_STEP_DELAY_MS    15   // 1도 이동마다 대기 (구버전 실기 테스트값)
+#define SERVO_HOME_ANGLE      170   // 대기 각도 (실측 확정값 - Servo_Push_Cycle_Test로 찾음)
+#define PUSH_ANGLE             70   // 배출(푸시) 각도 (실측 확정값) - 대기(170)에서 이 값까지 "감소"하며 이동함에 주의
+#define SWEEP_STEP_DELAY_MS    10   // 1도 이동마다 대기 (실측 확정값)
 #define RETURN_DELAY_MS       400   // 복귀 명령 후 실제 도달까지 대기
-#define DISPENSE_HOLD_MS      400   // 180도(완전 배출) 도달 후 유지 시간
+#define DISPENSE_HOLD_MS      400   // 푸시 각도 도달 후 유지 시간
 #define IR_CHECK_DELAY_MS     200   // DS_RETURNING에서 DS_WAIT_IR로 넘어가기 전 최소 물리 정착 대기 (IR 감시 자체는 이미 모터 시작 시점부터 계속 진행 중)
 #define IR_DETECT_LEVEL       LOW   // 센서가 "감지됨(빔 끊김)"일 때 주는 레벨 (실측 후 조정)
-#define BREAKAWAY_KICK_DEG      4   // 스윕 시작 시 정지마찰을 넘기기 위한 초기 킥 각도
+#define BREAKAWAY_KICK_DEG      4   // 스윕 시작 시 정지마찰을 넘기기 위한 초기 킥 각도 (대기->푸시 방향, 즉 감소 방향으로 킥)
 #define BREAKAWAY_SETTLE_MS    60   // 킥 이동 후 실제 도달까지 대기
 
 // ---- [브레이크빔(송신부/수신부 분리형) 센서 판정 파라미터] ----
@@ -379,14 +479,14 @@ const uint8_t IR_PIN[2][4] = {
 // 길이 - 실제 서보 동작 시퀀스(복귀대기+킥+스윕+홀드+복귀대기 ≈ 3.5~4초)를
 // 전부 덮고도 여유가 남도록 넉넉하게 잡음.
 #define IR_POLL_WINDOW_MS  4500   // 모터 시작 시각 기준 전체 감시 윈도우 (약 4.5초, 넉넉하게) - 실측 후 조정
-#define IR_MIN_BREAK_MS      20   // 이 이상 연속으로 끊겨야 유효 통과로 인정(노이즈 필터) - 실측 후 조정
+#define IR_MIN_BREAK_MS       7   // 이 이상 연속으로 끊겨야 유효 통과로 인정(노이즈 필터) - IR_Sensor_Test로 실측(7~19ms)한 결과 반영, 여유 두고 7로 설정
 
 // ---- [IR 센서 장착 여부 토글 - 보드 전체] ----
 // 1 = 이 보드에 브레이크빔 IR 센서가 최소 1개 이상 배선됨 (판정 로직 컴파일 포함)
 // 0 = 이 보드는 센서가 전혀 없음, DS_WAIT_IR 단계에서 핀을 읽지 않고 무조건 성공(idle) 처리
 // 아래 IR_INSTALLED 배열로 레일 단위 세부 제어를 하므로, 이 매크로는
 // "이 보드에 센서 배선이 하나라도 있는가"만 나타내는 최상위 스위치임.
-// ※ 이 보드(TF)의 현재 기본값: 0 (배선 현황 미확인 - 확인되는 대로 갱신)
+// ※ 이 보드(NS)의 현재 기본값: 1 (레일 일부에 브레이크빔 IR 센서 배선됨)
 #define IR_SENSOR_INSTALLED 0
 
 // ---- [레일별 IR 센서 배선 여부] ----
@@ -395,11 +495,10 @@ const uint8_t IR_PIN[2][4] = {
 // 폴링+디바운스 판정을 하고, false인 레일은 핀을 읽지 않고 즉시 성공 처리함
 // (플로팅 핀을 실수로 읽어서 오판정하는 일을 방지). 배선이 추가될 때마다
 // 이 표만 갱신하면 됨 - IR_PIN 배열과 인덱스([글자슬롯][색상슬롯])가 동일하게 대응.
-// ※ 이 보드(TF)는 실제 배선 현황 미확인 상태라 일단 전부 false로 둠 -
-//   NS 보드(N_r 1개만 배선된 사례) 참고해서 실측 후 이 표를 갱신할 것.
+// ※ 현재 배선 완료: N_r 1개 레일만 (IR_INSTALLED[0][0], 수신부 신호선을 핀 2에 연결)
 const bool IR_INSTALLED[2][4] = {
-  {false, false, false, false},  // T: 배선 여부 실측 후 갱신
-  {false, false, false, false}   // F: 배선 여부 실측 후 갱신
+  {false, false, false, false},  // 이 보드는 센서 미배선
+  {false, false, false, false}
 };
 
 // ---- 카트리지 최대 용량 (restock 시 이 값까지 채움, 전체 풀 부족하면 서버가 그보다 적게 응답) ----
@@ -487,18 +586,15 @@ bool pcaHasRelatedOrder = false;
 
 // ============================== 플랫폼(Mobius) fault 추적/재배출 ==============================
 // fault 두 종류가 있는데 처리 방식이 다름:
-//   - tray_jam류: 우리가 이미 disable/실패를 보고했기 때문에 플랫폼이 그걸
-//     보고 채워주는 것(우리 상태의 메아리) - 우리가 또 disable 보고할 필요 없음
-//   - stage_timeout류: 같은 status가 일정 시간(60초) 유지되면 플랫폼이
-//     자동으로 붙임 - 정상 대기 중에도 뜰 수 있어서 이것만 보고 disable
-//     판단할 근거가 없음
-// 그래서 fault 등장 시엔 아무것도 안 하고(disable도, 보고도 안 함), 그냥
-// "이 주문에 fault가 걸려있다"는 사실만 추적해뒀다가, fault가 사라지는
-// 시점에만 반응함:
-//   - 그때 주문 status가 아직 "assigned"면(아직 배출 시작도 못 한 경우) ->
-//     아무것도 안 해도 handleOrdersField()가 정상 경로로 알아서 주워감
-//   - status가 assigned를 이미 지났으면(이미 배출 끝난 뒤 걸린 tray_jam류) ->
-//     정상 경로가 다시 안 주워가므로 우리가 직접 재배출 job을 큐에 넣어줌
+//   - tray_jam류(keycap_cartridge_failed/keycap_driver_failed): 우리가 이미
+//     disable/실패를 보고했기 때문에 플랫폼이 그걸 보고 채워주는 것(우리
+//     상태의 메아리) - 등장 시엔 추적만 해두고, 해제 시점에 그때 주문 status/
+//     rail 상태를 보고 필요하면 재배출함 (기존 방식 그대로 유지).
+//   - stage_timeout: 같은 status가 일정 시간(60초) 유지되면 플랫폼이 자동으로
+//     붙임 - 우리 rail 상태와 무관하게 뜰 수 있어서 해제 시점 rail 상태로는
+//     판단할 수 없음. 이제 사람이 수동으로 폐기 처리하기로 했으므로, 아예
+//     "해제 시점 판단" 자체를 안 하고 **등장하는 즉시** 그 주문을 큐에서
+//     빼고 영구 재큐잉 차단함 (아래 handleOrderFaults 참고).
 bool   faultActive[2][4] = { {false, false, false, false}, {false, false, false, false} };
 String faultOrderId[2][4];
 
@@ -547,6 +643,9 @@ String gateOrderId = "";
 //   일치 여부 반드시 확인할 것. assigned/dispensing 등 이전 단계는 절대 포함 금지.
 // ※ unclaimed(노쇼) 포함 여부는 노쇼 시 실제로 픽업 지점이 비워지는지에 달려있음 -
 //   로봇암/컨베이어 운영 방식 확정되면 재검토.
+// ※ stage_timeout으로 폐기된 주문이 orders 목록에서 실제로 사라지는지, 아니면
+//   별도 status만 남기고 목록엔 남는지 아직 미확인 - 후자라면 그 status를
+//   여기 추가해야 게이트가 안 막힘 (플랫폼팀 확인 필요).
 const char* GATE_OPEN_STATUSES[] = {
   "pickup_reached", "loaded", "arrived", "unclaimed", "verified", "received", "completed"
 };
@@ -605,6 +704,7 @@ void handleOrderFaults(JsonObject orders);
 bool getOrderLetterColor(JsonObject order, char& letter, char& color);
 void checkGateAgainstOrders(JsonObject orders);
 void pruneDeadJobsFromQueue(JsonObject orders);
+void removeOrderFromQueue(const String& orderId);
 void handleAssignedOrder(const String& orderId, const char* keycap, JsonArray colors);
 void runDispenseStateMachine();
 void pollIrForCurrentJob();
@@ -835,6 +935,35 @@ void pruneDeadJobsFromQueue(JsonObject orders) {
   }
 }
 
+// ---- 특정 order_id의 job이 로컬 큐(jobQueue)에 대기 중이면 즉시 꺼내서
+// 서버 큐에서도 같이 제거함. stage_timeout fault가 뜬 주문을 등장 즉시
+// 큐에서 빼기 위해 씀(handleOrderFaults 참고). currentJob(이미 큐 밖으로
+// 나와 배출 진행 중인 것)은 건드리지 않음 - 물리적으로 멈출 방법이 없어서
+// 그대로 끝까지 진행되도록 둠.
+void removeOrderFromQueue(const String& orderId) {
+  DispenseJob temp[JOB_QUEUE_SIZE];
+  uint8_t tempCount = 0;
+  bool removed = false;
+
+  DispenseJob job;
+  while (queuePop(job)) {
+    if (job.orderId == orderId) {
+      completeOnServer(job); // 서버 큐에서도 제거
+      removed = true;
+    } else {
+      temp[tempCount++] = job;
+    }
+  }
+
+  for (uint8_t i = 0; i < tempCount; i++) {
+    queuePush(temp[i]);
+  }
+
+  if (removed) {
+    Serial.println("[큐] " + orderId + " stage_timeout으로 큐에서 즉시 제거함");
+  }
+}
+
 // ---- orders 필드 처리: 우리 축 담당 주문을 큐에 적재 (로컬 + 서버) ----
 void handleOrdersField(JsonObject orders) {
   // 스냅샷에 등장한 순서 그대로 큐잉 순서가 됨 (ArduinoJson은 JSON 원문 순서를 유지)
@@ -929,13 +1058,15 @@ bool getOrderLetterColor(JsonObject order, char& letter, char& color) {
 }
 
 // ---- fault 필드 처리: 우리 축 담당 주문의 fault 등장/해제를 감지 ----
-// 등장 시: 아무것도 안 함(disable/보고 없음) - "이 주문에 fault가 있다"는
-// 사실만 추적해둠. tray_jam류는 우리가 이미 보고한 걸 되돌려받는 것뿐이고,
-// stage_timeout류는 정상 대기 중에도 뜰 수 있어서 disable 판단 근거가 없음.
-// 해제 시(같은 order_id에서 fault가 다시 null이 되면): 그 시점 주문 status로
-// 갈라서 처리 - "assigned"면 정상 경로(handleOrdersField)에 맡기고 아무것도
-// 안 함, 아니면(이미 assigned를 지났으면) 정상 경로가 다시 안 주워가므로
-// 우리가 직접 재배출 job을 큐에 넣음. fault가 없었던 레일은 안 건드림.
+// stage_timeout: rail 상태와 무관하게 뜰 수 있어서 해제 시점 판단이 불가능함
+// (사람이 수동 폐기하기로 결정됨) -> **등장하는 즉시** 큐에서 빼고 영구
+// 재큐잉 차단. 해제 시점엔 할 일이 없음(이미 등장 시점에 다 처리했으므로).
+// keycap_cartridge_failed/keycap_driver_failed: 등장 시엔 추적만 하고
+// disable/보고는 하지 않음(우리가 이미 보고한 것의 메아리라서). 해제 시(같은
+// order_id에서 fault가 다시 null이 되면) 그 시점 주문 status로 갈라서 처리 -
+// "assigned"면 정상 경로(handleOrdersField)에 맡기고 아무것도 안 함, 아니면
+// (이미 assigned를 지났으면) 정상 경로가 다시 안 주워가므로 우리가 직접
+// 재배출 job을 큐에 넣음. fault가 없었던 레일은 안 건드림.
 void handleOrderFaults(JsonObject orders) {
   for (JsonPair kv : orders) {
     JsonObject order = kv.value().as<JsonObject>();
@@ -949,6 +1080,25 @@ void handleOrderFaults(JsonObject orders) {
 
     const char* faultStr = order["fault"] | "";
     bool hasFault = !order["fault"].isNull() && isKnownFault(faultStr);
+
+    if (hasFault && strcmp(faultStr, "stage_timeout") == 0) {
+      // stage_timeout 등장 - 그 자리에서 바로 폐기 취급: 큐에 있으면 즉시
+      // 빼고(있으면 completeOnServer까지 같이), jobKey를 markProcessed로
+      // 등록해 앞으로 이 주문이 다시 큐에 안 들어가게 영구 차단함.
+      // 지금 배출 진행 중(currentJob)인 경우는 물리적으로 멈출 수 없어서
+      // 그대로 두고 건드리지 않음 - 끝나면 원래 흐름대로 알아서 정리됨.
+      String jobKey = orderId + "_" + String(letter) + "_" + String(color);
+      if (!alreadyProcessed(jobKey)) {
+        markProcessed(jobKey);
+      }
+      removeOrderFromQueue(orderId);
+      // 이 주문은 더 이상 fault 추적 대상이 아님(해제 시점에 할 일이 없으므로)
+      if (faultActive[l][c] && faultOrderId[l][c] == orderId) {
+        faultActive[l][c] = false;
+        faultOrderId[l][c] = "";
+      }
+      continue;
+    }
 
     if (hasFault) {
       // 등장 시엔 추적만 하고 disable/보고는 하지 않음 (이유는 위 주석 참고)
@@ -986,9 +1136,9 @@ void handleOrderFaults(JsonObject orders) {
           if (rail[l][c].count > 0) {
             // disable -> 재배출 전에 먼저 사용 가능한 상태로 되돌림. fault가
             // 풀렸다는 것 자체가 "사람이 고쳤다"는 신호이므로 REPAIR 명령과
-            // 동일하게 신뢰하고 엶 (PCA 드라이버 고장이었다면 이후 PCA
-            // 헬스체크가 다음 시도 직전에 다시 확인해서, 진짜 안 고쳐졌으면
-            // 즉시 재차 disable됨 - 안전망 있음).
+            // 동일하게 신뢰하고 엶 (PCA 드라이버 고장이었을 경우 다음 배출
+            // 시도 직전 PCA 헬스체크가 다시 확인하므로, 진짜 안 고쳐졌으면
+            // 즉시 재차 disable되는 안전망이 있음).
             rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
 
             // 게이트가 바로 이 주문 자신을 기다리며 잠겨있으면 영원히 안 풀림
@@ -1014,7 +1164,7 @@ void handleOrderFaults(JsonObject orders) {
   }
 }
 
-// ============================== 배출 상태 머신 (90->180도 non-blocking 스윕 + 시작 스티션 킥 + 게이트) ==============================
+// ============================== 배출 상태 머신 (170->70도 non-blocking 스윕 + 시작 스티션 킥 + 게이트) ==============================
 void runDispenseStateMachine() {
   // 지금 배출 진행 중(DS_IDLE이 아님)이면, 상태 단계와 무관하게 매 loop()마다
   // IR 핀을 계속 폴링함 - 키캡이 스윕 도중/홀드 중/복귀 중 언제 떨어질지
@@ -1062,9 +1212,6 @@ void runDispenseStateMachine() {
         // 실제로 풀릴 때만 재배출"해야 하므로, 관련 주문이 있던 레일 1개는
         // 여기서 즉시 원복하지 않고 disable을 그대로 유지함 - 이 레일은
         // handleOrderFaults()가 그 주문의 fault 해제를 감지했을 때만 원복+재배출됨.
-        // (그 job은 이 상태로 다음 DS_IDLE에서 큐 맨 앞으로 나오면 "disable이라
-        // 건너뜀"으로 한 번 폐기되고, 이후 fault 해제 시 handleOrderFaults()가
-        // 새 job을 다시 큐에 넣어주므로 중복 배출 걱정 없음)
         // 나머지 7개 레일은 특정 주문에 안 걸려있어서(order_id null) 기다릴
         // fault 자체가 없으므로 지금 바로 원복함.
         for (int l = 0; l < 2; l++) {
@@ -1120,7 +1267,7 @@ void runDispenseStateMachine() {
     int l = letterSlot(currentJob.letter);
     int c = colorSlot(currentJob.color);
 
-    sweepAngle = SERVO_HOME_ANGLE + BREAKAWAY_KICK_DEG;
+    sweepAngle = SERVO_HOME_ANGLE - BREAKAWAY_KICK_DEG; // 방향 반전: 대기(170)->푸시(70)는 감소 방향이라 킥도 뺌
     moveServoAngle(SERVO_CHANNEL[l][c], sweepAngle);
     dsTimer = millis();
     dsState = DS_BREAKAWAY_WAIT;
@@ -1141,10 +1288,10 @@ void runDispenseStateMachine() {
     int l = letterSlot(currentJob.letter);
     int c = colorSlot(currentJob.color);
 
-    sweepAngle++;
+    sweepAngle--; // 방향 반전: 감소시키며 PUSH_ANGLE까지 이동
     moveServoAngle(SERVO_CHANNEL[l][c], sweepAngle);
 
-    if (sweepAngle >= 180) {
+    if (sweepAngle <= PUSH_ANGLE) {
       dsTimer = millis();
       dsState = DS_HOLDING;
     }

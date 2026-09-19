@@ -40,7 +40,7 @@ pickup 게이트) 패턴과 동일하게 맞춤:
     되거나 목록에서 사라지면 열림 (/gate/board/*)
     ⚠️ GATE_OPEN_STATUSES 철자/unclaimed 포함 여부 플랫폼팀 확인 필요.
 
-fault 처리 (신규) - 우리가 관리하는 fault 3종만:
+fault 처리 - 우리가 관리하는 fault 3종만:
     board_pack_failed / tray_01_belt_jammed / tray_02_belt_jammed
   흐름: 우리가 failed 보고 -> 플랫폼이 fault 채워서 push (status는 그대로
   유지) -> 사람이 물리적으로 해결 -> 관리자페이지에서 fault:null로 push
@@ -56,6 +56,11 @@ fault 처리 (신규) - 우리가 관리하는 fault 3종만:
   자동 복구됨 (게이트와 달리 우리 판단이 원본이 아니라서 영속화 불필요).
   ⚠️ 컨베이어 jam은 아직 센서로 자체 감지 안 함(추후 section1/2에 센서
   달아서 체크 예정) - 지금은 플랫폼이 걸어주는 fault에만 반응.
+  ⚠️ 2026-09-18: stage_timeout은 추적/재시도 대상이 아님 - 플랫폼팀 확인
+  결과 정해진 시간 초과 시 플랫폼이 주문 자체를 폐기하는 fault라, 우리가
+  뭘 재시도할 필요가 없음. 주문 폐기되면 orders에서 사라지고 그건 유령주문
+  정리(prune_dead_jobs_from_queue)/게이트 자동 열림(check_gate_against_orders)이
+  이미 처리함.
 
 restock 처리 (신규):
   관리자페이지 버튼 -> 플랫폼이 cnt_process 최상위(orders 밖)에
@@ -141,8 +146,13 @@ FAULT_RETRY_MAP = {
     "tray_01_belt_jammed": "conveyor1",
     "tray_02_belt_jammed": "conveyor2",
 }
-STAGE_TIMEOUT_FAULT = "stage_timeout"
-TRACKED_FAULTS = set(FAULT_RETRY_MAP) | {STAGE_TIMEOUT_FAULT}
+# ⚠️ 2026-09-18: stage_timeout은 재시도 대상에서 제외 - 플랫폼팀 확인 결과
+# stage_timeout은 우리가 재시도할 게 아니라 플랫폼이 정해진 시간 초과 시
+# 주문 자체를 폐기하는 fault임. 주문이 폐기되면 스냅샷 orders에서 사라지고,
+# 그건 prune_dead_jobs_from_queue()(로컬/서버 큐 정리)와
+# check_gate_against_orders()(게이트 - gate_order_id가 orders에서 사라지면
+# 자동으로 열림)가 이미 처리하고 있어서 별도 대응 불필요.
+TRACKED_FAULTS = set(FAULT_RETRY_MAP)
 
 DOBOT_PORT = "COM17"   # 팔 + 컨베이어(Magic Box) 공유 포트
 NAMESPACE_ARM = "MagicianLite"
@@ -162,18 +172,50 @@ NAMESPACE_BOX = "MagicBox"
 #    PLACE_POSE는 재실측 반영, CAMERA_CHECK_POSE는 로봇암 장착 카메라용 재실측 위치
 #    (2026-09-18, 이동시간 부족으로 도착 못 하고 지나치던 문제 확인 후
 #    CAMERA_MOVE_WAIT_SEC 4.0초로 별도 분리 - 아래 이동 타이밍 CONFIG 참고).
+# ⚠️ 2026-09-18 구조 변경(3차): 색당 5개×4줄(대각선 배치, 줄마다 X/Y 둘 다 바뀜)로
+#    확장. PICK_POSE_BASE(색상당 좌표 1개) -> PICK_POSE_ROWS(색상당 좌표 4개,
+#    row0=제일 가까운 줄 ~ row3=제일 먼 줄)로 구조 변경. 각 좌표는 기존과 동일한
+#    관례로 "그 줄에 count=1(1개 남았을 때)" 기준 base_z를 넣음.
+#    row0은 기존 실측값 그대로, row1~row3은 ⚠️ 아직 실측 전 - 4색×3줄=12개
+#    좌표 측정해서 아래 TODO 자리 채울 것. 그 전까지는 row1~3 선택 시 동작 안 됨.
+#    픽업 순서: 가까운 줄(row0)부터 5개 다 빈 다음 다음 줄로 - compute_pick_pose()
+#    참고. 바구니 문제로 당장은 3개(row3, 즉 4번째 줄)만 채워서 테스트 예정 -
+#    전체재고=3이면 row_index가 3으로 계산되는지가 테스트 포인트.
 # =================================================================
-PICK_POSE_BASE = {
-    "red":    (215.5975, 134.2798, -37.27, 31.9158),
-    "green":  (249.1647,  48.9685, -37.27, 11.1187),
-    "blue":   (248.0774, -36.6399, -37.27, -8.4016),
-    "yellow": (205.0976, -132.5483, -37.27, -32.8733),
+ROW_CAPACITY = 5     # 줄 하나당 최대 적재 개수
+NUM_ROWS = 4          # 줄 개수 (0=제일 가까운 줄 ~ 3=제일 먼 줄)
+TOTAL_CAPACITY = ROW_CAPACITY * NUM_ROWS  # 색상당 전체 용량 (20)
+
+# 색상별 [row0, row1, row2, row3] - 각 원소는 (x, y, base_z, r), base_z는
+# 그 줄에 1개 남았을 때 기준 (기존 PICK_POSE_BASE와 동일 관례)
+# ⚠️ 2026-09-19: 4색×4줄(16개) 전부 재실측 반영. 각 색상 내에서 Y/Z는 4줄
+# 공통값으로 통일(줄별 측정 노이즈 평탄화), X는 줄마다 다름. R은 색상별로 다름:
+# green/blue는 4줄 공통 R, red/yellow는 줄마다 R도 다르게 실측 반영.
+# ⚠️ 2026-09-19 재조정: red/yellow row3(제일 먼 줄)에서 count_in_row=1(z=-38)이
+# 물리적으로 도달 안 되는 문제 확인됨(다른 색·다른 줄은 전부 정상) - red row3의
+# Y=190이 다른 값들보다 유독 커서(수평거리 ~375mm) 생긴 문제로 파악, 카트리지
+# 위치 재조정 후 다시 실측한 값으로 교체. row3만 Y/Z/R이 나머지 3줄과 다른
+# "통일값"이 아니라 그 줄 자체의 개별 실측값인 이유가 이것.
+PICK_POSE_ROWS = {
+    "red":    [(229.4263, 190, -38, 41), (255.1454, 190, -38, 38),
+               (290.2512, 190, -38, 35), (320.1271, 165.9958, -37.1079, 27.3997)],
+    "green":  [(240.0187, 85, -38, 20), (267.8990, 85, -38, 20),
+               (296.3269, 85, -38, 20), (326.5881, 66.0017, -38, 20)],
+    "blue":   [(245.9397, -0.5, -38, 0.5), (271.3919, -0.5, -38, 0.5),
+               (298.0619, -0.5, -38, 0.5), (325.5233, -28.8626, -38, 0.5)],
+    "yellow": [(253.0182, -100, -38, -20), (279.8343, -100, -38, -18),
+               (303.9048, -100, -38, -16), (332.5840, -121.5756, -37.2979, -20.0798)],
 }
 BOARD_THICKNESS_MM = 20.0
 
 PLACE_POSE = (-152.0347, -263.0365, 0.4450, -120.0278)
 CAMERA_CHECK_POSE = (-122.3321, -200.4390, 58.4218, -121.3965)
-HOME_POSE = (240.0, 0.0, 150.0, 0.0)
+HOME_POSE = (239.9906, -5.5209, 84.0930, 0.7622)
+# ⚠️ 2026-09-19: red row3처럼 도달거리가 먼 픽업 위치에서 PLACE_POSE(반대쪽)로
+# 바로 이동하면 명령은 True로 접수되는데 실제로는 전혀 안 움직이는 문제 확인됨
+# (튜닝 스크립트에서 먼저 확인, 특이자세/joint리밋 경로탐색 이슈로 추정).
+# 중간에 이 지점의 X,Y를 한 번 거쳐서 극단적인 이동을 두 구간으로 나눔.
+WARMUP_POSE = (296.3269, 85.0, 2.0, 20.0)
 
 # =================================================================
 # CONFIG - 트레이 컨베이어
@@ -218,10 +260,19 @@ CALL_TIMEOUT = 5
 #    calibrate_camera.py 다시 돌려서 새 ROI 값으로 교체할 것 - 재보정 전까지는
 #    색상 판정이 엉뚱한 영역을 보고 있을 수 있음.
 # =================================================================
-CAMERA_INDEX = 1   # 노트북 내장캠이 0을 먼저 차지하는 경우가 많아 외장캠은 보통 1
+CAMERA_INDEX_PREFERENCE = [1, 0, 2, 3]  # ⚠️ 2026-09-19: USB 재연결마다 인덱스가 0/1로
+                                          # 바뀌는 문제 확인됨 - 고정값 대신 이 순서로 시도해서
+                                          # 처음 성공하는 장치를 씀 (아래 _resolve_camera_index 참고)
 CAMERA_ROI = (200, 150, 150, 100)  # (x, y, w, h) - ⚠️ 재보정 필요, 위 주석 참고
 CAMERA_PRESENCE_MIN_RATIO = 0.3
 CAMERA_SETTLE_DELAY = 0.5   # 사진 찍기 전 대기 - 5초는 과했음(이전 해석 오류), 짧게 줄임
+
+# ⚠️ 2026-09-19: 배치 확인 디버그용 - 이미 캡처된 프레임을 재사용(카메라 추가
+# 접근 없음, 충돌 위험 없음)해서 저장/화면표시. 둘 다 플래그로 독립 토글 가능.
+SAVE_CAMERA_IMAGE = True     # 매 확인마다 캡처 이미지를 파일로 저장 (가벼움, 항상 켜둬도 무방)
+SHOW_CAMERA_WINDOW = False   # cv2.imshow로 짧게 띄우기 (모니터 붙은 환경에서만 - 헤드리스면 끌 것)
+CAMERA_IMAGE_DIR = r"C:\Users\dusdn\warehouse-flask\board_camera_capture_log"
+CAMERA_WINDOW_MS = 800       # 창 띄우는 시간(ms) - 이 동안 메인 루프 블로킹됨
 
 # 실측 완료 (2026-09 촬영) - H:S:V 순서로 yellow(33,59,252) blue(94,68,243)
 # green(53,46,240) red/핑크(160,70,255). 전부 채도(S) 낮고 명도(V) 높은
@@ -229,10 +280,14 @@ CAMERA_SETTLE_DELAY = 0.5   # 사진 찍기 전 대기 - 5초는 과했음(이�
 # 33/53으로 가까워서 중간값(43) 기준으로 여유 없이 나눔 - 오판정 나면
 # 여기 경계값부터 조정할 것.
 COLOR_RANGES_HSV = {
-    "yellow": [((20, 30, 150), (42, 255, 255))],
-    "green":  [((44, 30, 150), (70, 255, 255))],
-    "blue":   [((75, 30, 150), (120, 255, 255))],
-    "red":    [((140, 30, 150), (180, 255, 255))],  # 실측은 핑크(H160)
+    # ⚠️ 2026-09-19: 로봇암 장착 카메라(CAMERA_CHECK_POSE) 기준 재실측 - 중앙 픽셀
+    # 1개씩만 잰 값(yellow H28/green H41/blue H97/red H164)이라 실제 판정
+    # 테스트('c' 키)는 아직 안 해본 상태. 노랑/초록 hue가 예전보다 가까워져서
+    # (28 vs 41) 겹치지 않게 경계를 34/35로 나눔 - 오판정 나면 여기부터 조정.
+    "yellow": [((18, 30, 150), (34, 255, 255))],
+    "green":  [((35, 30, 150), (70, 255, 255))],
+    "blue":   [((71, 30, 150), (125, 255, 255))],
+    "red":    [((140, 30, 150), (179, 255, 255))],  # 실측 H164
 }
 
 # =================================================================
@@ -521,10 +576,46 @@ async def suck(arm_api, on):
 
 
 # ============================== 카메라 배치 확인 ==============================
+_resolved_camera_index = None  # 최초 캡처 시 탐색해서 캐싱 - 이후엔 재탐색 안 함
+
+
+def _resolve_camera_index():
+    """CAMERA_INDEX_PREFERENCE 순서대로 시도해서 실제로 열리고 프레임까지
+    읽히는 첫 인덱스를 찾아 캐싱. USB 재연결마다 장치 인덱스가 바뀌는 문제 대응."""
+    global _resolved_camera_index
+    if _resolved_camera_index is not None:
+        return _resolved_camera_index
+
+    for idx in CAMERA_INDEX_PREFERENCE:
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            ok, _ = cap.read()
+            cap.release()
+            if ok:
+                log("CAM", f"카메라 인덱스 {idx}번으로 확정")
+                _resolved_camera_index = idx
+                return idx
+        cap.release()
+
+    log("CAM", f"카메라 인덱스 탐색 실패 - {CAMERA_INDEX_PREFERENCE} 전부 안 열림")
+    return None
+
+
 def _capture_frame():
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
+    idx = _resolve_camera_index()
+    if idx is None:
         return None
+    cap = cv2.VideoCapture(idx)
+    if not cap.isOpened():
+        # 캐싱된 인덱스가 이번엔 안 열림 (장치 빠졌다 다시 꽂힌 경우 등) - 재탐색
+        global _resolved_camera_index
+        _resolved_camera_index = None
+        idx = _resolve_camera_index()
+        if idx is None:
+            return None
+        cap = cv2.VideoCapture(idx)
+        if not cap.isOpened():
+            return None
     ok, frame = cap.read()
     cap.release()
     return frame if ok else None
@@ -547,10 +638,50 @@ def _classify_roi_color(frame):
     return best_color, best_ratio
 
 
+def _draw_roi_box(frame):
+    """디버그 저장/표시용 - ROI 사각형만 그린 복사본 반환 (원본 frame은 안 건드림)."""
+    boxed = frame.copy()
+    x, y, w, h = CAMERA_ROI
+    cv2.rectangle(boxed, (x, y), (x + w, y + h), (0, 255, 0), 2)
+    return boxed
+
+
+def _save_camera_image(frame, expected_color):
+    try:
+        os.makedirs(CAMERA_IMAGE_DIR, exist_ok=True)
+        filename = os.path.join(
+            CAMERA_IMAGE_DIR, f"{time.strftime('%Y%m%d_%H%M%S')}_{expected_color}.jpg"
+        )
+        # ⚠️ cv2.imwrite는 Windows에서 비-ASCII(한글 등) 경로를 못 읽어 조용히
+        # 저장 실패하는 경우가 있음(OpenCV 고질 이슈) - imencode+tofile로 우회.
+        ok, buf = cv2.imencode(".jpg", _draw_roi_box(frame))
+        if not ok:
+            log("CAM", "이미지 인코딩 실패")
+            return
+        buf.tofile(filename)
+        log("CAM", f"캡처 이미지 저장: {filename}")
+    except Exception as e:
+        log("CAM", f"이미지 저장 실패: {e}")
+
+
+def _show_camera_window(frame):
+    try:
+        cv2.imshow("board camera check", _draw_roi_box(frame))
+        cv2.waitKey(CAMERA_WINDOW_MS)
+        cv2.destroyWindow("board camera check")
+    except Exception as e:
+        log("CAM", f"창 표시 실패(헤드리스 환경일 수 있음): {e}")
+
+
 def verify_board_on_tray(expected_color):
     frame = _capture_frame()
     if frame is None:
         return False, None, "카메라 프레임 획득 실패"
+
+    if SAVE_CAMERA_IMAGE:
+        _save_camera_image(frame, expected_color)
+    if SHOW_CAMERA_WINDOW:
+        _show_camera_window(frame)
 
     detected_color, ratio = _classify_roi_color(frame)
 
@@ -565,8 +696,27 @@ def verify_board_on_tray(expected_color):
 
 # ============================== 픽업 로직 ==============================
 def compute_pick_pose(color, count):
-    x, y, base_z, r = PICK_POSE_BASE[color]
-    pick_z = base_z + (count - 1) * BOARD_THICKNESS_MM
+    """
+    count = 해당 색상 전체 재고(0~TOTAL_CAPACITY). 줄별 재고는 따로 저장하지
+    않고, "가까운 줄(row0)부터 채워서 가까운 줄부터 빈다"는 전제로 전체
+    재고 수에서 현재 어느 줄, 그 줄에 몇 개 남았는지 역산한다.
+    예: TOTAL_CAPACITY=20, count=3 -> emptied=17 -> row_index=3(4번째 줄),
+        count_in_row=3.
+    """
+    if count <= 0:
+        raise ValueError(f"[{color}] 재고 0 이하로 픽업 위치 계산 불가 (count={count})")
+
+    emptied = TOTAL_CAPACITY - count
+    row_index = min(emptied // ROW_CAPACITY, NUM_ROWS - 1)
+    count_in_row = ROW_CAPACITY - (emptied % ROW_CAPACITY)
+
+    row_pose = PICK_POSE_ROWS[color][row_index]
+    if row_pose is None:
+        raise ValueError(f"[{color}] row{row_index} 좌표 미실측 (PICK_POSE_ROWS의 None 자리) - "
+                          f"실측값으로 채운 뒤 재시도할 것")
+
+    x, y, base_z, r = row_pose
+    pick_z = base_z + (count_in_row - 1) * BOARD_THICKNESS_MM
     return (x, y, pick_z, r)
 
 
@@ -577,12 +727,12 @@ async def pick_and_place_board_async(arm_api, color, count):
     ⚠️ 이동 자체(도착 좌표)는 pydobot 트레이드오프 그대로 엄격 검증 안 함.
     카메라 확인만이 유일한 물리적 결과 검증 수단.
     """
-    pick_x, pick_y, pick_z, pick_r = compute_pick_pose(color, count)
-    place_x, place_y, place_z, place_r = PLACE_POSE
-    travel_z = max(pick_z, place_z) + SAFE_LIFT_MM
-    log("ARM", f"[{color}] 픽업 좌표: ({pick_x:.1f},{pick_y:.1f},{pick_z:.1f}) / 이동 높이: {travel_z:.1f}")
-
     try:
+        pick_x, pick_y, pick_z, pick_r = compute_pick_pose(color, count)
+        place_x, place_y, place_z, place_r = PLACE_POSE
+        travel_z = max(pick_z, place_z) + SAFE_LIFT_MM
+        log("ARM", f"[{color}] 픽업 좌표: ({pick_x:.1f},{pick_y:.1f},{pick_z:.1f}) / 이동 높이: {travel_z:.1f}")
+
         await move_and_wait(arm_api, (pick_x, pick_y, pick_z, pick_r), label="픽업 위치로 이동",
                              wait_sec=PRECISION_MOVE_WAIT_SEC)
 
@@ -590,7 +740,16 @@ async def pick_and_place_board_async(arm_api, color, count):
         await asyncio.sleep(SUCTION_SETTLE_DELAY)
 
         await move_and_wait(arm_api, (pick_x, pick_y, travel_z, pick_r), label="안전 높이로 들어올리기")
-        await move_and_wait(arm_api, (place_x, place_y, travel_z, place_r), label="안전 높이 유지한 채 트레이 위로 이동")
+
+        # ⚠️ 2026-09-19: red row3처럼 픽업 위치가 먼 경우, 거기서 PLACE_POSE까지
+        # 한 번에(큰 이동+큰 R회전 동시) 가면 명령이 씹히는 문제 확인됨 -
+        # WARMUP_POSE를 경유해서 "이동"과 "회전"을 분리된 단계로 나눔.
+        await move_and_wait(arm_api, (WARMUP_POSE[0], WARMUP_POSE[1], travel_z, pick_r),
+                             label="웜업 위치로 이동 (R은 아직 pick_r 유지)")
+        await move_and_wait(arm_api, (WARMUP_POSE[0], WARMUP_POSE[1], travel_z, place_r),
+                             label="웜업 위치에서 R만 place_r로 회전")
+        await move_and_wait(arm_api, (place_x, place_y, travel_z, place_r),
+                             label="안전 높이 유지한 채 트레이 위로 이동 (R은 이미 place_r)")
         await move_and_wait(arm_api, (place_x, place_y, place_z, place_r), label="트레이 위치로 하강",
                              wait_sec=PRECISION_MOVE_WAIT_SEC)
 
@@ -679,7 +838,7 @@ def process_board_job(loop, arm_api, box_api, order_id, color):
     """
     global gate_open, gate_order_id
 
-    if color not in BOARD_COLORS or color not in PICK_POSE_BASE:
+    if color not in BOARD_COLORS or color not in PICK_POSE_ROWS:
         log("ARM", f"알 수 없는 색상 '{color}' - 중단")
         complete_on_server(order_id, color)
         return
@@ -759,10 +918,6 @@ def check_fault_transitions(loop, arm_api, box_api, orders):
             current_fault_order_id, current_fault_value = "", ""
             log("FAULT", f"{oid}: {fval} 해제")
 
-            if fval == STAGE_TIMEOUT_FAULT:
-                handle_stage_timeout_retry(oid, order)
-                return
-
             retry_kind = FAULT_RETRY_MAP.get(fval)
             color = order.get("board")
             if retry_kind == "pick":
@@ -780,19 +935,6 @@ def check_fault_transitions(loop, arm_api, box_api, orders):
             current_fault_value = fault
             log("FAULT", f"{order_id}: {fault} 감지")
             break
-
-
-def handle_stage_timeout_retry(order_id, order):
-    status = order.get("status")
-    color = order.get("board")
-
-    if status in (STATUS_PICK, STATUS_MISMATCH):
-        job_key = build_job_key(order_id, color, status, order.get("retry"))
-        if not already_processed(job_key):
-            mark_processed(job_key)
-            job_queue.append({"order_id": order_id, "color": color})
-            enqueue_to_server(order_id, color)
-            log("QUEUE", f"{order_id}({color}) stage_timeout -> 큐 적재")
 
 
 # ---- 재부팅 시 fault 해제 전이를 놓친 경우 복구 ----
