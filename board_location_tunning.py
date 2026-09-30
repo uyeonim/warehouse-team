@@ -3,7 +3,7 @@ import time
 
 from DobotRPC import RPCClient, DobotlinkAdapter
 
-DOBOT_PORT = "COM17"
+DOBOT_PORT = "COM3"
 
 # main_board_robot_arm.py와 동일한 값 - PICK_POSE_ROWS 바뀌면 여기도 맞춰서 갱신
 PICK_POSE_ROWS = {
@@ -21,7 +21,7 @@ BOARD_COLORS = ["red", "yellow", "blue", "green"]
 NUM_ROWS = 4          # 0=제일 가까운 줄 ~ 3=제일 먼 줄
 ROW_CAPACITY = 5       # 줄 하나당 최대 적재 개수 (입력값 범위 체크용)
 
-HOME_POSE = (260.1675, 9.9420, 104.0457, 2.1885)  # main_board_robot_arm.py와 동일값
+HOME_POSE = (239.9906, -5.5209, 84.0930, 0.7622)  # main_board_robot_arm.py와 동일값
 # ⚠️ 2026-09-19: HOME_POSE의 실제 joint값이 [~0,-0.33,-1.18,~0]로 사실상
 # joint 전부 0인 특이 자세와 거의 같아서 웜업 용도로 못 씀 - 확실히 다른
 # joint값이 나오는 지점(green row2/3에서 실제로 통했던 값)을 별도로 둠.

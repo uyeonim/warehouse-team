@@ -3,7 +3,7 @@ import time
 
 from DobotRPC import RPCClient, DobotlinkAdapter
 
-DOBOT_PORT = "COM17"
+DOBOT_PORT = "COM3"
 
 # main_board_robot_arm.py와 동일한 값 - PICK_POSE_ROWS/PLACE_POSE 바뀌면 여기도 맞춰서 갱신
 PICK_POSE_ROWS = {
@@ -21,7 +21,7 @@ BOARD_COLORS = ["red", "yellow", "blue", "green"]
 NUM_ROWS = 4          # 0=제일 가까운 줄 ~ 3=제일 먼 줄
 ROW_CAPACITY = 5       # 줄 하나당 최대 적재 개수 (입력값 범위 체크용)
 
-PLACE_POSE = (-152.0347, -263.0365, 0.4450, -120.0278)
+PLACE_POSE = (-116.6558, -294.7615, 28.6249, -111.5918)
 SAFE_LIFT_MM = 40.0
 
 HOME_POSE = (239.9906, -5.5209, 84.0930, 0.7622)  # main_board_robot_arm.py와 동일값

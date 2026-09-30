@@ -154,48 +154,22 @@ FAULT_RETRY_MAP = {
 # 자동으로 열림)가 이미 처리하고 있어서 별도 대응 불필요.
 TRACKED_FAULTS = set(FAULT_RETRY_MAP)
 
-DOBOT_PORT = "COM17"   # 팔 + 컨베이어(Magic Box) 공유 포트
+DOBOT_PORT = "COM3"   # 팔 + 컨베이어(Magic Box) 공유 포트
 NAMESPACE_ARM = "MagicianLite"
 NAMESPACE_BOX = "MagicBox"
 
 # =================================================================
 # CONFIG - 로봇암 좌표
-# ⚠️ 2026-09-18 실측 갱신(1차): PICK_POSE_BASE의 X/Z/R을 4색 공통값으로 통일.
-#    X:290.0 / Z:-35.0(count=1 기준) / R:0.0 통일. Y는 색상별 실측값 유지.
-# ⚠️ 2026-09-18 재실측(2차): 보드 3개 적재(count=3) 기준으로 재측정.
-#    - X: 이번엔 통일 안 함 - 색상별 실측값 그대로 사용
-#    - Y: 항상 색상별 실측값 유지 (컨베이어 위 레일 위치라 통일 대상 아님)
-#    - Z: 실측값은 count=3 기준이라 (3-1)*BOARD_THICKNESS_MM(=40mm)를 빼서
-#      count=1 기준 base_z로 환산 후, 4색 평균(-33.27)으로 통일
-#      (red -33.4577 / green -33.9360 / blue -32.4397 / yellow -33.2272 평균)
-#    - R: 0.0 통일 폐기 - 이번엔 실측값을 그대로 사용(회전축이라 적재 개수와 무관)
-#    PLACE_POSE는 재실측 반영, CAMERA_CHECK_POSE는 로봇암 장착 카메라용 재실측 위치
-#    (2026-09-18, 이동시간 부족으로 도착 못 하고 지나치던 문제 확인 후
-#    CAMERA_MOVE_WAIT_SEC 4.0초로 별도 분리 - 아래 이동 타이밍 CONFIG 참고).
-# ⚠️ 2026-09-18 구조 변경(3차): 색당 5개×4줄(대각선 배치, 줄마다 X/Y 둘 다 바뀜)로
-#    확장. PICK_POSE_BASE(색상당 좌표 1개) -> PICK_POSE_ROWS(색상당 좌표 4개,
-#    row0=제일 가까운 줄 ~ row3=제일 먼 줄)로 구조 변경. 각 좌표는 기존과 동일한
-#    관례로 "그 줄에 count=1(1개 남았을 때)" 기준 base_z를 넣음.
-#    row0은 기존 실측값 그대로, row1~row3은 ⚠️ 아직 실측 전 - 4색×3줄=12개
-#    좌표 측정해서 아래 TODO 자리 채울 것. 그 전까지는 row1~3 선택 시 동작 안 됨.
-#    픽업 순서: 가까운 줄(row0)부터 5개 다 빈 다음 다음 줄로 - compute_pick_pose()
-#    참고. 바구니 문제로 당장은 3개(row3, 즉 4번째 줄)만 채워서 테스트 예정 -
-#    전체재고=3이면 row_index가 3으로 계산되는지가 테스트 포인트.
+# 색당 5개×4줄(대각선 배치, 줄마다 X/Y가 다름) 적재. row0=제일 가까운 줄 ~
+# row3=제일 먼 줄, 픽업은 가까운 줄부터 5개 다 빈 다음 다음 줄로(compute_pick_pose 참고).
 # =================================================================
-ROW_CAPACITY = 5     # 줄 하나당 최대 적재 개수
-NUM_ROWS = 4          # 줄 개수 (0=제일 가까운 줄 ~ 3=제일 먼 줄)
+ROW_CAPACITY = 5      # 줄 하나당 최대 적재 개수
+NUM_ROWS = 4           # 줄 개수 (0=제일 가까운 줄 ~ 3=제일 먼 줄)
 TOTAL_CAPACITY = ROW_CAPACITY * NUM_ROWS  # 색상당 전체 용량 (20)
 
 # 색상별 [row0, row1, row2, row3] - 각 원소는 (x, y, base_z, r), base_z는
-# 그 줄에 1개 남았을 때 기준 (기존 PICK_POSE_BASE와 동일 관례)
-# ⚠️ 2026-09-19: 4색×4줄(16개) 전부 재실측 반영. 각 색상 내에서 Y/Z는 4줄
-# 공통값으로 통일(줄별 측정 노이즈 평탄화), X는 줄마다 다름. R은 색상별로 다름:
-# green/blue는 4줄 공통 R, red/yellow는 줄마다 R도 다르게 실측 반영.
-# ⚠️ 2026-09-19 재조정: red/yellow row3(제일 먼 줄)에서 count_in_row=1(z=-38)이
-# 물리적으로 도달 안 되는 문제 확인됨(다른 색·다른 줄은 전부 정상) - red row3의
-# Y=190이 다른 값들보다 유독 커서(수평거리 ~375mm) 생긴 문제로 파악, 카트리지
-# 위치 재조정 후 다시 실측한 값으로 교체. row3만 Y/Z/R이 나머지 3줄과 다른
-# "통일값"이 아니라 그 줄 자체의 개별 실측값인 이유가 이것.
+# 그 줄에 1개 남았을 때 기준. Y/Z는 대체로 4줄 공통값(측정 노이즈 평탄화), X는
+# 줄마다 다름. red/yellow row3만 개별 실측값(도달범위 문제로 카트리지 재조정 후 측정).
 PICK_POSE_ROWS = {
     "red":    [(229.4263, 190, -38, 41), (255.1454, 190, -38, 38),
                (290.2512, 190, -38, 35), (320.1271, 165.9958, -37.1079, 27.3997)],
@@ -208,13 +182,11 @@ PICK_POSE_ROWS = {
 }
 BOARD_THICKNESS_MM = 20.0
 
-PLACE_POSE = (-152.0347, -263.0365, 0.4450, -120.0278)
-CAMERA_CHECK_POSE = (-122.3321, -200.4390, 58.4218, -121.3965)
+PLACE_POSE = (-116.6558, -294.7615, 28.6249, -111.5918)
+CAMERA_CHECK_POSE = (-97.5224, -229.2938, 58.3063, -113.0408)
 HOME_POSE = (239.9906, -5.5209, 84.0930, 0.7622)
-# ⚠️ 2026-09-19: red row3처럼 도달거리가 먼 픽업 위치에서 PLACE_POSE(반대쪽)로
-# 바로 이동하면 명령은 True로 접수되는데 실제로는 전혀 안 움직이는 문제 확인됨
-# (튜닝 스크립트에서 먼저 확인, 특이자세/joint리밋 경로탐색 이슈로 추정).
-# 중간에 이 지점의 X,Y를 한 번 거쳐서 극단적인 이동을 두 구간으로 나눔.
+# 픽업 위치가 멀 때(red row3 등) PLACE_POSE로 한 번에 이동하면 명령이 씹히는
+# 문제가 있어서, 이 지점을 경유해 이동을 두 구간으로 나눔(특이자세/joint리밋 추정).
 WARMUP_POSE = (296.3269, 85.0, 2.0, 20.0)
 
 # =================================================================
@@ -235,12 +207,9 @@ TRAY_CONVEYOR_RUN_TIME_SECTION2 = 6.5   # board_packed -> 픽업대까지
 # CONFIG - 이동 타이밍 (pydobot 버전 검증값 참고)
 # =================================================================
 MOVE_WAIT_SEC = 2.0          # 대부분의 이동에 쓰는 기본 대기시간
-PRECISION_MOVE_WAIT_SEC = 3.0  # 정밀 접촉이 필요한 이동(픽업/놓기) 전용 - 짧으면 흡착 실패 실물로 확인됨
-CAMERA_MOVE_WAIT_SEC = 4.0    # 카메라 체크 위치 이동 전용 - place_pose -> CAMERA_CHECK_POSE 이동거리(~107mm)가
-                              # 다른 구간보다 커서 MOVE_WAIT_SEC(2.0초)로는 도착 전에 다음 명령이 덮어써 그냥
-                              # 지나쳐버리는 문제 확인됨(2026-09-18) - 정확히 도착해야 사진이 의미 있어서 넉넉하게 설정
-HOME_MOVE_WAIT_SEC = 5.0      # 카메라 체크 위치 -> HOME 복귀 전용 - XY 이동거리(~380mm)에 R 회전(~121도)까지
-                              # 겹쳐서 MOVE_WAIT_SEC(2.0초)로는 부족해 복귀가 안 되던 문제 확인됨(2026-09-18)
+PRECISION_MOVE_WAIT_SEC = 3.0  # 정밀 접촉이 필요한 이동(픽업/놓기) 전용 - 짧으면 흡착 실패
+CAMERA_MOVE_WAIT_SEC = 4.0    # 카메라 체크 위치 이동 전용 - 이동거리가 커서 여유있게
+HOME_MOVE_WAIT_SEC = 5.0      # 카메라 체크 위치 -> HOME 복귀 전용 - 이동거리+R회전 모두 커서 여유있게
 SUCTION_SETTLE_DELAY = 1.0   # 흡착력 형성 대기
 RELEASE_SETTLE_DELAY = 0.5
 SAFE_LIFT_MM = 40.0
@@ -250,44 +219,32 @@ CALL_TIMEOUT = 5
 
 # =================================================================
 # CONFIG - 카메라 배치 확인
-# ⚠️ 2026-09-18 변경: 카메라를 로봇암에 직접 장착하는 방식으로 변경됨.
-#    이전(별개 고정 USB 웹캠, cv2로 직접 제어, HOME_POSE 복귀 후 확인)과 달리
-#    이제는 보드를 놓은 직후 CAMERA_CHECK_POSE로 이동해서 그 자리에서 확인.
-#    장치 접근 방식(cv2.VideoCapture)과 CAMERA_INDEX 자체는 그대로 유지 -
-#    카메라 장치가 바뀐 게 아니라 장착 위치만 팔로 옮겨간 것으로 간주.
-# ⚠️ CAMERA_ROI 재보정 필요 - 카메라 위치가 완전히 바뀌었는데 아래 값은
-#    기존(고정 웹캠 기준) 값 그대로 남겨둔 상태. CAMERA_CHECK_POSE에서 실물로
-#    calibrate_camera.py 다시 돌려서 새 ROI 값으로 교체할 것 - 재보정 전까지는
-#    색상 판정이 엉뚱한 영역을 보고 있을 수 있음.
+# 카메라는 로봇암에 장착돼있음 - 보드를 놓은 직후 CAMERA_CHECK_POSE로 이동해서
+# 그 자리에서 확인(별도 고정 웹캠 아님). ⚠️ CAMERA_ROI 재보정 필요 - 카메라
+# 위치가 바뀌었는데 아래 값은 예전(고정 웹캠 기준) 값 그대로임.
 # =================================================================
-CAMERA_INDEX_PREFERENCE = [1, 0, 2, 3]  # ⚠️ 2026-09-19: USB 재연결마다 인덱스가 0/1로
-                                          # 바뀌는 문제 확인됨 - 고정값 대신 이 순서로 시도해서
-                                          # 처음 성공하는 장치를 씀 (아래 _resolve_camera_index 참고)
+CAMERA_INDEX_PREFERENCE = [1]  # USB 재연결마다 인덱스가 바뀌는 문제 대응 -
+                                          # 순서대로 시도해서 처음 성공하는 장치를 씀
 CAMERA_ROI = (200, 150, 150, 100)  # (x, y, w, h) - ⚠️ 재보정 필요, 위 주석 참고
-CAMERA_PRESENCE_MIN_RATIO = 0.3
-CAMERA_SETTLE_DELAY = 0.5   # 사진 찍기 전 대기 - 5초는 과했음(이전 해석 오류), 짧게 줄임
+CAMERA_PRESENCE_MIN_RATIO = 0.5   # 실측: 보드 최소 0.72, 빈 배경 최대 0.13 (2026-09-30, 임시 트레이 기준)
+CAMERA_SETTLE_DELAY = 0.5   # 사진 찍기 전 대기
+CAMERA_WARMUP_FRAMES = 5    # 열자마자 읽은 프레임은 자동노출 적응 전이라 어두움 - 앞 N장 버림
 
-# ⚠️ 2026-09-19: 배치 확인 디버그용 - 이미 캡처된 프레임을 재사용(카메라 추가
-# 접근 없음, 충돌 위험 없음)해서 저장/화면표시. 둘 다 플래그로 독립 토글 가능.
-SAVE_CAMERA_IMAGE = True     # 매 확인마다 캡처 이미지를 파일로 저장 (가벼움, 항상 켜둬도 무방)
-SHOW_CAMERA_WINDOW = False   # cv2.imshow로 짧게 띄우기 (모니터 붙은 환경에서만 - 헤드리스면 끌 것)
+SAVE_CAMERA_IMAGE = True     # 확인마다 캡처 이미지를 파일로 저장 (가벼움, 항상 켜둬도 무방)
+SHOW_CAMERA_WINDOW = False   # cv2.imshow로 짧게 띄우기 (모니터 붙은 환경에서만)
 CAMERA_IMAGE_DIR = r"C:\Users\dusdn\warehouse-flask\board_camera_capture_log"
 CAMERA_WINDOW_MS = 800       # 창 띄우는 시간(ms) - 이 동안 메인 루프 블로킹됨
 
-# 실측 완료 (2026-09 촬영) - H:S:V 순서로 yellow(33,59,252) blue(94,68,243)
-# green(53,46,240) red/핑크(160,70,255). 전부 채도(S) 낮고 명도(V) 높은
-# 파스텔톤이라 S/V는 4색 공통으로 넉넉하게 낮춰 잡음. 노랑/초록 hue가
-# 33/53으로 가까워서 중간값(43) 기준으로 여유 없이 나눔 - 오판정 나면
-# 여기 경계값부터 조정할 것.
+# H:S:V 순서 실측값 (2026-09-30, 로봇암 장착 카메라, CAMERA_CHECK_POSE 기준)
+# yellow(47,30,214) green(66,36,218) blue(99,144,255) red/핑크(147,57,219).
+# 노랑/초록 채도(S)가 30대로 매우 낮아서 S 하한을 15로 내림 - 흰 트레이 배경이
+# 노랑/초록으로 잡힐 위험이 있으니 'c' 키 판정 테스트로 꼭 확인할 것.
+# 노랑(47)/초록(66) 경계는 중간값 56/57로 나눔.
 COLOR_RANGES_HSV = {
-    # ⚠️ 2026-09-19: 로봇암 장착 카메라(CAMERA_CHECK_POSE) 기준 재실측 - 중앙 픽셀
-    # 1개씩만 잰 값(yellow H28/green H41/blue H97/red H164)이라 실제 판정
-    # 테스트('c' 키)는 아직 안 해본 상태. 노랑/초록 hue가 예전보다 가까워져서
-    # (28 vs 41) 겹치지 않게 경계를 34/35로 나눔 - 오판정 나면 여기부터 조정.
-    "yellow": [((18, 30, 150), (34, 255, 255))],
-    "green":  [((35, 30, 150), (70, 255, 255))],
-    "blue":   [((71, 30, 150), (125, 255, 255))],
-    "red":    [((140, 30, 150), (179, 255, 255))],  # 실측 H164
+    "yellow": [((35, 15, 150), (56, 255, 255))],
+    "green":  [((57, 15, 150), (85, 255, 255))],
+    "blue":   [((86, 30, 150), (130, 255, 255))],
+    "red":    [((135, 30, 150), (179, 255, 255))],
 }
 
 # =================================================================
@@ -564,7 +521,29 @@ async def move_and_wait(arm_api, pose, label="", wait_sec=None):
 
     actual = await safe_call(arm_api.GetPose(portName=DOBOT_PORT, isQueued=False))
     log("ARM", f"{label} - 명령:{moved}, 목표=({x:.1f},{y:.1f},{z:.1f},{r:.1f}), 실제위치:{actual}")
-    return is_ok(moved)
+    return is_ok(moved), actual
+
+
+# 픽업 위치 이동 / 트레이 하강, 이 두 정밀 구간만 GetPose로 실제 도착 여부
+# 확인(명령이 True로 접수돼도 실제로 안 움직이는 경우가 있어서). 그 외 구간은
+# 기존처럼 결과 확인 안 함 - pydobot 스타일 트레이드오프 유지.
+POSITION_TOLERANCE_MM = 2.0
+POSITION_TOLERANCE_DEG = 2.0
+
+
+def _position_matches(actual, target_pose):
+    if not isinstance(actual, dict):
+        return False
+    tx, ty, tz, tr = target_pose
+    try:
+        dx = abs(actual.get("x", 0) - tx)
+        dy = abs(actual.get("y", 0) - ty)
+        dz = abs(actual.get("z", 0) - tz)
+        dr = abs(actual.get("r", 0) - tr)
+    except TypeError:
+        return False
+    return (dx <= POSITION_TOLERANCE_MM and dy <= POSITION_TOLERANCE_MM
+            and dz <= POSITION_TOLERANCE_MM and dr <= POSITION_TOLERANCE_DEG)
 
 
 async def suck(arm_api, on):
@@ -579,6 +558,11 @@ async def suck(arm_api, on):
 _resolved_camera_index = None  # 최초 캡처 시 탐색해서 캐싱 - 이후엔 재탐색 안 함
 
 
+def _open_camera(idx):
+    # 윈도우 기본 백엔드(MSMF)는 여는 데 5~30초씩 걸려서 DirectShow로 지정
+    return cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+
+
 def _resolve_camera_index():
     """CAMERA_INDEX_PREFERENCE 순서대로 시도해서 실제로 열리고 프레임까지
     읽히는 첫 인덱스를 찾아 캐싱. USB 재연결마다 장치 인덱스가 바뀌는 문제 대응."""
@@ -587,7 +571,7 @@ def _resolve_camera_index():
         return _resolved_camera_index
 
     for idx in CAMERA_INDEX_PREFERENCE:
-        cap = cv2.VideoCapture(idx)
+        cap = _open_camera(idx)
         if cap.isOpened():
             ok, _ = cap.read()
             cap.release()
@@ -602,23 +586,29 @@ def _resolve_camera_index():
 
 
 def _capture_frame():
+    global _resolved_camera_index
     idx = _resolve_camera_index()
     if idx is None:
         return None
-    cap = cv2.VideoCapture(idx)
+    cap = _open_camera(idx)
     if not cap.isOpened():
         # 캐싱된 인덱스가 이번엔 안 열림 (장치 빠졌다 다시 꽂힌 경우 등) - 재탐색
-        global _resolved_camera_index
         _resolved_camera_index = None
         idx = _resolve_camera_index()
         if idx is None:
             return None
-        cap = cv2.VideoCapture(idx)
+        cap = _open_camera(idx)
         if not cap.isOpened():
             return None
-    ok, frame = cap.read()
+
+    # 앞 프레임 몇 장은 자동노출 적응 전이라 어두움 - 버리고 마지막 프레임 사용
+    frame = None
+    for _ in range(CAMERA_WARMUP_FRAMES + 1):
+        ok, f = cap.read()
+        if ok:
+            frame = f
     cap.release()
-    return frame if ok else None
+    return frame
 
 
 def _classify_roi_color(frame):
@@ -720,12 +710,16 @@ def compute_pick_pose(color, count):
     return (x, y, pick_z, r)
 
 
-async def pick_and_place_board_async(arm_api, color, count):
+async def pick_and_place_board_async(arm_api, order_id, color, count):
     """
-    픽업 -> 안전 높이로 들어올림 -> 안전 높이 유지한 채 이동 -> 트레이로 하강 -> 놓기
-    -> 다시 안전 높이로 들어올림 -> 카메라로 배치 확인 -> 초기위치 복귀.
-    ⚠️ 이동 자체(도착 좌표)는 pydobot 트레이드오프 그대로 엄격 검증 안 함.
-    카메라 확인만이 유일한 물리적 결과 검증 수단.
+    픽업 -> 안전 높이로 들어올림 -> 웜업 경유 이동/회전 -> 트레이로 하강 -> 놓기
+    -> 카메라로 배치 확인 -> 초기위치 복귀.
+
+    픽업 위치 이동 / 트레이 하강, 이 두 구간만 GetPose로 실제 도착 여부를
+    검증한다(POSITION_TOLERANCE_MM/DEG). 여기서 실패하면 카메라 확인 없이 즉시
+    board:"failed" 보고 후 반환 - 팔이 제대로 안 내려갔으면 뭘 봐도 의미 없으니까.
+    성공(board:"done")은 카메라 확인까지 통과해야만 보고한다. 그 외 구간(안전높이
+    이동 등)은 여전히 결과 확인 안 함 - pydobot 스타일 트레이드오프 유지.
     """
     try:
         pick_x, pick_y, pick_z, pick_r = compute_pick_pose(color, count)
@@ -733,34 +727,50 @@ async def pick_and_place_board_async(arm_api, color, count):
         travel_z = max(pick_z, place_z) + SAFE_LIFT_MM
         log("ARM", f"[{color}] 픽업 좌표: ({pick_x:.1f},{pick_y:.1f},{pick_z:.1f}) / 이동 높이: {travel_z:.1f}")
 
-        await move_and_wait(arm_api, (pick_x, pick_y, pick_z, pick_r), label="픽업 위치로 이동",
-                             wait_sec=PRECISION_MOVE_WAIT_SEC)
+        pick_move_ok, pick_actual = await move_and_wait(
+            arm_api, (pick_x, pick_y, pick_z, pick_r), label="픽업 위치로 이동",
+            wait_sec=PRECISION_MOVE_WAIT_SEC
+        )
+        if not pick_move_ok or not _position_matches(pick_actual, (pick_x, pick_y, pick_z, pick_r)):
+            log("ARM", f"픽업 위치 도달 실패 - 목표=({pick_x:.1f},{pick_y:.1f},{pick_z:.1f},{pick_r:.1f}) "
+                        f"실제={pick_actual} - 흡착 시도 안 하고 실패 처리")
+            report_board_robot_arm(order_id, "failed")
+            return False
 
         grabbed = await suck(arm_api, True)
         await asyncio.sleep(SUCTION_SETTLE_DELAY)
 
         await move_and_wait(arm_api, (pick_x, pick_y, travel_z, pick_r), label="안전 높이로 들어올리기")
 
-        # ⚠️ 2026-09-19: red row3처럼 픽업 위치가 먼 경우, 거기서 PLACE_POSE까지
-        # 한 번에(큰 이동+큰 R회전 동시) 가면 명령이 씹히는 문제 확인됨 -
-        # WARMUP_POSE를 경유해서 "이동"과 "회전"을 분리된 단계로 나눔.
+        # red row3처럼 픽업 위치가 멀면 PLACE_POSE까지 한 번에(이동+회전 동시)
+        # 갈 때 명령이 씹히는 문제가 있어서, WARMUP_POSE를 거쳐 이동/회전을 분리.
         await move_and_wait(arm_api, (WARMUP_POSE[0], WARMUP_POSE[1], travel_z, pick_r),
                              label="웜업 위치로 이동 (R은 아직 pick_r 유지)")
         await move_and_wait(arm_api, (WARMUP_POSE[0], WARMUP_POSE[1], travel_z, place_r),
                              label="웜업 위치에서 R만 place_r로 회전")
         await move_and_wait(arm_api, (place_x, place_y, travel_z, place_r),
                              label="안전 높이 유지한 채 트레이 위로 이동 (R은 이미 place_r)")
-        await move_and_wait(arm_api, (place_x, place_y, place_z, place_r), label="트레이 위치로 하강",
-                             wait_sec=PRECISION_MOVE_WAIT_SEC)
+        descend_ok, descend_actual = await move_and_wait(
+            arm_api, (place_x, place_y, place_z, place_r), label="트레이 위치로 하강",
+            wait_sec=PRECISION_MOVE_WAIT_SEC
+        )
+        if not descend_ok or not _position_matches(descend_actual, (place_x, place_y, place_z, place_r)):
+            log("ARM", f"트레이 하강 도달 실패 - 목표=({place_x:.1f},{place_y:.1f},{place_z:.1f},{place_r:.1f}) "
+                        f"실제={descend_actual} - 흡착 끄고 실패 처리")
+            report_board_robot_arm(order_id, "failed")
+            try:
+                await suck(arm_api, False)
+            except Exception:
+                pass
+            return False
 
         released = await suck(arm_api, False)
         await asyncio.sleep(RELEASE_SETTLE_DELAY)
 
         await move_and_wait(arm_api, (place_x, place_y, travel_z, place_r), label="다시 안전 높이로 들어올리기")
 
-        # ⚠️ 2026-09-18 변경: 카메라가 로봇암에 장착돼서, 보드를 놓은 직후
-        # CAMERA_CHECK_POSE로 먼저 이동해서 그 자리에서 확인 - HOME 복귀는
-        # 확인 이후로 미룸(이전엔 순서가 반대: HOME 복귀 후 고정 웹캠으로 확인).
+        # 카메라가 로봇암에 장착돼서, 보드를 놓은 직후 CAMERA_CHECK_POSE로 먼저
+        # 이동해서 그 자리에서 확인 - HOME 복귀는 확인 이후로 미룸.
         await move_and_wait(arm_api, CAMERA_CHECK_POSE, label="카메라 체크 위치로 이동",
                              wait_sec=CAMERA_MOVE_WAIT_SEC)
 
@@ -769,14 +779,13 @@ async def pick_and_place_board_async(arm_api, color, count):
         verified, detected_color, reason = verify_board_on_tray(color)
         log("ARM", f"카메라 확인 결과: {reason} (감지된 색={detected_color})")
 
-        # ⚠️ 2026-09-18: CAMERA_CHECK_POSE -> HOME_POSE 구간 R 회전폭이 커서
-        # (약 121도) "R+XY 동시 이동 씹힘" 의심했었으나, 실제 원인은 대기시간
-        # 부족이었음 확인됨 - 2단계 분리 대신 HOME_MOVE_WAIT_SEC로 충분히 대기.
         await move_and_wait(arm_api, HOME_POSE, label="초기위치로 복귀",
                              wait_sec=HOME_MOVE_WAIT_SEC)
 
+        report_board_robot_arm(order_id, "done" if verified else "failed")
+
         if not verified:
-            log("ARM", "카메라 확인 실패 - 실패 처리 (물리 동작은 완료했지만 done 보고 안 함)")
+            log("ARM", "카메라 확인 실패 - 실패 처리")
             return False
 
         log("ARM", "결과: 성공 (카메라로 배치 확인됨)")
@@ -788,6 +797,7 @@ async def pick_and_place_board_async(arm_api, color, count):
             await suck(arm_api, False)
         except Exception:
             pass
+        report_board_robot_arm(order_id, "failed")
         return False
 
 
@@ -850,8 +860,9 @@ def process_board_job(loop, arm_api, box_api, order_id, color):
         report_board_robot_arm(order_id, "failed")
     else:
         report_board_status(order_id, color, "busy", count=count_before)
-        success = loop.run_until_complete(pick_and_place_board_async(arm_api, color, count_before))
-        report_board_robot_arm(order_id, "done" if success else "failed")
+        # board 필드 보고는 pick_and_place_board_async 내부에서 정확한 시점에
+        # 이뤄짐 (위치검증 실패 시 즉시, 성공 시 카메라 확인 후)
+        success = loop.run_until_complete(pick_and_place_board_async(arm_api, order_id, color, count_before))
 
         if not success:
             report_board_status(order_id, color, "idle", count=count_before)

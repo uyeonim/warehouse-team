@@ -1,6 +1,6 @@
 /*
   ================================================================================
-  키캡 배출 아두이노 - N/S 축 담당 (Arduino Uno R4 WiFi)
+  키캡 배출 아두이노 - P/J 축 담당 (Arduino Uno R4 WiFi)
   ================================================================================
   역할
    1) HiveMQ Cloud(MQTT, TLS)에 직접 연결해서 "sjuiot/warehouse/process" 구독
@@ -396,8 +396,31 @@
      IR_MIN_BREAK_MS(디바운스) 세 곳 모두 맞춰야 실제 판정이 동작함 -
      다음에 새 레일 배선 추가할 때도 이 세 곳을 다 확인할 것.
 
+  [2026-09-30 PCA9685 채널 매핑을 짝수 채널(0,2,4,...,14)로 변경 + 4개 보드 공통 코드 정리]
+   - 배경: 실제 배선이 4개 보드 모두 PCA9685의 0,2,4,6,8,10,12,14번 채널에
+     연결되어 있음 (기존 코드는 0~7번 연속 채널을 가정). 전압원에 전 보드를
+     연결해 E/I, N/S, T/F, P/J 전부 동작시켜야 해서 SERVO_CHANNEL을 수정함.
+   - 매핑: LETTER_0 r,y,b,g = 0,2,4,6 / LETTER_1 r,y,b,g = 8,10,12,14
+   - IR 센서는 현재 E_r 1개만 배선됨 -> EI 보드만 IR_SENSOR_INSTALLED=1,
+     IR_INSTALLED[0][0]=true. NS/TF/PJ는 센서가 없으므로 IR_SENSOR_INSTALLED=0,
+     IR_INSTALLED 전부 false (배출 후 무조건 성공 처리). 센서가 추가 배선될 때마다
+     IR_SENSOR_INSTALLED / IR_INSTALLED[l][c] / IR_MIN_BREAK_MS 세 곳을 함께 확인할 것.
+
+  [2026-09-30 부팅 시 서보 홈 이동을 동시 -> 순차로 변경]
+   - 8개 서보가 동시에 움직이며 전압이 순간 떨어지는 문제 완화를 위해 setup()에서
+     채널마다 SERVO_STARTUP_STAGGER_MS(200ms) 간격으로 한 개씩 홈(170도)으로 보냄.
+     배출 사이클은 원래 한 번에 한 레일만 움직이므로 영향 없음.
+
+  [2026-09-30 색상 순서 변경 + 대기 각도 170 -> 165]
+   - 색상 순서를 r,y,b,g -> r,g,b,y로 변경 (COLOR_LIST). 채널 매핑은 그대로
+     LETTER_0 = 0,2,4,6 / LETTER_1 = 8,10,12,14 이고, 각 자리의 색이 바뀜:
+     r=0/8, g=2/10, b=4/12, y=6/14. 색 인덱스 자리가 바뀌므로 IR_PIN 표도
+     같은 자리에 대응함(현재 센서는 E_r=슬롯 0번뿐이라 영향 없음).
+   - SERVO_HOME_ANGLE 170 -> 165: 170도에서 일부 서보가 끝단에 걸려 계속 떨림
+     (Servo_Jitter_Test로 확인, 5도 낮추니 해소). PUSH_ANGLE(70)은 그대로.
+
   다른 3개 보드는 이 파일을 복사한 뒤 "보드별 설정" 블록만 아래 표대로
-  바꿔서 각 보드에 업로드하면 됩니다. (지금 이 파일은 NS 보드용입니다)
+  바꿔서 각 보드에 업로드하면 됩니다. (지금 이 파일은 PJ 보드용입니다)
 
   ------------------------------------------------------------------------------
    보드      LETTER_0 / LETTER_1   AXIS_INDEX   MQTT_CLIENT_ID   BOARD_NAME
@@ -441,12 +464,12 @@ const char* BOARD_NAME           = "PJ";  // /queue/{board}/*, /stock/keycap?boa
 // ===========================================================================
 
 // ---- 색상 순서 (colors 배열/보드 내부 인덱싱과 동일 순서로 고정) ----
-const char COLOR_LIST[4] = {'r', 'y', 'b', 'g'};
+const char COLOR_LIST[4] = {'r', 'g', 'b', 'y'};
 
 // ---- PCA9685 채널 매핑: [글자슬롯(0/1)][색상슬롯(0~3)] ----
 const uint8_t SERVO_CHANNEL[2][4] = {
-  {0, 1, 2, 3},   // LETTER_0 - r,y,b,g
-  {4, 5, 6, 7}    // LETTER_1 - r,y,b,g
+  {0, 2, 4, 6},      // LETTER_0 - r,g,b,y  (실배선: PCA9685 짝수 채널)
+  {8, 10, 12, 14}    // LETTER_1 - r,g,b,y
 };
 
 // ---- IR 센서 핀 매핑: [글자슬롯(0/1)][색상슬롯(0~3)] (실배선에 맞게 수정) ----
@@ -458,8 +481,8 @@ const uint8_t IR_PIN[2][4] = {
 // ---- 서보 동작 파라미터 (실측 후 조정) ----
 #define SERVO_MIN_PULSE       150
 #define SERVO_MAX_PULSE       600
-#define SERVO_HOME_ANGLE      170   // 대기 각도 (실측 확정값 - Servo_Push_Cycle_Test로 찾음)
-#define PUSH_ANGLE             70   // 배출(푸시) 각도 (실측 확정값) - 대기(170)에서 이 값까지 "감소"하며 이동함에 주의
+#define SERVO_HOME_ANGLE      165   // 대기 각도 (170도에서 일부 서보가 끝단에서 떨어서 165로 하향 - Servo_Jitter_Test로 확인)
+#define PUSH_ANGLE             70   // 배출(푸시) 각도 (실측 확정값) - 대기(165)에서 이 값까지 "감소"하며 이동함에 주의
 #define SWEEP_STEP_DELAY_MS    10   // 1도 이동마다 대기 (실측 확정값)
 #define RETURN_DELAY_MS       400   // 복귀 명령 후 실제 도달까지 대기
 #define DISPENSE_HOLD_MS      400   // 푸시 각도 도달 후 유지 시간
@@ -467,6 +490,7 @@ const uint8_t IR_PIN[2][4] = {
 #define IR_DETECT_LEVEL       LOW   // 센서가 "감지됨(빔 끊김)"일 때 주는 레벨 (실측 후 조정)
 #define BREAKAWAY_KICK_DEG      4   // 스윕 시작 시 정지마찰을 넘기기 위한 초기 킥 각도 (대기->푸시 방향, 즉 감소 방향으로 킥)
 #define BREAKAWAY_SETTLE_MS    60   // 킥 이동 후 실제 도달까지 대기
+#define SERVO_STARTUP_STAGGER_MS 200 // 부팅 시 서보를 한 채널씩 순서대로 홈으로 보낼 때 채널 사이 간격 (돌입전류 분산용, 8개 x 200ms = 약 1.6초)
 
 // ---- [브레이크빔(송신부/수신부 분리형) 센서 판정 파라미터] ----
 // 키캡이 정확히 언제 떨어질지 알 수 없음(서보가 180도까지 도는 도중일 수도,
@@ -486,7 +510,7 @@ const uint8_t IR_PIN[2][4] = {
 // 0 = 이 보드는 센서가 전혀 없음, DS_WAIT_IR 단계에서 핀을 읽지 않고 무조건 성공(idle) 처리
 // 아래 IR_INSTALLED 배열로 레일 단위 세부 제어를 하므로, 이 매크로는
 // "이 보드에 센서 배선이 하나라도 있는가"만 나타내는 최상위 스위치임.
-// ※ 이 보드(NS)의 현재 기본값: 1 (레일 일부에 브레이크빔 IR 센서 배선됨)
+// ※ 이 보드(PJ)의 현재 값: 0 (센서 미배선 - 배출 후 무조건 성공 처리)
 #define IR_SENSOR_INSTALLED 0
 
 // ---- [레일별 IR 센서 배선 여부] ----
@@ -495,7 +519,7 @@ const uint8_t IR_PIN[2][4] = {
 // 폴링+디바운스 판정을 하고, false인 레일은 핀을 읽지 않고 즉시 성공 처리함
 // (플로팅 핀을 실수로 읽어서 오판정하는 일을 방지). 배선이 추가될 때마다
 // 이 표만 갱신하면 됨 - IR_PIN 배열과 인덱스([글자슬롯][색상슬롯])가 동일하게 대응.
-// ※ 현재 배선 완료: N_r 1개 레일만 (IR_INSTALLED[0][0], 수신부 신호선을 핀 2에 연결)
+// ※ 현재 배선 완료: 없음 (센서는 EI 보드의 E_r에만 배선됨)
 const bool IR_INSTALLED[2][4] = {
   {false, false, false, false},  // 이 보드는 센서 미배선
   {false, false, false, false}
@@ -750,9 +774,12 @@ void setup() {
   pwm.begin();
   pwm.setPWMFreq(50);
   delay(50);
+  // 8개를 동시에 움직이면 돌입전류로 전압이 순간 떨어질 수 있어서,
+  // 한 채널씩 SERVO_STARTUP_STAGGER_MS 간격을 두고 순서대로 홈으로 보냄.
   for (int l = 0; l < 2; l++) {
     for (int c = 0; c < 4; c++) {
       moveServoAngle(SERVO_CHANNEL[l][c], SERVO_HOME_ANGLE);
+      delay(SERVO_STARTUP_STAGGER_MS);
     }
   }
 
