@@ -97,7 +97,8 @@ restock 처리 (신규):
   - DobotLink.exe 실행 중이어야 함
   - .env에 MQTT_HOST/PORT/USER/PASS, MQTT_TOPIC, FLASK_BASE_URL
   - pip install DobotRPC opencv-python numpy (Python 3.9 환경 - venv-dobot)
-  - calibrate_camera.py로 CAMERA_ROI/COLOR_RANGES_HSV 먼저 확정할 것
+  - 좌표/컨베이어/카메라/HSV 등 튜닝값은 전부 board_config.py에서 수정
+    (CAMERA_ROI/COLOR_RANGES_HSV는 camera.py로 확인 후 board_config.py에 반영)
 =====================================================================
 """
 
@@ -154,100 +155,24 @@ FAULT_RETRY_MAP = {
 # 자동으로 열림)가 이미 처리하고 있어서 별도 대응 불필요.
 TRACKED_FAULTS = set(FAULT_RETRY_MAP)
 
-DOBOT_PORT = "COM3"   # 팔 + 컨베이어(Magic Box) 공유 포트
 NAMESPACE_ARM = "MagicianLite"
 NAMESPACE_BOX = "MagicBox"
-
-# =================================================================
-# CONFIG - 로봇암 좌표
-# 색당 5개×4줄(대각선 배치, 줄마다 X/Y가 다름) 적재. row0=제일 가까운 줄 ~
-# row3=제일 먼 줄, 픽업은 가까운 줄부터 5개 다 빈 다음 다음 줄로(compute_pick_pose 참고).
-# =================================================================
-ROW_CAPACITY = 5      # 줄 하나당 최대 적재 개수
-NUM_ROWS = 4           # 줄 개수 (0=제일 가까운 줄 ~ 3=제일 먼 줄)
-TOTAL_CAPACITY = ROW_CAPACITY * NUM_ROWS  # 색상당 전체 용량 (20)
-
-# 색상별 [row0, row1, row2, row3] - 각 원소는 (x, y, base_z, r), base_z는
-# 그 줄에 1개 남았을 때 기준. Y/Z는 대체로 4줄 공통값(측정 노이즈 평탄화), X는
-# 줄마다 다름. red/yellow row3만 개별 실측값(도달범위 문제로 카트리지 재조정 후 측정).
-PICK_POSE_ROWS = {
-    "red":    [(229.4263, 190, -38, 41), (255.1454, 190, -38, 38),
-               (290.2512, 190, -38, 35), (320.1271, 165.9958, -37.1079, 27.3997)],
-    "green":  [(240.0187, 85, -38, 20), (267.8990, 85, -38, 20),
-               (296.3269, 85, -38, 20), (326.5881, 66.0017, -38, 20)],
-    "blue":   [(245.9397, -0.5, -38, 0.5), (271.3919, -0.5, -38, 0.5),
-               (298.0619, -0.5, -38, 0.5), (325.5233, -28.8626, -38, 0.5)],
-    "yellow": [(253.0182, -100, -38, -20), (279.8343, -100, -38, -18),
-               (303.9048, -100, -38, -16), (332.5840, -121.5756, -37.2979, -20.0798)],
-}
-BOARD_THICKNESS_MM = 20.0
-
-PLACE_POSE = (-116.6558, -294.7615, 28.6249, -111.5918)
-CAMERA_CHECK_POSE = (-97.5224, -229.2938, 58.3063, -113.0408)
-HOME_POSE = (239.9906, -5.5209, 84.0930, 0.7622)
-# 픽업 위치가 멀 때(red row3 등) PLACE_POSE로 한 번에 이동하면 명령이 씹히는
-# 문제가 있어서, 이 지점을 경유해 이동을 두 구간으로 나눔(특이자세/joint리밋 추정).
-WARMUP_POSE = (296.3269, 85.0, 2.0, 20.0)
-
-# =================================================================
-# CONFIG - 트레이 컨베이어
-# 물리적으로 벨트 2개(STP1/STP2)를 이어붙여 "하나의 긴 벨트"로 씀 - 이 두 모터는
-# section1이든 section2든 항상 같이 구동/정지함.
-#   section1: keycap_packed 감지 시 구동 - 보드 로봇암 앞까지 이동
-#   section2: board_packed  감지 시 구동 - 픽업대까지 이동
-# =================================================================
-TRAY_CONVEYOR_STP_1 = 0   # Magic Box STP1 포트
-TRAY_CONVEYOR_STP_2 = 1   # Magic Box STP2 포트 (벨트 2개 실배선 반영, 2026-09-18)
-TRAY_CONVEYOR_SPEED_MM_S = 50
-
-TRAY_CONVEYOR_RUN_TIME_SECTION1 = 11.0   # keycap_packed -> 보드 로봇암 앞까지
-TRAY_CONVEYOR_RUN_TIME_SECTION2 = 6.5   # board_packed -> 픽업대까지
-
-# =================================================================
-# CONFIG - 이동 타이밍 (pydobot 버전 검증값 참고)
-# =================================================================
-MOVE_WAIT_SEC = 2.0          # 대부분의 이동에 쓰는 기본 대기시간
-PRECISION_MOVE_WAIT_SEC = 3.0  # 정밀 접촉이 필요한 이동(픽업/놓기) 전용 - 짧으면 흡착 실패
-CAMERA_MOVE_WAIT_SEC = 4.0    # 카메라 체크 위치 이동 전용 - 이동거리가 커서 여유있게
-HOME_MOVE_WAIT_SEC = 5.0      # 카메라 체크 위치 -> HOME 복귀 전용 - 이동거리+R회전 모두 커서 여유있게
-SUCTION_SETTLE_DELAY = 1.0   # 흡착력 형성 대기
-RELEASE_SETTLE_DELAY = 0.5
-SAFE_LIFT_MM = 40.0
-
-BOARD_COLORS = ["red", "yellow", "blue", "green"]
 CALL_TIMEOUT = 5
 
-# =================================================================
-# CONFIG - 카메라 배치 확인
-# 카메라는 로봇암에 장착돼있음 - 보드를 놓은 직후 CAMERA_CHECK_POSE로 이동해서
-# 그 자리에서 확인(별도 고정 웹캠 아님). ⚠️ CAMERA_ROI 재보정 필요 - 카메라
-# 위치가 바뀌었는데 아래 값은 예전(고정 웹캠 기준) 값 그대로임.
-# =================================================================
-CAMERA_INDEX_PREFERENCE = [1]  # USB 재연결마다 인덱스가 바뀌는 문제 대응 -
-                                          # 순서대로 시도해서 처음 성공하는 장치를 씀
-CAMERA_ROI = (200, 150, 150, 100)  # (x, y, w, h) - ⚠️ 재보정 필요, 위 주석 참고
-CAMERA_PRESENCE_MIN_RATIO = 0.5   # 실측: 보드 최소 0.72, 빈 배경 최대 0.13 (2026-09-30, 임시 트레이 기준)
-CAMERA_SETTLE_DELAY = 0.5   # 사진 찍기 전 대기
-CAMERA_WARMUP_FRAMES = 5    # 열자마자 읽은 프레임은 자동노출 적응 전이라 어두움 - 앞 N장 버림
-
-SAVE_CAMERA_IMAGE = True     # 확인마다 캡처 이미지를 파일로 저장 (가벼움, 항상 켜둬도 무방)
-SHOW_CAMERA_WINDOW = False   # cv2.imshow로 짧게 띄우기 (모니터 붙은 환경에서만)
-CAMERA_IMAGE_DIR = r"C:\Users\dusdn\warehouse-flask\board_camera_capture_log"
-CAMERA_WINDOW_MS = 800       # 창 띄우는 시간(ms) - 이 동안 메인 루프 블로킹됨
-
-# H:S:V 순서 실측값 (2026-09-30, 로봇암 장착 카메라, CAMERA_CHECK_POSE 기준)
-# yellow(47,30,214) green(66,36,218) blue(99,144,255) red/핑크(147,57,219).
-# 노랑/초록 채도(S)가 30대로 매우 낮아서 S 하한을 15로 내림 - 흰 트레이 배경이
-# 노랑/초록으로 잡힐 위험이 있으니 'c' 키 판정 테스트로 꼭 확인할 것.
-# 노랑(47)/초록(66) 경계는 중간값 56/57로 나눔.
-COLOR_RANGES_HSV = {
-    "yellow": [((35, 15, 150), (56, 255, 255))],
-    "green":  [((57, 15, 150), (85, 255, 255))],
-    "blue":   [((86, 30, 150), (130, 255, 255))],
-    "red":    [((135, 30, 150), (179, 255, 255))],
-}
-
-# =================================================================
+# 튜닝값(좌표/컨베이어/타이밍/카메라/HSV)은 전부 board_config.py에 있음
+from board_config import (
+    DOBOT_PORT,
+    PICK_POSE_ROWS, PLACE_XYZ, CAMERA_CHECK_XYZ, HOME_XYZ, HOME_WRIST_DEG, SAFE_LIFT_MM,
+    MOVE_WAIT_SEC, PRECISION_MOVE_WAIT_SEC, CAMERA_MOVE_WAIT_SEC, HOME_MOVE_WAIT_SEC,
+    SUCTION_SETTLE_DELAY, RELEASE_SETTLE_DELAY,
+    POSITION_TOLERANCE_MM, POSITION_TOLERANCE_DEG,
+    TRAY_CONVEYOR_STP_1, TRAY_CONVEYOR_STP_2, TRAY_CONVEYOR_SPEED_MM_S,
+    TRAY_CONVEYOR_RUN_TIME_SECTION1, TRAY_CONVEYOR_RUN_TIME_SECTION2,
+    CAMERA_INDEX_PREFERENCE, CAMERA_ROI, CAMERA_PRESENCE_MIN_RATIO, CAMERA_SETTLE_DELAY,
+    CAMERA_WARMUP_FRAMES, SAVE_CAMERA_IMAGE, SHOW_CAMERA_WINDOW, CAMERA_WINDOW_MS,
+    CAMERA_IMAGE_DIR, COLOR_RANGES_HSV,
+    BOARD_COLORS, compute_pick_pose, wrist_of, r_for, arc_midpoint, needs_midpoint, _wrap_deg,
+)
 
 _MM_TO_PULSE = (360.0 / 1.8 * 5.0 * 16.0) / (3.1415926535898 * 32)
 
@@ -524,13 +449,6 @@ async def move_and_wait(arm_api, pose, label="", wait_sec=None):
     return is_ok(moved), actual
 
 
-# 픽업 위치 이동 / 트레이 하강, 이 두 정밀 구간만 GetPose로 실제 도착 여부
-# 확인(명령이 True로 접수돼도 실제로 안 움직이는 경우가 있어서). 그 외 구간은
-# 기존처럼 결과 확인 안 함 - pydobot 스타일 트레이드오프 유지.
-POSITION_TOLERANCE_MM = 2.0
-POSITION_TOLERANCE_DEG = 2.0
-
-
 def _position_matches(actual, target_pose):
     if not isinstance(actual, dict):
         return False
@@ -539,7 +457,7 @@ def _position_matches(actual, target_pose):
         dx = abs(actual.get("x", 0) - tx)
         dy = abs(actual.get("y", 0) - ty)
         dz = abs(actual.get("z", 0) - tz)
-        dr = abs(actual.get("r", 0) - tr)
+        dr = abs(_wrap_deg(actual.get("r", 0) - tr))
     except TypeError:
         return False
     return (dx <= POSITION_TOLERANCE_MM and dy <= POSITION_TOLERANCE_MM
@@ -685,111 +603,109 @@ def verify_board_on_tray(expected_color):
 
 
 # ============================== 픽업 로직 ==============================
-def compute_pick_pose(color, count):
-    """
-    count = 해당 색상 전체 재고(0~TOTAL_CAPACITY). 줄별 재고는 따로 저장하지
-    않고, "가까운 줄(row0)부터 채워서 가까운 줄부터 빈다"는 전제로 전체
-    재고 수에서 현재 어느 줄, 그 줄에 몇 개 남았는지 역산한다.
-    예: TOTAL_CAPACITY=20, count=3 -> emptied=17 -> row_index=3(4번째 줄),
-        count_in_row=3.
-    """
-    if count <= 0:
-        raise ValueError(f"[{color}] 재고 0 이하로 픽업 위치 계산 불가 (count={count})")
+# 손목 각도 고정 규칙: 픽업 R로 손목 각도를 정하고, 이후 모든 위치는 그 손목
+# 각도를 유지한 R(r_for)로 이동 - 별도의 "제자리 R 회전" 단계 없음.
+# compute_pick_pose / r_for / arc_midpoint 등 계산식은 board_config.py에 있음.
 
-    emptied = TOTAL_CAPACITY - count
-    row_index = min(emptied // ROW_CAPACITY, NUM_ROWS - 1)
-    count_in_row = ROW_CAPACITY - (emptied % ROW_CAPACITY)
-
-    row_pose = PICK_POSE_ROWS[color][row_index]
-    if row_pose is None:
-        raise ValueError(f"[{color}] row{row_index} 좌표 미실측 (PICK_POSE_ROWS의 None 자리) - "
-                          f"실측값으로 채운 뒤 재시도할 것")
-
-    x, y, base_z, r = row_pose
-    pick_z = base_z + (count_in_row - 1) * BOARD_THICKNESS_MM
-    return (x, y, pick_z, r)
+async def travel(arm_api, from_xyz, to_xyz, wrist, label, final_wait=None):
+    """from -> to 이동. 두 점 베이스 각도 차가 크면(MIDPOINT_MIN_ANGLE_DEG 이상)
+    극좌표 중간점을 경유. 중간점 높이는 두 점 중 높은 쪽.
+    반환: 마지막 move_and_wait의 (명령성공, 실제위치)."""
+    if needs_midpoint(from_xyz[:2], to_xyz[:2]):
+        mx, my = arc_midpoint(from_xyz[:2], to_xyz[:2])
+        mz = max(from_xyz[2], to_xyz[2])
+        await move_and_wait(arm_api, (mx, my, mz, r_for(mx, my, wrist)), label=f"{label} - 중간점 경유")
+    tx, ty, tz = to_xyz
+    return await move_and_wait(arm_api, (tx, ty, tz, r_for(tx, ty, wrist)), label=label,
+                               wait_sec=final_wait)
 
 
 async def pick_and_place_board_async(arm_api, order_id, color, count):
     """
-    픽업 -> 안전 높이로 들어올림 -> 웜업 경유 이동/회전 -> 트레이로 하강 -> 놓기
-    -> 카메라로 배치 확인 -> 초기위치 복귀.
+    HOME -> (중간점) -> 픽업 위 -> 픽업 하강 -> 흡착 -> 들어올림 -> (중간점) ->
+    트레이 위 -> 하강 -> 놓기 -> 들어올림 -> 카메라 확인 위치 -> 확인 -> (중간점) -> HOME.
 
-    픽업 위치 이동 / 트레이 하강, 이 두 구간만 GetPose로 실제 도착 여부를
-    검증한다(POSITION_TOLERANCE_MM/DEG). 여기서 실패하면 카메라 확인 없이 즉시
-    board:"failed" 보고 후 반환 - 팔이 제대로 안 내려갔으면 뭘 봐도 의미 없으니까.
-    성공(board:"done")은 카메라 확인까지 통과해야만 보고한다. 그 외 구간(안전높이
-    이동 등)은 여전히 결과 확인 안 함 - pydobot 스타일 트레이드오프 유지.
+    픽업 위치 / 트레이 하강 두 구간만 GetPose로 도착 확인. 여기서 실패하면 카메라
+    확인 없이 즉시 board:"failed" 보고. 성공(board:"done")은 카메라 확인까지 통과해야만.
+
+    반환: (success, consumed)
+      consumed = 스택에서 보드를 실제로 집어 올렸는지 - 재고 차감 여부 판단용.
+      픽업 위치 도달 실패(흡착 전)만 False, 그 이후 실패는 전부 True.
     """
+    consumed = False
     try:
         pick_x, pick_y, pick_z, pick_r = compute_pick_pose(color, count)
-        place_x, place_y, place_z, place_r = PLACE_POSE
+        wrist = wrist_of(pick_x, pick_y, pick_r)
+        place_x, place_y, place_z = PLACE_XYZ
         travel_z = max(pick_z, place_z) + SAFE_LIFT_MM
-        log("ARM", f"[{color}] 픽업 좌표: ({pick_x:.1f},{pick_y:.1f},{pick_z:.1f}) / 이동 높이: {travel_z:.1f}")
+        log("ARM", f"[{color}] 픽업 좌표: ({pick_x:.1f},{pick_y:.1f},{pick_z:.1f}) R={pick_r:.1f} "
+                    f"손목={wrist:.1f} / 이동 높이: {travel_z:.1f}")
 
-        pick_move_ok, pick_actual = await move_and_wait(
-            arm_api, (pick_x, pick_y, pick_z, pick_r), label="픽업 위치로 이동",
-            wait_sec=PRECISION_MOVE_WAIT_SEC
-        )
-        if not pick_move_ok or not _position_matches(pick_actual, (pick_x, pick_y, pick_z, pick_r)):
-            log("ARM", f"픽업 위치 도달 실패 - 목표=({pick_x:.1f},{pick_y:.1f},{pick_z:.1f},{pick_r:.1f}) "
+        # HOME -> 픽업 위 (안전 높이) -> 픽업 하강
+        await travel(arm_api, (HOME_XYZ[0], HOME_XYZ[1], travel_z), (pick_x, pick_y, travel_z),
+                     wrist, "픽업 위치 위로 이동")
+        pick_target = (pick_x, pick_y, pick_z, r_for(pick_x, pick_y, wrist))
+        pick_move_ok, pick_actual = await move_and_wait(arm_api, pick_target, label="픽업 위치로 하강",
+                                                         wait_sec=PRECISION_MOVE_WAIT_SEC)
+        if not pick_move_ok or not _position_matches(pick_actual, pick_target):
+            log("ARM", f"픽업 위치 도달 실패 - 목표={tuple(round(v, 1) for v in pick_target)} "
                         f"실제={pick_actual} - 흡착 시도 안 하고 실패 처리")
             report_board_robot_arm(order_id, "failed")
-            return False
+            await travel(arm_api, (pick_x, pick_y, travel_z), HOME_XYZ, wrist, "초기위치로 복귀",
+                         final_wait=HOME_MOVE_WAIT_SEC)
+            return False, consumed
 
-        grabbed = await suck(arm_api, True)
+        await suck(arm_api, True)
         await asyncio.sleep(SUCTION_SETTLE_DELAY)
+        consumed = True   # 이 시점부터는 스택에서 보드가 빠진 것으로 간주
 
-        await move_and_wait(arm_api, (pick_x, pick_y, travel_z, pick_r), label="안전 높이로 들어올리기")
+        await move_and_wait(arm_api, (pick_x, pick_y, travel_z, r_for(pick_x, pick_y, wrist)),
+                            label="안전 높이로 들어올리기")
 
-        # red row3처럼 픽업 위치가 멀면 PLACE_POSE까지 한 번에(이동+회전 동시)
-        # 갈 때 명령이 씹히는 문제가 있어서, WARMUP_POSE를 거쳐 이동/회전을 분리.
-        await move_and_wait(arm_api, (WARMUP_POSE[0], WARMUP_POSE[1], travel_z, pick_r),
-                             label="웜업 위치로 이동 (R은 아직 pick_r 유지)")
-        await move_and_wait(arm_api, (WARMUP_POSE[0], WARMUP_POSE[1], travel_z, place_r),
-                             label="웜업 위치에서 R만 place_r로 회전")
-        await move_and_wait(arm_api, (place_x, place_y, travel_z, place_r),
-                             label="안전 높이 유지한 채 트레이 위로 이동 (R은 이미 place_r)")
-        descend_ok, descend_actual = await move_and_wait(
-            arm_api, (place_x, place_y, place_z, place_r), label="트레이 위치로 하강",
-            wait_sec=PRECISION_MOVE_WAIT_SEC
-        )
-        if not descend_ok or not _position_matches(descend_actual, (place_x, place_y, place_z, place_r)):
-            log("ARM", f"트레이 하강 도달 실패 - 목표=({place_x:.1f},{place_y:.1f},{place_z:.1f},{place_r:.1f}) "
+        # 픽업 위 -> (중간점) -> 트레이 위 -> 하강
+        await travel(arm_api, (pick_x, pick_y, travel_z), (place_x, place_y, travel_z),
+                     wrist, "트레이 위로 이동")
+        place_target = (place_x, place_y, place_z, r_for(place_x, place_y, wrist))
+        descend_ok, descend_actual = await move_and_wait(arm_api, place_target, label="트레이 위치로 하강",
+                                                          wait_sec=PRECISION_MOVE_WAIT_SEC)
+        if not descend_ok or not _position_matches(descend_actual, place_target):
+            log("ARM", f"트레이 하강 도달 실패 - 목표={tuple(round(v, 1) for v in place_target)} "
                         f"실제={descend_actual} - 흡착 끄고 실패 처리")
             report_board_robot_arm(order_id, "failed")
             try:
                 await suck(arm_api, False)
             except Exception:
                 pass
-            return False
+            await travel(arm_api, (place_x, place_y, travel_z), HOME_XYZ, wrist, "초기위치로 복귀",
+                         final_wait=HOME_MOVE_WAIT_SEC)
+            return False, consumed
 
-        released = await suck(arm_api, False)
+        await suck(arm_api, False)
         await asyncio.sleep(RELEASE_SETTLE_DELAY)
 
-        await move_and_wait(arm_api, (place_x, place_y, travel_z, place_r), label="다시 안전 높이로 들어올리기")
+        await move_and_wait(arm_api, (place_x, place_y, travel_z, r_for(place_x, place_y, wrist)),
+                            label="다시 안전 높이로 들어올리기")
 
-        # 카메라가 로봇암에 장착돼서, 보드를 놓은 직후 CAMERA_CHECK_POSE로 먼저
-        # 이동해서 그 자리에서 확인 - HOME 복귀는 확인 이후로 미룸.
-        await move_and_wait(arm_api, CAMERA_CHECK_POSE, label="카메라 체크 위치로 이동",
-                             wait_sec=CAMERA_MOVE_WAIT_SEC)
-
+        # 카메라 확인 위치로 이동 후 확인
+        await travel(arm_api, (place_x, place_y, travel_z), CAMERA_CHECK_XYZ, wrist,
+                     "카메라 체크 위치로 이동", final_wait=CAMERA_MOVE_WAIT_SEC)
         await asyncio.sleep(CAMERA_SETTLE_DELAY)
         log("ARM", "카메라로 배치 확인 중")
         verified, detected_color, reason = verify_board_on_tray(color)
         log("ARM", f"카메라 확인 결과: {reason} (감지된 색={detected_color})")
 
-        await move_and_wait(arm_api, HOME_POSE, label="초기위치로 복귀",
-                             wait_sec=HOME_MOVE_WAIT_SEC)
+        # 카메라 위치 -> (중간점) -> HOME
+        await travel(arm_api, CAMERA_CHECK_XYZ, HOME_XYZ, wrist, "초기위치로 복귀",
+                     final_wait=HOME_MOVE_WAIT_SEC)
 
         report_board_robot_arm(order_id, "done" if verified else "failed")
 
         if not verified:
             log("ARM", "카메라 확인 실패 - 실패 처리")
-            return False
+            return False, consumed
 
         log("ARM", "결과: 성공 (카메라로 배치 확인됨)")
-        return True
+        return True, consumed
 
     except Exception as e:
         log("ARM", f"예외 발생 - 실패 처리: {e}")
@@ -798,7 +714,7 @@ async def pick_and_place_board_async(arm_api, order_id, color, count):
         except Exception:
             pass
         report_board_robot_arm(order_id, "failed")
-        return False
+        return False, consumed
 
 
 # ============================== 컨베이어 로직 ==============================
@@ -862,16 +778,22 @@ def process_board_job(loop, arm_api, box_api, order_id, color):
         report_board_status(order_id, color, "busy", count=count_before)
         # board 필드 보고는 pick_and_place_board_async 내부에서 정확한 시점에
         # 이뤄짐 (위치검증 실패 시 즉시, 성공 시 카메라 확인 후)
-        success = loop.run_until_complete(pick_and_place_board_async(arm_api, order_id, color, count_before))
+        success, consumed = loop.run_until_complete(
+            pick_and_place_board_async(arm_api, order_id, color, count_before))
 
-        if not success:
-            report_board_status(order_id, color, "idle", count=count_before)
-        else:
+        if success:
             report_board_dispense(order_id, color)
+
+        # 재고: 스택에서 실제로 집어 올렸으면(consumed) 성공/실패 무관하게 -1.
+        # 픽업 위치 도달 실패(흡착 전)만 그대로 유지.
+        if consumed:
             count_after = count_before - 1
             local_stock[color] = count_after
-            report_board_status(order_id, color, "idle", count=count_after)
-            log("STOCK", f"[{color}] 재고 {count_before} -> {count_after}")
+            log("STOCK", f"[{color}] 재고 {count_before} -> {count_after}"
+                         f"{'' if success else ' (실패했지만 스택에서 빠졌으므로 차감)'}")
+        else:
+            count_after = count_before
+        report_board_status(order_id, color, "idle", count=count_after)
 
     gate_open = False
     gate_order_id = order_id
@@ -1094,6 +1016,11 @@ def main():
     log("INIT", f"연결 결과: {connect_res}")
     if not is_ok(connect_res):
         log("INIT", "연결 실패 - DobotLab 연결 끊겨있는지, DobotLink.exe 켜져있는지 확인")
+
+    # 시작 시 HOME으로 이동 (픽업 전이라 손목 각도는 HOME_WRIST_DEG)
+    hx, hy, hz = HOME_XYZ
+    loop.run_until_complete(move_and_wait(arm_api, (hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG)),
+                                          label="시작 - 초기위치로 이동", wait_sec=HOME_MOVE_WAIT_SEC))
 
     log("INIT", f"준비 완료 (픽업:{STATUS_PICK}/{STATUS_MISMATCH}, 컨베이어1:{STATUS_CONVEYOR_1}, "
                 f"컨베이어2:{STATUS_CONVEYOR_2}, 큐 {len(job_queue)}건, "

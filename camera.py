@@ -1,43 +1,31 @@
+# -*- coding: utf-8 -*-
 """
-카메라 ROI(트레이 위 보드가 보이는 영역) + 색상 범위 캘리브레이션 도구.
+카메라 ROI + 색상 범위 캘리브레이션 도구.
+카메라 번호 / ROI / HSV 범위 / 판정 기준은 전부 board_config.py에서 가져옴 -
+값을 바꾸려면 board_config.py를 수정하고 이 스크립트를 다시 켤 것
+(그러면 메인 코드에도 같은 값이 그대로 적용됨).
 
 사용법:
-  1. python camera.py
-  2. 웹캠 화면에 초록 사각형(ROI)이 보임 - 트레이 위 보드 놓이는 자리에 오도록
-     아래 ROI_X/Y/W/H 값을 수정하면서 재실행
-  3. ROI 안에 보드를 실제로 놓고, 's' 키를 눌러 그 순간의 HSV 값을 출력
-     -> 이 값들을 보고 COLOR_RANGES_HSV 범위를 4색 전부 채울 것
-  4. 다 채웠으면 'c' 눌러서 색상 판정이 잘 되는지(터미널에 색상명 출력) 확인
-     - 보드 없는 빈 트레이 상태에서도 'c' 눌러서 비율이 0.5(메인 스크립트의
-       CAMERA_PRESENCE_MIN_RATIO) 밑으로 나오는지 꼭 확인할 것
-  5. 'q'로 종료
+  1. 로봇암을 CAMERA_CHECK_XYZ 위치에 두고 python camera.py
+  2. 초록 사각형(ROI)이 트레이 위 보드 자리에 오는지 확인 -> 안 맞으면
+     board_config.py의 CAMERA_ROI 수정 후 재실행
+  3. 's': ROI 안 HSV 출력 (중앙 픽셀 + ROI 전체 중앙값)
+  4. 'c': 색상 판정 테스트 - 메인 코드와 같은 기준으로 "보드 있음/없음"까지 표시
+     보드 없는 빈 트레이에서도 꼭 눌러서 "없음"으로 나오는지 확인할 것
+  5. 'q': 종료
 
-주의: 조명이 바뀌면(특히 전시장 조명 vs 지금 테스트 환경) 범위가 달라질 수
-있음 - 전시장 가서 반드시 재보정할 것.
-여기서 확정한 ROI / COLOR_RANGES_HSV 값은 main_board_robot_arm.py의
-CAMERA_ROI / COLOR_RANGES_HSV에 똑같이 복사할 것.
+주의: 조명이 바뀌면(전시장 vs 테스트 환경) 범위가 달라질 수 있음 - 현장에서 재확인.
 """
 
 import cv2
 import numpy as np
 
-CAMERA_INDEX = 1  # 웹캠이 여러 개면 0,1,2... 바꿔가며 찾을 것
+from board_config import (
+    CAMERA_INDEX_PREFERENCE, CAMERA_ROI, COLOR_RANGES_HSV, CAMERA_PRESENCE_MIN_RATIO,
+)
 
-# ⚠️ 트레이 위 보드가 보이는 화면 영역 - 로봇암 장착 카메라 기준으로 재보정 필요
-ROI_X, ROI_Y, ROI_W, ROI_H = 200, 150, 150, 100
-
-# H:S:V 순서 실측값 (2026-09-30, 로봇암 장착 카메라, CAMERA_CHECK_POSE 기준)
-# yellow(47,30,214) green(66,36,218) blue(99,144,255) red/핑크(147,57,219).
-# 노랑/초록 채도(S)가 30대로 매우 낮아서 S 하한을 15로 내림 - 흰 트레이 배경이
-# 노랑/초록으로 잡힐 위험이 있으니 빈 트레이 상태로 'c' 판정 꼭 확인할 것.
-# 노랑(47)/초록(66) 경계는 중간값 56/57로 나눔.
-# main_board_robot_arm.py의 COLOR_RANGES_HSV와 동일값 유지할 것.
-COLOR_RANGES_HSV = {
-    "yellow": [((35, 15, 150), (56, 255, 255))],
-    "green":  [((57, 15, 150), (85, 255, 255))],
-    "blue":   [((86, 30, 150), (130, 255, 255))],
-    "red":    [((135, 30, 150), (179, 255, 255))],
-}
+CAMERA_INDEX = CAMERA_INDEX_PREFERENCE[0]
+ROI_X, ROI_Y, ROI_W, ROI_H = CAMERA_ROI
 
 
 def get_roi(frame):
@@ -62,10 +50,11 @@ def main():
     # 윈도우 기본 백엔드(MSMF)는 여는 데 5~30초씩 걸려서 DirectShow로 지정
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        print(f"카메라 {CAMERA_INDEX}를 열 수 없음 - CAMERA_INDEX 값 확인")
+        print(f"카메라 {CAMERA_INDEX}를 열 수 없음 - board_config.py의 CAMERA_INDEX_PREFERENCE 확인")
         return
 
-    print("[조작] s: 현재 ROI 중앙 픽셀 HSV 출력 / c: 색상 판정 테스트 / q: 종료")
+    print(f"[카메라 {CAMERA_INDEX}번] ROI={CAMERA_ROI} 판정기준={CAMERA_PRESENCE_MIN_RATIO}")
+    print("[조작] s: HSV 출력 / c: 색상 판정 / q: 종료")
 
     while True:
         ok, frame = cap.read()
@@ -81,17 +70,17 @@ def main():
             break
 
         elif key == ord("s"):
-            roi = get_roi(frame)
-            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            hsv = cv2.cvtColor(get_roi(frame), cv2.COLOR_BGR2HSV)
             cy, cx = hsv.shape[0] // 2, hsv.shape[1] // 2
             h, s, v = hsv[cy, cx]
-            print(f"[HSV] ROI 중앙 픽셀 = H:{h} S:{s} V:{v}  "
-                  f"(이 값 참고해서 COLOR_RANGES_HSV 범위 채울 것)")
+            mh, ms, mv = np.median(hsv.reshape(-1, 3), axis=0).astype(int)
+            print(f"[HSV] 중앙 픽셀 H:{h} S:{s} V:{v} / ROI 중앙값 H:{mh} S:{ms} V:{mv}")
 
         elif key == ord("c"):
-            roi = get_roi(frame)
-            color, ratio = classify_color(roi)
-            print(f"[판정] 감지된 색: {color}, 비율: {ratio:.2f}")
+            color, ratio = classify_color(get_roi(frame))
+            present = ratio >= CAMERA_PRESENCE_MIN_RATIO
+            print(f"[판정] 감지된 색: {color}, 비율: {ratio:.2f} -> "
+                  f"{'보드 있음' if present else '보드 없음'} (기준 {CAMERA_PRESENCE_MIN_RATIO})")
 
     cap.release()
     cv2.destroyAllWindows()

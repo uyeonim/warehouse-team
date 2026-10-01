@@ -1,34 +1,28 @@
+# -*- coding: utf-8 -*-
+"""
+트레이 놓기 확인/튜닝 - 보드를 실제로 집어서 트레이 위(안전 높이)까지 가져가 보고,
+그 자리에서 R을 +/- 해보는 도구. 튜닝값은 전부 board_config.py에서 수정.
+
+⚠️ 메인 코드는 놓는 위치 R을 직접 쓰지 않음 - 픽업 R로 정해진 손목 각도를 유지한 채
+   자동 계산함(board_config의 r_for). 이 스크립트에서 R을 바꿔보는 건 "방향이 어떻게
+   바뀌는지 확인용"이고, 메인에 반영하려면 PICK_POSE_ROWS의 픽업 R을 조정해야 함
+   (마지막에 그 환산값을 출력해줌).
+
+흐름: HOME -> 픽업 위 -> 픽업 하강 -> 흡착 -> 들어올림 -> (중간점) -> 트레이 위(안전 높이)
+      -> R 조정 루프 -> release(흡착 OFF) -> HOME
+"""
+
 import asyncio
 import time
 
 from DobotRPC import RPCClient, DobotlinkAdapter
 
-DOBOT_PORT = "COM3"
-
-# main_board_robot_arm.py와 동일한 값 - PICK_POSE_ROWS/PLACE_POSE 바뀌면 여기도 맞춰서 갱신
-PICK_POSE_ROWS = {
-    "red":    [(229.4263, 190, -38, 41), (255.1454, 190, -38, 38),
-               (290.2512, 190, -38, 35), (320.1271, 165.9958, -37.1079, 27.3997)],
-    "green":  [(240.0187, 85, -38, 20), (267.8990, 85, -38, 20),
-               (296.3269, 85, -38, 20), (326.5881, 66.0017, -38, 20)],
-    "blue":   [(245.9397, -0.5, -38, 0.5), (271.3919, -0.5, -38, 0.5),
-               (298.0619, -0.5, -38, 0.5), (325.5233, -28.8626, -38, 0.5)],
-    "yellow": [(253.0182, -100, -38, -20), (279.8343, -100, -38, -18),
-               (303.9048, -100, -38, -16), (332.5840, -121.5756, -37.2979, -20.0798)],
-}
-BOARD_THICKNESS_MM = 20.0
-BOARD_COLORS = ["red", "yellow", "blue", "green"]
-NUM_ROWS = 4          # 0=제일 가까운 줄 ~ 3=제일 먼 줄
-ROW_CAPACITY = 5       # 줄 하나당 최대 적재 개수 (입력값 범위 체크용)
-
-PLACE_POSE = (-116.6558, -294.7615, 28.6249, -111.5918)
-SAFE_LIFT_MM = 40.0
-
-HOME_POSE = (239.9906, -5.5209, 84.0930, 0.7622)  # main_board_robot_arm.py와 동일값
-# ⚠️ 2026-09-19: HOME_POSE의 실제 joint값이 [~0,-0.33,-1.18,~0]로 사실상
-# joint 전부 0인 특이 자세와 거의 같아서 웜업 용도로 못 씀(board_location_tunning.py
-# 에서 확인된 문제 그대로 적용) - 확실히 다른 joint값이 나오는 지점을 따로 둠.
-WARMUP_POSE = (296.3269, 85.0, 2.0, 20.0)
+from board_config import (
+    DOBOT_PORT, NUM_ROWS, ROW_CAPACITY, BOARD_COLORS, PLACE_XYZ, HOME_XYZ, HOME_WRIST_DEG,
+    SAFE_LIFT_MM, PRECISION_MOVE_WAIT_SEC, MOVE_WAIT_SEC, HOME_MOVE_WAIT_SEC,
+    SUCTION_SETTLE_DELAY, RELEASE_SETTLE_DELAY,
+    pick_pose_for, wrist_of, r_for, base_angle, arc_midpoint, needs_midpoint, _wrap_deg,
+)
 
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
@@ -50,13 +44,12 @@ def get_pose():
     return loop.run_until_complete(safe_call(arm_api.GetPose(portName=DOBOT_PORT, isQueued=False)))
 
 
-def move_to(x, y, z, r, wait_sec=3.0):
+def move_to(x, y, z, r, label="", wait_sec=MOVE_WAIT_SEC):
     res = loop.run_until_complete(safe_call(
         arm_api.SetPTPCmd(portName=DOBOT_PORT, ptpMode=0, x=x, y=y, z=z, r=r, isQueued=False)
     ))
-    print("이동 명령 결과:", res)
     time.sleep(wait_sec)
-    print("이동 후 실제 위치:", get_pose())
+    print(f"[{label}] 명령:{res} 목표=({x:.1f},{y:.1f},{z:.1f},{r:.1f}) 실제:{get_pose()}")
 
 
 def suck(on):
@@ -66,150 +59,127 @@ def suck(on):
     print(f"흡착 {'ON' if on else 'OFF'} 결과:", res)
 
 
-def compute_pick_pose(color, row, count_in_row):
-    x, y, base_z, r = PICK_POSE_ROWS[color][row]
-    pick_z = base_z + (count_in_row - 1) * BOARD_THICKNESS_MM
-    return (x, y, pick_z, r)
+def travel(from_xyz, to_xyz, wrist, label, final_wait=MOVE_WAIT_SEC):
+    """메인 코드의 travel()과 같은 규칙 - 각도 차 크면 극좌표 중간점 경유."""
+    if needs_midpoint(from_xyz[:2], to_xyz[:2]):
+        mx, my = arc_midpoint(from_xyz[:2], to_xyz[:2])
+        mz = max(from_xyz[2], to_xyz[2])
+        move_to(mx, my, mz, r_for(mx, my, wrist), label=f"{label} - 중간점 경유")
+    tx, ty, tz = to_xyz
+    move_to(tx, ty, tz, r_for(tx, ty, wrist), label=label, wait_sec=final_wait)
 
 
 def parse_row_count(raw):
-    """'0/4' -> (row=0, count_in_row=4). 형식/범위 안 맞으면 None 반환."""
     parts = raw.strip().split("/")
     if len(parts) != 2:
         return None
     try:
-        row = int(parts[0])
-        count_in_row = int(parts[1])
+        row, cnt = int(parts[0]), int(parts[1])
     except ValueError:
         return None
-    if not (0 <= row < NUM_ROWS):
-        print(f"줄 번호는 0~{NUM_ROWS - 1} 범위")
+    if not (0 <= row < NUM_ROWS) or not (1 <= cnt <= ROW_CAPACITY):
         return None
-    if not (1 <= count_in_row <= ROW_CAPACITY):
-        print(f"개수는 1~{ROW_CAPACITY} 범위")
-        return None
-    return row, count_in_row
+    return row, cnt
+
+
+def disconnect():
+    loop.run_until_complete(safe_call(arm_api.DisconnectDobot(portName=DOBOT_PORT)))
+    print("연결 해제 완료")
 
 
 def main():
     connect_res = loop.run_until_complete(safe_call(arm_api.ConnectDobot(portName=DOBOT_PORT)))
     print("연결 결과:", connect_res)
-    print("\n현재 위치:", get_pose())
+    print("현재 위치:", get_pose())
 
-    # board_location_tunning.py와 동일 이유 - joint 전부 0(또는 그에 준하는)
-    # 특이 자세에서 멀리 있는 목표로 바로 가면 명령은 접수되는데 실제로는
-    # 안 움직이는 문제 대응.
-    print(f"\nHOME_POSE{HOME_POSE}로 이동")
-    move_to(*HOME_POSE)
-    print(f"웜업 이동 - WARMUP_POSE{WARMUP_POSE}로 한 번 거침 (특이 자세 탈출용)")
-    move_to(*WARMUP_POSE)
+    hx, hy, hz = HOME_XYZ
+    move_to(hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG), label="초기위치로 이동", wait_sec=HOME_MOVE_WAIT_SEC)
 
     color = input("\n픽업할 색깔 (red/yellow/blue/green): ").strip().lower()
     if color not in BOARD_COLORS:
-        print(f"알 수 없는 색상 - {BOARD_COLORS} 중 하나 입력")
-        return
+        print(f"알 수 없는 색상 - {BOARD_COLORS} 중 하나")
+        return disconnect()
 
-    raw = input(f"줄/개수 (예: 0/4, 줄 0~{NUM_ROWS - 1}, 개수 1~{ROW_CAPACITY}): ").strip()
-    parsed = parse_row_count(raw)
+    parsed = parse_row_count(input(f"줄/개수 (예: 0/4, 줄 0~{NUM_ROWS - 1}, 개수 1~{ROW_CAPACITY}): "))
     if parsed is None:
         print("형식이 안 맞음")
-        return
-    row, count_in_row = parsed
+        return disconnect()
+    row, cnt = parsed
 
-    pick_x, pick_y, pick_z, pick_r = compute_pick_pose(color, row, count_in_row)
-    place_x, place_y, place_z, place_r = PLACE_POSE
-    travel_z = max(pick_z, place_z) + SAFE_LIFT_MM
+    px, py, pz, pr = pick_pose_for(color, row, cnt)
+    wrist = wrist_of(px, py, pr)
+    place_x, place_y, place_z = PLACE_XYZ
+    travel_z = max(pz, place_z) + SAFE_LIFT_MM
 
-    print(f"\n[{color}] 줄{row}/{count_in_row}개 -> 픽업 위치: ({pick_x:.1f},{pick_y:.1f},{pick_z:.1f},{pick_r:.1f})")
-    confirm = input("이 위치로 이동할까요? (y/n): ").strip().lower()
-    if confirm != "y":
+    print(f"\n[{color}] 줄{row}/{cnt}개 -> 픽업 ({px:.1f},{py:.1f},{pz:.1f}) R={pr:.1f} 손목={wrist:.1f}")
+    if input("이 위치로 이동할까요? (y/n): ").strip().lower() != "y":
         print("취소")
-        loop.run_until_complete(safe_call(arm_api.DisconnectDobot(portName=DOBOT_PORT)))
-        return
-    move_to(pick_x, pick_y, pick_z, pick_r)
+        return disconnect()
 
+    travel((hx, hy, travel_z), (px, py, travel_z), wrist, "픽업 위치 위로 이동")
+    move_to(px, py, pz, r_for(px, py, wrist), label="픽업 위치로 하강", wait_sec=PRECISION_MOVE_WAIT_SEC)
     suck(True)
-    time.sleep(1.0)
+    time.sleep(SUCTION_SETTLE_DELAY)
+    move_to(px, py, travel_z, r_for(px, py, wrist), label="안전 높이로 들어올리기")
 
-    move_to(pick_x, pick_y, travel_z, pick_r)
-
-    # ⚠️ 2026-09-19: red row3처럼 도달거리가 먼 픽업 위치에서 PLACE_POSE(반대쪽)로
-    # 바로 이동하면 명령은 True로 접수되는데 실제로는 전혀 안 움직이는 문제
-    # 확인됨(board_location_tunning.py에서 확인된 것과 같은 패턴) - 중간에
-    # WARMUP_POSE의 X,Y를 한 번 거쳐서 극단적인 이동을 두 구간으로 나눔.
-    print(f"\n웜업 경유 - WARMUP_POSE X,Y({WARMUP_POSE[0]:.1f},{WARMUP_POSE[1]:.1f})")
-    move_to(WARMUP_POSE[0], WARMUP_POSE[1], travel_z, pick_r)
-
-    print(f"\nPLACE_POSE X,Y({place_x:.1f},{place_y:.1f})까지만 이동 - 놓기 직전(z={place_z:.1f})까지는 안 내려감, "
-          f"안전 높이({travel_z:.1f})에서 멈춤.")
-    confirm = input("트레이 위치로 이동할까요? (y/n): ").strip().lower()
-    if confirm != "y":
-        print("취소 - 흡착 끄고 종료")
+    print(f"\n트레이 위({place_x:.1f},{place_y:.1f}) 안전 높이({travel_z:.1f})까지 이동 - 하강은 안 함")
+    if input("트레이 위치로 이동할까요? (y/n): ").strip().lower() != "y":
+        print("취소 - 흡착 끄고 종료 (지금 높이에서 떨어짐)")
         suck(False)
-        loop.run_until_complete(safe_call(arm_api.DisconnectDobot(portName=DOBOT_PORT)))
-        return
-    move_to(place_x, place_y, travel_z, pick_r)
+        return disconnect()
+    travel((px, py, travel_z), (place_x, place_y, travel_z), wrist, "트레이 위로 이동")
 
-    current_r = pick_r
-    step = 1.0  # 기본 스텝(도) - "step 0.5" 입력으로 변경 가능
-    print("\n이제부터 R값만 바꿔가며 방향 튜닝 (X,Y,Z는 고정, R만 제자리 회전).")
-    print("  +        -> R을 현재 스텝만큼 증가")
-    print("  -        -> R을 현재 스텝만큼 감소")
-    print("  +5 / -5  -> 그 숫자만큼만 1회 증가/감소 (스텝 값은 안 바뀜)")
-    print("  step 0.5 -> 이후 +/- 의 기본 스텝을 0.5도로 변경")
-    print("  31.9158  -> 그 값으로 절대 이동")
-    print("  release  -> 흡착 끄고 종료 (이 높이에서 바로 떨어짐, 주의)")
+    current_r = r_for(place_x, place_y, wrist)
+    step = 1.0
+    print("\nR만 바꿔가며 방향 확인 (X,Y,Z 고정).")
+    print("  +        -> 스텝만큼 증가 / -        -> 스텝만큼 감소")
+    print("  +5 / -5  -> 그만큼 1회 증감 / step 0.5 -> 기본 스텝 변경")
+    print("  숫자     -> 그 R로 절대 이동 / release  -> 흡착 끄고 종료 (이 높이에서 떨어짐)")
     while True:
-        cmd = input(f"\n현재 R={current_r:.4f} (스텝={step}) / 명령 입력: ").strip().lower()
+        cmd = input(f"\n현재 R={current_r:.4f} (스텝={step}) / 명령: ").strip().lower()
 
         if cmd == "release":
-            confirm = input(f"정말 여기(z={travel_z:.1f}, 안전 높이)에서 흡착을 끌까요? "
-                             f"보드가 이 높이에서 떨어집니다. (y/n): ").strip().lower()
-            if confirm == "y":
+            if input(f"z={travel_z:.1f}에서 흡착을 끌까요? 보드가 떨어집니다. (y/n): ").strip().lower() == "y":
                 break
-            print("취소 - R 튜닝 계속")
             continue
 
         if cmd.startswith("step"):
             parts = cmd.split()
-            if len(parts) == 2:
-                try:
-                    step = float(parts[1])
-                    print(f"스텝을 {step}도로 변경")
-                except ValueError:
-                    print("사용법: step 0.5")
-            else:
+            try:
+                step = float(parts[1])
+                print(f"스텝을 {step}도로 변경")
+            except (IndexError, ValueError):
                 print("사용법: step 0.5")
             continue
 
-        if cmd == "+":
-            new_r = current_r + step
-        elif cmd == "-":
-            new_r = current_r - step
-        elif cmd.startswith("+") or cmd.startswith("-"):
-            # "+5" / "-5" - 그 값만큼 1회 가감 (스텝 자체는 안 바뀜)
-            try:
-                delta = float(cmd)
-            except ValueError:
-                print("숫자, +, -, +숫자, -숫자, 'step 숫자', 'release' 중 하나만 입력 가능")
-                continue
-            new_r = current_r + delta
-        else:
-            try:
+        try:
+            if cmd == "+":
+                new_r = current_r + step
+            elif cmd == "-":
+                new_r = current_r - step
+            elif cmd.startswith(("+", "-")):
+                new_r = current_r + float(cmd)
+            else:
                 new_r = float(cmd)
-            except ValueError:
-                print("숫자, +, -, +숫자, -숫자, 'step 숫자', 'release' 중 하나만 입력 가능")
-                continue
+        except ValueError:
+            print("숫자, +, -, +숫자, -숫자, 'step 숫자', 'release' 중 하나")
+            continue
 
-        move_to(place_x, place_y, travel_z, new_r)
+        move_to(place_x, place_y, travel_z, new_r, label="R 조정")
         current_r = new_r
 
     suck(False)
-    print(f"\n최종 R값: {current_r:.4f}  -> PLACE_POSE의 R 자리에 이 값 반영할 것")
+    time.sleep(RELEASE_SETTLE_DELAY)
 
-    print("\n종료 중...")
-    loop.run_until_complete(safe_call(arm_api.DisconnectDobot(portName=DOBOT_PORT)))
-    print("연결 해제 완료")
+    final_wrist = _wrap_deg(current_r - base_angle(place_x, place_y))
+    suggested_pick_r = _wrap_deg(base_angle(px, py) + final_wrist)
+    print(f"\n최종 R={current_r:.4f} (손목 {final_wrist:.2f}도)")
+    print(f"-> 메인 코드에 이 방향을 반영하려면 PICK_POSE_ROWS['{color}'][{row}]의 R을 "
+          f"{suggested_pick_r:.4f}로 바꾸면 됨 (현재 {pr:.4f})")
+
+    travel((place_x, place_y, travel_z), HOME_XYZ, final_wrist, "초기위치로 복귀",
+           final_wait=HOME_MOVE_WAIT_SEC)
+    disconnect()
 
 
 if __name__ == "__main__":
