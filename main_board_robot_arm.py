@@ -39,7 +39,8 @@ pickup 게이트) 패턴과 동일하게 맞춤:
     열려있는 상태로 즉시 통과함. 수동 테스트 대비 안전장치로 유지.
     픽업+컨베이어 직후(성공/실패 무관) 잠그고, pickup_reached 이후 상태가
     되거나 목록에서 사라지면 열림 (/gate/board/*)
-    ⚠️ GATE_OPEN_STATUSES 철자/unclaimed 포함 여부 플랫폼팀 확인 필요.
+    GATE_OPEN_STATUSES 철자/unclaimed 포함 - 플랫폼 문서(Mobius CNT·CIN 구조 정리,
+    2026-10-02) 2-2 status 표와 일치 확인됨.
 
 fault 처리 - 우리가 관리하는 fault 3종만:
     board_pack_failed / tray_01_belt_jammed / tray_02_belt_jammed
@@ -109,6 +110,7 @@ import math
 import os
 import queue
 import time
+import uuid
 
 import cv2
 import numpy as np
@@ -137,6 +139,14 @@ if not FLASK_BASE_URL:
     raise RuntimeError(".env에 FLASK_BASE_URL이 비어있음")
 FLASK_BASE_URL = FLASK_BASE_URL.rstrip("/")
 REPORT_TIMEOUT = 5
+
+# Mobius 직접 조회용 (재부팅 복구 때 cnt_board_robot_arm 최신 보고 확인) - 없으면 그 확인만 건너뜀
+COSS_BASE_URL = os.getenv("COSS_BASE_URL")
+AE_NAME = os.getenv("AE_NAME")
+COSS_API_KEY = os.getenv("COSS_API_KEY")
+COSS_LECTURE = os.getenv("COSS_LECTURE")
+COSS_CREATOR = os.getenv("COSS_CREATOR")
+COSS_ORIGIN = os.getenv("ORIGIN")
 
 STATUS_PICK = "tray_reached"           # 보드 픽업 트리거
 STATUS_MISMATCH = "board_mismatched"   # 재출고 트리거 - tray_reached와 같은 핸들러로 처리
@@ -431,6 +441,38 @@ def clear_gate_on_server():
         log("GATE", f"서버 게이트 해제 실패: {e}")
 
 
+# ---- Mobius 직접 조회 ----
+def fetch_latest_board_robot_arm():
+    """cnt_robot_arm/cnt_board_robot_arm 최신 CIN의 con(dict) - 플랫폼이 board_packed 판단에
+    쓰는 원본. .env에 COSS 값이 없거나 조회 실패면 None (판단 근거 없음)."""
+    if not all([COSS_BASE_URL, AE_NAME, COSS_API_KEY, COSS_LECTURE, COSS_CREATOR, COSS_ORIGIN]):
+        log("MOBIUS", ".env에 COSS 값이 없어 cnt_board_robot_arm 조회 생략")
+        return None
+    url = f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/cnt_robot_arm/cnt_board_robot_arm/la"
+    headers = {
+        "X-API-KEY": COSS_API_KEY,
+        "X-AUTH-CUSTOM-LECTURE": COSS_LECTURE,
+        "X-AUTH-CUSTOM-CREATOR": COSS_CREATOR,
+        "Accept": "application/json",
+        "X-M2M-RI": str(uuid.uuid4()),
+        "X-M2M-RVI": "3",
+        "X-M2M-Origin": COSS_ORIGIN,
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=REPORT_TIMEOUT)
+        if resp.status_code != 200:
+            log("MOBIUS", f"cnt_board_robot_arm 최신 CIN 조회 실패 ({resp.status_code})")
+            return None
+        con = resp.json().get("m2m:cin", {}).get("con")
+        for _ in range(2):   # 이중 인코딩 대비 최대 2회 파싱
+            if isinstance(con, str):
+                con = json.loads(con)
+        return con if isinstance(con, dict) else None
+    except Exception as e:
+        log("MOBIUS", f"cnt_board_robot_arm 조회 에러: {e}")
+        return None
+
+
 # ============================== DobotRPC 공용 헬퍼 ==============================
 async def safe_call(coro, timeout_sec=CALL_TIMEOUT):
     try:
@@ -491,7 +533,7 @@ async def move_and_wait(arm_api, pose, label="", settle_sec=0.0):
         await asyncio.sleep(settle_sec)
 
     elapsed = time.time() - started
-    status = f"도착 {elapsed:.1f}초" if arrived else f"⚠️ 도착 실패({elapsed:.1f}초)"
+    status = f"도착 {elapsed:.1f}초" if arrived else f"!! 도착 실패({elapsed:.1f}초)"
     if resends:
         status += f", 재전송 {resends}회"
     log("ARM", f"{label} - 명령:{moved}, {status}, 목표=({x:.1f},{y:.1f},{z:.1f},{r:.1f}), 실제위치:{actual}")
@@ -981,6 +1023,16 @@ def check_startup_recovery(loop, arm_api, box_api, orders):
         # 처리함 표시 - 안 하면 같은 스냅샷의 새 주문 감지(handle_snapshot 5단계)가
         # 아직 tray_reached인 이 주문을 또 큐에 넣어서 게이트 열릴 때 중복 픽업함
         mark_processed(build_job_key(gate_order_id, color, status, order.get("retry")))
+
+        # done 보고 후 플랫폼이 board_packed로 넘기기 전에 재부팅된 경우 - 이미 성공한
+        # 주문이라 다시 집으면 안 됨. tray_reached일 때만 (board_mismatched는 done 보고
+        # 후에도 재투입이 필요한 상태라 그대로 재시도)
+        if status == STATUS_PICK:
+            last = fetch_latest_board_robot_arm()
+            if last and last.get("order_id") == gate_order_id and last.get("board") == "done":
+                log("GATE", f"재부팅 복구: {gate_order_id} done 보고 확인됨 - 재시도 안 함, 플랫폼 전이 대기")
+                return
+
         log("GATE", f"재부팅 복구: {gate_order_id} 재시도")
         process_board_job(loop, arm_api, box_api, gate_order_id, color)
 

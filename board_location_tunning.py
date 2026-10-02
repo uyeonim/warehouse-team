@@ -105,7 +105,7 @@ def move_to(x, y, z, r, label="", settle_sec=0.0):
     if arrived and settle_sec > 0:
         time.sleep(settle_sec)
     elapsed = time.time() - started
-    status = f"도착 {elapsed:.1f}초" if arrived else f"⚠️ 도착 실패({elapsed:.1f}초)"
+    status = f"도착 {elapsed:.1f}초" if arrived else f"!! 도착 실패({elapsed:.1f}초)"
     if resends:
         status += f", 재전송 {resends}회"
     print(f"[{label}] 명령:{res} {status} 목표=({x:.1f},{y:.1f},{z:.1f},{r:.1f}) 실제:{actual}")
