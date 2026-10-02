@@ -65,7 +65,7 @@ fault 처리 - 우리가 관리하는 fault 3종만:
 
 restock 처리 (신규):
   관리자페이지 버튼 -> 플랫폼이 cnt_process 최상위(orders 밖)에
-  board_restock: ["blue", "red"] 형태로 push (물리적으로 이미 다음 스택
+  board_restock: ["b", "r"] 색 코드 형태로 push (물리적으로 이미 다음 스택
   교체가 끝났다는 확인 신호로 간주) -> 우리가 감지해서 색상마다
   POST /restock/board/<color> 호출 -> Flask가 pool에서 실제로 차감하며
   채우고 그 결과(filled)를 반환 -> local_stock 갱신.
@@ -1009,8 +1009,17 @@ def prune_dead_jobs_from_queue(orders):
 
 
 # ---- restock: board_restock 배열 감지해서 즉시 처리 (큐/게이트 무관) ----
+BOARD_CODE_TO_COLOR = {"r": "red", "y": "yellow", "g": "green", "b": "blue"}
+
+
 def check_board_restock(data):
-    board_restock = [c for c in (data.get("board_restock") or []) if c in BOARD_COLORS]
+    # 플랫폼은 색 코드(["b","r"])로 보냄 - 내부(handled_restock, /restock/board/<color>)는
+    # 전체 이름이라 여기서 변환. 전체 이름("blue")으로 와도 그대로 받음.
+    board_restock = []
+    for c in (data.get("board_restock") or []):
+        color = BOARD_CODE_TO_COLOR.get(c, c)
+        if color in BOARD_COLORS and color not in board_restock:
+            board_restock.append(color)
 
     for color in board_restock:
         if color not in handled_restock:
