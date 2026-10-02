@@ -21,7 +21,8 @@ from DobotRPC import RPCClient, DobotlinkAdapter
 
 from board_config import (
     DOBOT_PORT, NUM_ROWS, ROW_CAPACITY, BOARD_COLORS, HOME_XYZ, HOME_WRIST_DEG, SAFE_LIFT_MM,
-    PRECISION_MOVE_WAIT_SEC, MOVE_WAIT_SEC, HOME_MOVE_WAIT_SEC,
+    MOVE_TIMEOUT_SEC, MOVE_POLL_INTERVAL_SEC, PRECISION_SETTLE_SEC,
+    MOVE_STABLE_MM, MOVE_STABLE_DEG, MOVE_RESEND_AFTER_SEC, MOVE_MAX_RESEND,
     POSITION_TOLERANCE_MM, POSITION_TOLERANCE_DEG,
     pick_pose_for, wrist_of, r_for, arc_midpoint, needs_midpoint, _wrap_deg,
 )
@@ -46,17 +47,7 @@ def get_pose():
     return loop.run_until_complete(safe_call(arm_api.GetPose(portName=DOBOT_PORT, isQueued=False)))
 
 
-def move_to(x, y, z, r, label="", wait_sec=MOVE_WAIT_SEC):
-    res = loop.run_until_complete(safe_call(
-        arm_api.SetPTPCmd(portName=DOBOT_PORT, ptpMode=0, x=x, y=y, z=z, r=r, isQueued=False)
-    ))
-    time.sleep(wait_sec)
-    actual = get_pose()
-    print(f"[{label}] 명령:{res} 목표=({x:.1f},{y:.1f},{z:.1f},{r:.1f}) 실제:{actual}")
-    return actual
-
-
-def position_matches(actual, target):
+def _matches(actual, target):
     if not isinstance(actual, dict):
         return False
     tx, ty, tz, tr = target
@@ -69,14 +60,66 @@ def position_matches(actual, target):
         return False
 
 
-def travel(from_xyz, to_xyz, wrist, label, final_wait=MOVE_WAIT_SEC):
+def _is_still(prev, cur):
+    """직전 조회 대비 거의 안 움직였으면 True (= 팔이 멈춘 상태)."""
+    try:
+        return (abs(cur["x"] - prev["x"]) <= MOVE_STABLE_MM
+                and abs(cur["y"] - prev["y"]) <= MOVE_STABLE_MM
+                and abs(cur["z"] - prev["z"]) <= MOVE_STABLE_MM
+                and abs(_wrap_deg(cur["r"] - prev["r"])) <= MOVE_STABLE_DEG)
+    except (KeyError, TypeError):
+        return False
+
+
+def move_to(x, y, z, r, label="", settle_sec=0.0):
+    """메인 코드와 같은 이동 방식 - 도착 + 멈춤까지 GetPose로 확인, 목표 못 간 채 멈춰 있으면
+    명령 재전송 (최대 MOVE_MAX_RESEND번), 최대 MOVE_TIMEOUT_SEC."""
+    def send():
+        return loop.run_until_complete(safe_call(
+            arm_api.SetPTPCmd(portName=DOBOT_PORT, ptpMode=0, x=x, y=y, z=z, r=r, isQueued=False)
+        ))
+
+    started = time.time()
+    res = send()
+    actual, arrived, resends = None, False, 0
+    prev = None
+    still_since = time.time()
+    while time.time() - started < MOVE_TIMEOUT_SEC:
+        time.sleep(MOVE_POLL_INTERVAL_SEC)
+        actual = get_pose()
+        if not isinstance(actual, dict):
+            continue
+        if prev is None or not _is_still(prev, actual):
+            still_since = time.time()   # 아직 움직이는 중
+        elif _matches(actual, (x, y, z, r)):
+            arrived = True
+            break
+        elif time.time() - still_since >= MOVE_RESEND_AFTER_SEC:
+            if resends >= MOVE_MAX_RESEND:
+                break
+            resends += 1
+            res = send()
+            print(f"[{label}] 목표 못 간 채 멈춤 -> 명령 재전송 {resends}/{MOVE_MAX_RESEND} ({res})")
+            still_since = time.time()
+        prev = actual
+    if arrived and settle_sec > 0:
+        time.sleep(settle_sec)
+    elapsed = time.time() - started
+    status = f"도착 {elapsed:.1f}초" if arrived else f"⚠️ 도착 실패({elapsed:.1f}초)"
+    if resends:
+        status += f", 재전송 {resends}회"
+    print(f"[{label}] 명령:{res} {status} 목표=({x:.1f},{y:.1f},{z:.1f},{r:.1f}) 실제:{actual}")
+    return actual
+
+
+def travel(from_xyz, to_xyz, wrist, label, final_settle=0.0):
     """메인 코드의 travel()과 같은 규칙 - 각도 차 크면 극좌표 중간점 경유."""
     if needs_midpoint(from_xyz[:2], to_xyz[:2]):
         mx, my = arc_midpoint(from_xyz[:2], to_xyz[:2])
         mz = max(from_xyz[2], to_xyz[2])
         move_to(mx, my, mz, r_for(mx, my, wrist), label=f"{label} - 중간점 경유")
     tx, ty, tz = to_xyz
-    return move_to(tx, ty, tz, r_for(tx, ty, wrist), label=label, wait_sec=final_wait)
+    return move_to(tx, ty, tz, r_for(tx, ty, wrist), label=label, settle_sec=final_settle)
 
 
 def parse_row_count(raw):
@@ -103,7 +146,7 @@ def main():
     print("현재 위치:", get_pose())
 
     hx, hy, hz = HOME_XYZ
-    move_to(hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG), label="초기위치로 이동", wait_sec=HOME_MOVE_WAIT_SEC)
+    move_to(hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG), label="초기위치로 이동")
     cur_xyz = HOME_XYZ
     cur_wrist = HOME_WRIST_DEG
 
@@ -117,8 +160,7 @@ def main():
         if cmd == "home":
             safe_z = max(cur_xyz[2], hz) + SAFE_LIFT_MM
             move_to(cur_xyz[0], cur_xyz[1], safe_z, r_for(cur_xyz[0], cur_xyz[1], cur_wrist), label="들어올리기")
-            travel((cur_xyz[0], cur_xyz[1], safe_z), HOME_XYZ, cur_wrist, "초기위치로 복귀",
-                   final_wait=HOME_MOVE_WAIT_SEC)
+            travel((cur_xyz[0], cur_xyz[1], safe_z), HOME_XYZ, cur_wrist, "초기위치로 복귀")
             cur_xyz = HOME_XYZ
             continue
 
@@ -143,8 +185,8 @@ def main():
         move_to(cur_xyz[0], cur_xyz[1], safe_z, r_for(cur_xyz[0], cur_xyz[1], wrist), label="들어올리기")
         travel((cur_xyz[0], cur_xyz[1], safe_z), (px, py, safe_z), wrist, "픽업 위치 위로 이동")
         target = (px, py, pz, r_for(px, py, wrist))
-        actual = move_to(*target, label="픽업 위치로 하강", wait_sec=PRECISION_MOVE_WAIT_SEC)
-        print("도착 확인:", "OK" if position_matches(actual, target) else "실패 (목표와 다름)")
+        actual = move_to(*target, label="픽업 위치로 하강", settle_sec=PRECISION_SETTLE_SEC)
+        print("도착 확인:", "OK" if _matches(actual, target) else "실패 (목표와 다름)")
 
         cur_xyz = (px, py, pz)
         cur_wrist = wrist

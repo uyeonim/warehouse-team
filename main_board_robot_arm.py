@@ -9,16 +9,17 @@
    포트라서, 라이브러리를 진짜로 섞어 쓸 수는 없음 - 전부 DobotRPC로
    통일된 상태 유지.
 
-   대신 "이동 방식"만 pydobot 버전(검증됨, 실물로 잘 됐던 방식)의
-   전략을 그대로 가져옴:
-     - GetPose로 엄격하게 "도착했는지" 확인하고 재시도하는 방식 (X)
-       -> DobotRPC의 GetPose도 연속 호출 시 불안정한 게 실물로 확인됨
-     - 이동 명령 보내고 고정 시간만큼 대기, 그 다음 위치는 "육안 확인용"
-       으로만 한 번 조회 (O)
+   이동 방식: 이동 명령 보낸 뒤 GetPose를 MOVE_POLL_INTERVAL_SEC 간격으로
+   조회하며 목표 도착(허용오차 이내) + 멈춤까지 대기, 목표 못 간 채 멈춰
+   있으면 명령 재전송, MOVE_TIMEOUT_SEC 초과 시 도착 실패로 봄
+   (move_and_wait). 픽업 위치 / 트레이 하강은 도착 실패 시 failed 처리,
+   나머지 이동은 로그만 남기고 진행.
+     ⚠️ 예전엔 "DobotRPC의 GetPose 연속 호출이 불안정"해서 고정 시간 대기
+       방식을 썼음 - GetPose가 TIMEOUT/ERROR를 반복하면 이동마다
+       MOVE_TIMEOUT_SEC를 다 기다리게 되므로 로그의 "도착 실패" 확인할 것.
 
-   대신 "실제로 트레이에 기대한 색 보드가 놓였는지"는 별개 USB 웹캠으로
-   확인함 - 이게 지금 유일한 물리적 결과 검증 수단 (도착 좌표 자체는
-   여전히 엄격 검증 안 함).
+   "실제로 트레이에 기대한 색 보드가 놓였는지"는 별개 USB 웹캠으로
+   확인함 - 최종 결과 검증 수단.
 
 흡착 파라미터: 가이드북 API 레퍼런스로 확정된 대로 "on" 사용
 (m_lite.set_endeffector_suctioncup(enable, on)).
@@ -162,8 +163,9 @@ CALL_TIMEOUT = 5
 # 튜닝값(좌표/컨베이어/타이밍/카메라/HSV)은 전부 board_config.py에 있음
 from board_config import (
     DOBOT_PORT,
-    PICK_POSE_ROWS, PLACE_XYZ, CAMERA_CHECK_XYZ, HOME_XYZ, HOME_WRIST_DEG, SAFE_LIFT_MM,
-    MOVE_WAIT_SEC, PRECISION_MOVE_WAIT_SEC, CAMERA_MOVE_WAIT_SEC, HOME_MOVE_WAIT_SEC,
+    PICK_POSE_ROWS, PLACE_XYZ, PLACE_R_OFFSET_DEG_BY_COLOR, CAMERA_CHECK_XYZ, HOME_XYZ, HOME_WRIST_DEG, SAFE_LIFT_MM,
+    MOVE_TIMEOUT_SEC, MOVE_POLL_INTERVAL_SEC, PRECISION_SETTLE_SEC,
+    MOVE_STABLE_MM, MOVE_STABLE_DEG, MOVE_RESEND_AFTER_SEC, MOVE_MAX_RESEND,
     SUCTION_SETTLE_DELAY, RELEASE_SETTLE_DELAY,
     POSITION_TOLERANCE_MM, POSITION_TOLERANCE_DEG,
     TRAY_CONVEYOR_STP_1, TRAY_CONVEYOR_STP_2, TRAY_CONVEYOR_SPEED_MM_S,
@@ -171,7 +173,7 @@ from board_config import (
     CAMERA_INDEX_PREFERENCE, CAMERA_ROI, CAMERA_PRESENCE_MIN_RATIO, CAMERA_SETTLE_DELAY,
     CAMERA_WARMUP_FRAMES, SAVE_CAMERA_IMAGE, SHOW_CAMERA_WINDOW, CAMERA_WINDOW_MS,
     CAMERA_IMAGE_DIR, COLOR_RANGES_HSV,
-    BOARD_COLORS, compute_pick_pose, wrist_of, r_for, arc_midpoint, needs_midpoint, _wrap_deg,
+    BOARD_COLORS, compute_pick_pose, wrist_of, r_for, place_r_for, base_angle, arc_midpoint, needs_midpoint, _wrap_deg,
 )
 
 _MM_TO_PULSE = (360.0 / 1.8 * 5.0 * 16.0) / (3.1415926535898 * 32)
@@ -394,6 +396,14 @@ def complete_on_server(order_id, color):
         return False
 
 
+def complete_job(order_id, color):
+    """job 완료/폐기 - 로컬 큐와 서버 큐 양쪽에서 제거.
+    (재부팅 복구/fault 재시도처럼 큐를 안 거치고 직접 처리한 job도 로컬 큐에 남지 않게)"""
+    global job_queue
+    job_queue = [j for j in job_queue if not (j["order_id"] == order_id and j["color"] == color)]
+    complete_on_server(order_id, color)
+
+
 # ---- 픽업 게이트 서버 동기화 ----
 def fetch_gate_from_server():
     try:
@@ -435,17 +445,56 @@ def is_ok(res):
     return not (isinstance(res, str) and (res.startswith("TIMEOUT") or res.startswith("ERROR")))
 
 
-# ============================== 이동 - pydobot 스타일 ==============================
-async def move_and_wait(arm_api, pose, label="", wait_sec=None):
-    if wait_sec is None:
-        wait_sec = MOVE_WAIT_SEC
+# ============================== 이동 - 도착 대기 방식 ==============================
+async def move_and_wait(arm_api, pose, label="", settle_sec=0.0):
+    """
+    이동 명령을 보낸 뒤, 목표 위치에 "도착 + 멈춤"할 때까지 GetPose로 확인하며 대기.
+    - 허용오차 안이어도 아직 움직이는 중이면 도착으로 안 봄 (그때 다음 명령 보내면 씹힘)
+    - 목표 못 간 채 MOVE_RESEND_AFTER_SEC 동안 멈춰 있으면 명령 재전송 (최대 MOVE_MAX_RESEND번),
+      재전송 다 써도 안 되면 바로 도착 실패
+    - MOVE_TIMEOUT_SEC 안에 도착 못 하면 마지막으로 읽은 위치를 그대로 반환(도착 실패)
+    반환: (명령 성공 여부, 마지막 실제 위치)
+    """
     x, y, z, r = pose
-    moved = await safe_call(arm_api.SetPTPCmd(portName=DOBOT_PORT, ptpMode=0,
-                                               x=x, y=y, z=z, r=r, isQueued=False))
-    await asyncio.sleep(wait_sec)
 
-    actual = await safe_call(arm_api.GetPose(portName=DOBOT_PORT, isQueued=False))
-    log("ARM", f"{label} - 명령:{moved}, 목표=({x:.1f},{y:.1f},{z:.1f},{r:.1f}), 실제위치:{actual}")
+    def send():
+        return safe_call(arm_api.SetPTPCmd(portName=DOBOT_PORT, ptpMode=0,
+                                           x=x, y=y, z=z, r=r, isQueued=False))
+
+    started = time.time()
+    moved = await send()
+    actual = None
+    arrived = False
+    resends = 0
+    if is_ok(moved):
+        prev = None
+        still_since = time.time()
+        while time.time() - started < MOVE_TIMEOUT_SEC:
+            await asyncio.sleep(MOVE_POLL_INTERVAL_SEC)
+            actual = await safe_call(arm_api.GetPose(portName=DOBOT_PORT, isQueued=False))
+            if not isinstance(actual, dict):
+                continue
+            if prev is None or not _is_still(prev, actual):
+                still_since = time.time()   # 아직 움직이는 중
+            elif _position_matches(actual, pose):
+                arrived = True
+                break
+            elif time.time() - still_since >= MOVE_RESEND_AFTER_SEC:
+                if resends >= MOVE_MAX_RESEND:
+                    break
+                resends += 1
+                moved = await send()
+                log("ARM", f"{label} - 목표 못 간 채 멈춤 -> 명령 재전송 {resends}/{MOVE_MAX_RESEND} ({moved})")
+                still_since = time.time()
+            prev = actual
+    if arrived and settle_sec > 0:
+        await asyncio.sleep(settle_sec)
+
+    elapsed = time.time() - started
+    status = f"도착 {elapsed:.1f}초" if arrived else f"⚠️ 도착 실패({elapsed:.1f}초)"
+    if resends:
+        status += f", 재전송 {resends}회"
+    log("ARM", f"{label} - 명령:{moved}, {status}, 목표=({x:.1f},{y:.1f},{z:.1f},{r:.1f}), 실제위치:{actual}")
     return is_ok(moved), actual
 
 
@@ -462,6 +511,17 @@ def _position_matches(actual, target_pose):
         return False
     return (dx <= POSITION_TOLERANCE_MM and dy <= POSITION_TOLERANCE_MM
             and dz <= POSITION_TOLERANCE_MM and dr <= POSITION_TOLERANCE_DEG)
+
+
+def _is_still(prev, cur):
+    """직전 조회 대비 거의 안 움직였으면 True (= 팔이 멈춘 상태)."""
+    try:
+        return (abs(cur["x"] - prev["x"]) <= MOVE_STABLE_MM
+                and abs(cur["y"] - prev["y"]) <= MOVE_STABLE_MM
+                and abs(cur["z"] - prev["z"]) <= MOVE_STABLE_MM
+                and abs(_wrap_deg(cur["r"] - prev["r"])) <= MOVE_STABLE_DEG)
+    except (KeyError, TypeError):
+        return False
 
 
 async def suck(arm_api, on):
@@ -607,7 +667,7 @@ def verify_board_on_tray(expected_color):
 # 각도를 유지한 R(r_for)로 이동 - 별도의 "제자리 R 회전" 단계 없음.
 # compute_pick_pose / r_for / arc_midpoint 등 계산식은 board_config.py에 있음.
 
-async def travel(arm_api, from_xyz, to_xyz, wrist, label, final_wait=None):
+async def travel(arm_api, from_xyz, to_xyz, wrist, label, final_settle=0.0):
     """from -> to 이동. 두 점 베이스 각도 차가 크면(MIDPOINT_MIN_ANGLE_DEG 이상)
     극좌표 중간점을 경유. 중간점 높이는 두 점 중 높은 쪽.
     반환: 마지막 move_and_wait의 (명령성공, 실제위치)."""
@@ -617,7 +677,7 @@ async def travel(arm_api, from_xyz, to_xyz, wrist, label, final_wait=None):
         await move_and_wait(arm_api, (mx, my, mz, r_for(mx, my, wrist)), label=f"{label} - 중간점 경유")
     tx, ty, tz = to_xyz
     return await move_and_wait(arm_api, (tx, ty, tz, r_for(tx, ty, wrist)), label=label,
-                               wait_sec=final_wait)
+                               settle_sec=final_settle)
 
 
 async def pick_and_place_board_async(arm_api, order_id, color, count):
@@ -633,6 +693,7 @@ async def pick_and_place_board_async(arm_api, order_id, color, count):
       픽업 위치 도달 실패(흡착 전)만 False, 그 이후 실패는 전부 True.
     """
     consumed = False
+    travel_z = None   # 예외 복구(_recover_to_home)에서 참조 - 좌표 계산 전 예외 대비
     try:
         pick_x, pick_y, pick_z, pick_r = compute_pick_pose(color, count)
         wrist = wrist_of(pick_x, pick_y, pick_r)
@@ -646,13 +707,12 @@ async def pick_and_place_board_async(arm_api, order_id, color, count):
                      wrist, "픽업 위치 위로 이동")
         pick_target = (pick_x, pick_y, pick_z, r_for(pick_x, pick_y, wrist))
         pick_move_ok, pick_actual = await move_and_wait(arm_api, pick_target, label="픽업 위치로 하강",
-                                                         wait_sec=PRECISION_MOVE_WAIT_SEC)
+                                                         settle_sec=PRECISION_SETTLE_SEC)
         if not pick_move_ok or not _position_matches(pick_actual, pick_target):
             log("ARM", f"픽업 위치 도달 실패 - 목표={tuple(round(v, 1) for v in pick_target)} "
                         f"실제={pick_actual} - 흡착 시도 안 하고 실패 처리")
             report_board_robot_arm(order_id, "failed")
-            await travel(arm_api, (pick_x, pick_y, travel_z), HOME_XYZ, wrist, "초기위치로 복귀",
-                         final_wait=HOME_MOVE_WAIT_SEC)
+            await travel(arm_api, (pick_x, pick_y, travel_z), HOME_XYZ, wrist, "초기위치로 복귀")
             return False, consumed
 
         await suck(arm_api, True)
@@ -665,9 +725,14 @@ async def pick_and_place_board_async(arm_api, order_id, color, count):
         # 픽업 위 -> (중간점) -> 트레이 위 -> 하강
         await travel(arm_api, (pick_x, pick_y, travel_z), (place_x, place_y, travel_z),
                      wrist, "트레이 위로 이동")
-        place_target = (place_x, place_y, place_z, r_for(place_x, place_y, wrist))
+        # 트레이 위에서 XY 고정한 채 R만 색별 놓기 R로 회전 (하강 전)
+        # 놓기 R = 기준 R(손목 0도) + 색별 회전값 - 픽업 R/줄과 무관하게 색만 같으면 항상 같음
+        place_r = place_r_for(color)
+        await move_and_wait(arm_api, (place_x, place_y, travel_z, place_r),
+                            label=f"트레이 위에서 R 회전 ({color} {PLACE_R_OFFSET_DEG_BY_COLOR[color]:+.1f}도, R={place_r:.1f})")
+        place_target = (place_x, place_y, place_z, place_r)
         descend_ok, descend_actual = await move_and_wait(arm_api, place_target, label="트레이 위치로 하강",
-                                                          wait_sec=PRECISION_MOVE_WAIT_SEC)
+                                                          settle_sec=PRECISION_SETTLE_SEC)
         if not descend_ok or not _position_matches(descend_actual, place_target):
             log("ARM", f"트레이 하강 도달 실패 - 목표={tuple(round(v, 1) for v in place_target)} "
                         f"실제={descend_actual} - 흡착 끄고 실패 처리")
@@ -676,27 +741,29 @@ async def pick_and_place_board_async(arm_api, order_id, color, count):
                 await suck(arm_api, False)
             except Exception:
                 pass
-            await travel(arm_api, (place_x, place_y, travel_z), HOME_XYZ, wrist, "초기위치로 복귀",
-                         final_wait=HOME_MOVE_WAIT_SEC)
+            await travel(arm_api, (place_x, place_y, travel_z), HOME_XYZ, wrist, "초기위치로 복귀")
             return False, consumed
 
         await suck(arm_api, False)
         await asyncio.sleep(RELEASE_SETTLE_DELAY)
 
-        await move_and_wait(arm_api, (place_x, place_y, travel_z, r_for(place_x, place_y, wrist)),
+        await move_and_wait(arm_api, (place_x, place_y, travel_z, place_r),
                             label="다시 안전 높이로 들어올리기")
+        # 놓은 뒤엔 손목 각도를 유지할 필요 없음 - 제자리에서 손목 0도로 되돌린 뒤 이동
+        # (회전은 제자리에서만 - 이동+큰 회전 동시에 시키면 씹히는 문제 회피)
+        await move_and_wait(arm_api, (place_x, place_y, travel_z, r_for(place_x, place_y, HOME_WRIST_DEG)),
+                            label="놓은 뒤 R 원위치 (손목 0도)")
 
-        # 카메라 확인 위치로 이동 후 확인
-        await travel(arm_api, (place_x, place_y, travel_z), CAMERA_CHECK_XYZ, wrist,
-                     "카메라 체크 위치로 이동", final_wait=CAMERA_MOVE_WAIT_SEC)
+        # 카메라 확인 위치로 이동 후 확인 (카메라 위치/HOME은 항상 손목 0도 고정)
+        await travel(arm_api, (place_x, place_y, travel_z), CAMERA_CHECK_XYZ, HOME_WRIST_DEG,
+                     "카메라 체크 위치로 이동")
         await asyncio.sleep(CAMERA_SETTLE_DELAY)
         log("ARM", "카메라로 배치 확인 중")
         verified, detected_color, reason = verify_board_on_tray(color)
         log("ARM", f"카메라 확인 결과: {reason} (감지된 색={detected_color})")
 
         # 카메라 위치 -> (중간점) -> HOME
-        await travel(arm_api, CAMERA_CHECK_XYZ, HOME_XYZ, wrist, "초기위치로 복귀",
-                     final_wait=HOME_MOVE_WAIT_SEC)
+        await travel(arm_api, CAMERA_CHECK_XYZ, HOME_XYZ, HOME_WRIST_DEG, "초기위치로 복귀")
 
         report_board_robot_arm(order_id, "done" if verified else "failed")
 
@@ -714,7 +781,27 @@ async def pick_and_place_board_async(arm_api, order_id, color, count):
         except Exception:
             pass
         report_board_robot_arm(order_id, "failed")
+        await _recover_to_home(arm_api, travel_z)
         return False, consumed
+
+
+async def _recover_to_home(arm_api, travel_z):
+    """예외 후 복귀 - 현재 위치를 모르면 안 움직임. 아는 경우 제자리 수직 상승 후
+    현재 손목 각도 유지한 채 HOME으로 (이동 중 큰 회전 방지)."""
+    try:
+        actual = await safe_call(arm_api.GetPose(portName=DOBOT_PORT, isQueued=False))
+        if not isinstance(actual, dict):
+            log("ARM", f"현재 위치 조회 실패({actual}) - HOME 복귀 생략, 수동 확인 필요")
+            return
+        cx, cy, cz, cr = actual["x"], actual["y"], actual["z"], actual["r"]
+        safe_z = max(cz, travel_z) if travel_z is not None else cz + SAFE_LIFT_MM
+        # wrist_of()는 -180~180으로 접어서 R이 360도 차이날 수 있음 - 접지 않은 값 사용
+        wrist = cr - base_angle(cx, cy)
+        await move_and_wait(arm_api, (cx, cy, safe_z, cr),
+                            label="예외 복구 - 제자리 들어올리기")
+        await travel(arm_api, (cx, cy, safe_z), HOME_XYZ, wrist, "예외 복구 - 초기위치로 복귀")
+    except Exception as e:
+        log("ARM", f"예외 복구 중 에러 - HOME 복귀 실패, 수동 확인 필요: {e}")
 
 
 # ============================== 컨베이어 로직 ==============================
@@ -760,13 +847,13 @@ async def run_tray_conveyor_async(box_api, run_time, section_label=""):
 def process_board_job(loop, arm_api, box_api, order_id, color):
     """
     큐에서 꺼낸 job 1건 처리 (또는 fault 해제 후 직접 재시도).
-    픽업 실행 후, 성공/실패 무관하게 게이트 잠금 + 서버 큐 제거.
+    픽업 실행 후, 성공/실패 무관하게 게이트 잠금 + 로컬/서버 큐 제거.
     """
     global gate_open, gate_order_id
 
     if color not in BOARD_COLORS or color not in PICK_POSE_ROWS:
         log("ARM", f"알 수 없는 색상 '{color}' - 중단")
-        complete_on_server(order_id, color)
+        complete_job(order_id, color)
         return
 
     count_before = local_stock.get(color, 0)
@@ -799,7 +886,7 @@ def process_board_job(loop, arm_api, box_api, order_id, color):
     gate_order_id = order_id
     lock_gate_on_server(order_id)
     log("GATE", f"잠금: {order_id} (pickup_reached 이후 대기)")
-    complete_on_server(order_id, color)
+    complete_job(order_id, color)
 
 
 def handle_tray_conveyor(loop, box_api, order_id, section):
@@ -891,23 +978,34 @@ def check_startup_recovery(loop, arm_api, box_api, orders):
     status = order.get("status")
     if status in (STATUS_PICK, STATUS_MISMATCH):
         color = order.get("board")
+        # 처리함 표시 - 안 하면 같은 스냅샷의 새 주문 감지(handle_snapshot 5단계)가
+        # 아직 tray_reached인 이 주문을 또 큐에 넣어서 게이트 열릴 때 중복 픽업함
+        mark_processed(build_job_key(gate_order_id, color, status, order.get("retry")))
         log("GATE", f"재부팅 복구: {gate_order_id} 재시도")
         process_board_job(loop, arm_api, box_api, gate_order_id, color)
 
 
-# ---- 큐에 남은 job 중 orders에서 사라진 것(유령주문) 정리 ----
+# ---- 큐에 남은 job 중 유령주문 정리 ----
+# orders에서 사라진 주문 + 주문의 board 색과 다른 job(주문 1건 = 보드 1색이라 찌꺼기)
 def prune_dead_jobs_from_queue(orders):
     global job_queue
-    alive, removed = [], 0
+    alive, removed, mismatched = [], 0, 0
     for job in job_queue:
-        if job["order_id"] in orders:
-            alive.append(job)
-        else:
+        order = orders.get(job["order_id"])
+        if order is None:
             complete_on_server(job["order_id"], job["color"])
             removed += 1
+        elif order.get("board") is not None and order.get("board") != job["color"]:
+            log("QUEUE", f"{job['order_id']}: 큐의 색({job['color']})이 주문 색({order.get('board')})과 다름 - 제거")
+            complete_on_server(job["order_id"], job["color"])
+            mismatched += 1
+        else:
+            alive.append(job)
     job_queue = alive
     if removed:
         log("QUEUE", f"orders에서 사라진 job {removed}건 제거함")
+    if mismatched:
+        log("QUEUE", f"주문 색과 다른 job {mismatched}건 제거함")
 
 
 # ---- restock: board_restock 배열 감지해서 즉시 처리 (큐/게이트 무관) ----
@@ -963,9 +1061,14 @@ def handle_snapshot(loop, arm_api, box_api, data):
             job_key = build_job_key(order_id, color, status, retry)
             if not already_processed(job_key):
                 mark_processed(job_key)
-                job_queue.append({"order_id": order_id, "color": color})
-                enqueue_to_server(order_id, color)
-                log("QUEUE", f"{order_id}({color}, {status}, retry={retry}) 큐 적재 - 대기 {len(job_queue)}건")
+                # 재부팅 복원분은 status/retry를 몰라 job_key로 못 걸러냄 -
+                # 같은 order_id+color가 이미 큐에 있으면 다시 안 넣음 (중복 픽업 방지)
+                if any(j["order_id"] == order_id and j["color"] == color for j in job_queue):
+                    log("QUEUE", f"{order_id}({color}, {status}, retry={retry}) 이미 큐에 있음 - 적재 생략")
+                else:
+                    job_queue.append({"order_id": order_id, "color": color})
+                    enqueue_to_server(order_id, color)
+                    log("QUEUE", f"{order_id}({color}, {status}, retry={retry}) 큐 적재 - 대기 {len(job_queue)}건")
 
         elif status == STATUS_CONVEYOR_1:
             if handled_status.get(order_id) != status:
@@ -988,10 +1091,8 @@ def main():
 
     local_stock = fetch_initial_stock()
 
-    restored_jobs = fetch_queue_from_server()
-    job_queue = restored_jobs
-    for job in restored_jobs:
-        mark_processed(f"{job['order_id']}_{job['color']}")
+    # 복원분 중복 적재 방지는 handle_snapshot()에서 job_queue 존재 여부로 처리
+    job_queue = fetch_queue_from_server()
 
     gate_state = fetch_gate_from_server()
     if gate_state.get("locked"):
@@ -1020,21 +1121,25 @@ def main():
     # 시작 시 HOME으로 이동 (픽업 전이라 손목 각도는 HOME_WRIST_DEG)
     hx, hy, hz = HOME_XYZ
     loop.run_until_complete(move_and_wait(arm_api, (hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG)),
-                                          label="시작 - 초기위치로 이동", wait_sec=HOME_MOVE_WAIT_SEC))
+                                          label="시작 - 초기위치로 이동"))
 
     log("INIT", f"준비 완료 (픽업:{STATUS_PICK}/{STATUS_MISMATCH}, 컨베이어1:{STATUS_CONVEYOR_1}, "
                 f"컨베이어2:{STATUS_CONVEYOR_2}, 큐 {len(job_queue)}건, "
                 f"게이트 {'닫힘' if not gate_open else '열림'}) - 대기 시작. Ctrl+C로 종료")
 
+    first_snapshot_handled = False
     try:
         while True:
             try:
                 data = snapshot_queue.get(timeout=1)
                 handle_snapshot(loop, arm_api, box_api, data)
+                first_snapshot_handled = True
             except queue.Empty:
                 pass
 
-            if gate_open and job_queue:
+            # 첫 스냅샷을 받기 전엔 큐를 꺼내지 않음 - 복원된 job이 이미 끝난/사라진 주문인지,
+            # 중복인지를 스냅샷으로 먼저 정리(prune/중복체크)한 뒤에 처리하려고
+            if first_snapshot_handled and gate_open and job_queue:
                 job = job_queue.pop(0)
                 log("ARM", f"{job['order_id']}: 큐에서 꺼내 처리 시작 (색상={job['color']})")
                 process_board_job(loop, arm_api, box_api, job["order_id"], job["color"])

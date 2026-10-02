@@ -3,7 +3,7 @@
 =====================================================================
  보드 로봇암 튜닝값 모음 (board_config.py)
 =====================================================================
-main_board_robot_arm.py / board_location_tunning.py / board_place_tunning.py /
+main_board_robot_arm.py / board_location_tunning.py / board_R_tunning.py /
 camera.py 가 전부 이 파일을 import 해서 씀 - 여기 값 하나 바꾸면 4개 스크립트에
 동시에 반영됨. 비밀값(MQTT/Flask 주소 등)은 여기 넣지 말고 .env에 둘 것.
 
@@ -49,6 +49,14 @@ BOARD_THICKNESS_MM = 20.0
 # 좌표 - 나머지 위치 (x, y, z) - R은 자동 계산이라 안 적음
 # =================================================================
 PLACE_XYZ = (-116.6558, -294.7615, 28.6249)          # 트레이에 보드 놓는 위치 (흡착 상태로 트레이에 닿는 높이)
+# 트레이에 놓을 때 R - 픽업 R과 무관하게 "기준 R(손목 0도, 놓는 위치 베이스 각도)"에서
+# 색별로 이만큼 돌린 값으로 놓음. 트레이 위에서 제자리로 R만 돌린 뒤 하강.
+PLACE_R_OFFSET_DEG_BY_COLOR = {
+    "red":    -50.0,
+    "green":  -60.0,
+    "blue":   -80.0,
+    "yellow": -100.0,
+}
 CAMERA_CHECK_XYZ = (-97.5224, -229.2938, 58.3063)    # 카메라로 배치 확인하는 위치
 HOME_XYZ = (239.9906, -5.5209, 84.0930)              # 대기 위치
 HOME_WRIST_DEG = 0.0   # 픽업 전(손목 각도가 아직 없을 때) HOME에서 쓸 손목 각도
@@ -62,14 +70,24 @@ SAFE_LIFT_MM = 40.0    # 이동할 때 출발/도착 높이보다 이만큼 더 
 # (반대편으로 크게 돌 때 이동 명령이 씹히는 문제 대응)
 MIDPOINT_MIN_ANGLE_DEG = 60.0
 
-MOVE_WAIT_SEC = 2.0             # 일반 이동 대기
-PRECISION_MOVE_WAIT_SEC = 3.0   # 픽업/놓기 정밀 접촉 이동 대기 - 짧으면 흡착 실패
-CAMERA_MOVE_WAIT_SEC = 4.0      # 카메라 확인 위치로 이동 대기
-HOME_MOVE_WAIT_SEC = 5.0        # HOME 복귀 대기
+# 이동은 "명령 보낸 뒤 목표에 도착할 때까지 GetPose로 확인하며 대기" 방식.
+# 고정 대기시간이 아니라서 빨리 도착하면 바로 다음 단계로 넘어가고, 큰 회전처럼
+# 오래 걸리는 동작은 도착할 때까지 기다려줌.
+# 도착 = 허용오차 이내 + "멈춤"(직전 조회 대비 MOVE_STABLE 이내). 아직 움직이는 중에
+# 다음 명령을 보내면 그 명령이 씹혀서 팔이 안 움직이는 게 실물로 확인됨(2026-10-02).
+# 목표 못 간 채 MOVE_RESEND_AFTER_SEC 동안 멈춰 있으면 명령 재전송, MOVE_MAX_RESEND번 다 해도
+# 안 되면 타임아웃 안 기다리고 바로 도착 실패.
+MOVE_TIMEOUT_SEC = 6.0          # 이 시간 안에 목표 도착 못 하면 "도착 실패"로 봄
+MOVE_POLL_INTERVAL_SEC = 0.2    # 도착 확인 간격
+MOVE_STABLE_MM = 0.5            # 직전 조회 대비 이 이내로만 움직였으면 "멈춤"
+MOVE_STABLE_DEG = 0.5
+MOVE_RESEND_AFTER_SEC = 1.0     # 목표 못 간 채 이만큼 멈춰 있으면 명령 씹힘으로 보고 재전송
+MOVE_MAX_RESEND = 2             # 재전송 최대 횟수
+PRECISION_SETTLE_SEC = 0.5      # 픽업/트레이 하강처럼 정밀 접촉 이동은 도착 후 이만큼 더 안정화 대기
 SUCTION_SETTLE_DELAY = 1.0      # 흡착 ON 후 흡착력 형성 대기
 RELEASE_SETTLE_DELAY = 0.5      # 흡착 OFF 후 대기
 
-# 픽업 위치 이동 / 트레이 하강 두 구간만 GetPose로 도착 확인 - 허용오차
+# 도착 판정 허용오차 (모든 이동에 사용. 픽업 위치 / 트레이 하강은 도착 실패 시 failed 처리)
 POSITION_TOLERANCE_MM = 2.0
 POSITION_TOLERANCE_DEG = 2.0
 
@@ -136,8 +154,15 @@ def wrist_of(x, y, r):
 
 
 def r_for(x, y, wrist_deg):
-    """손목 각도를 wrist_deg로 고정했을 때 그 XY에서의 R."""
-    return _wrap_deg(base_angle(x, y) + wrist_deg)
+    """손목 각도를 wrist_deg로 고정했을 때 그 XY에서의 R.
+    ⚠️ -180~180으로 접지 않음 - Dobot은 R = 베이스 + 손목이라, 예를 들어 -191을
+    169로 접어서 보내면 손목을 반대로 280도 돌리라는 명령이 돼서 한계에 걸림."""
+    return base_angle(x, y) + wrist_deg
+
+
+def place_r_for(color):
+    """트레이에 놓을 때 R = 놓는 위치 기준 R(손목 0도) + 색별 회전값. 접지 않음."""
+    return base_angle(PLACE_XYZ[0], PLACE_XYZ[1]) + PLACE_R_OFFSET_DEG_BY_COLOR[color]
 
 
 def arc_midpoint(xy_from, xy_to):

@@ -3,10 +3,9 @@
 트레이 놓기 확인/튜닝 - 보드를 실제로 집어서 트레이 위(안전 높이)까지 가져가 보고,
 그 자리에서 R을 +/- 해보는 도구. 튜닝값은 전부 board_config.py에서 수정.
 
-⚠️ 메인 코드는 놓는 위치 R을 직접 쓰지 않음 - 픽업 R로 정해진 손목 각도를 유지한 채
-   자동 계산함(board_config의 r_for). 이 스크립트에서 R을 바꿔보는 건 "방향이 어떻게
-   바뀌는지 확인용"이고, 메인에 반영하려면 PICK_POSE_ROWS의 픽업 R을 조정해야 함
-   (마지막에 그 환산값을 출력해줌).
+메인 코드는 트레이 위에 도착하면 R을 "기준 R(손목 0도) + 색별 회전값"으로 돌린 뒤 하강함
+(board_config의 PLACE_R_OFFSET_DEG_BY_COLOR). 이 스크립트도 같은 R에서 시작하고, 여기서 맞춘
+최종 R을 "그 색의 회전값"으로 환산해서 출력해줌.
 
 흐름: HOME -> 픽업 위 -> 픽업 하강 -> 흡착 -> 들어올림 -> (중간점) -> 트레이 위(안전 높이)
       -> R 조정 루프 -> release(흡착 OFF) -> HOME
@@ -18,10 +17,13 @@ import time
 from DobotRPC import RPCClient, DobotlinkAdapter
 
 from board_config import (
-    DOBOT_PORT, NUM_ROWS, ROW_CAPACITY, BOARD_COLORS, PLACE_XYZ, HOME_XYZ, HOME_WRIST_DEG,
-    SAFE_LIFT_MM, PRECISION_MOVE_WAIT_SEC, MOVE_WAIT_SEC, HOME_MOVE_WAIT_SEC,
+    DOBOT_PORT, NUM_ROWS, ROW_CAPACITY, BOARD_COLORS, PLACE_XYZ, PLACE_R_OFFSET_DEG_BY_COLOR,
+    HOME_XYZ, HOME_WRIST_DEG,
+    SAFE_LIFT_MM, MOVE_TIMEOUT_SEC, MOVE_POLL_INTERVAL_SEC, PRECISION_SETTLE_SEC,
+    MOVE_STABLE_MM, MOVE_STABLE_DEG, MOVE_RESEND_AFTER_SEC, MOVE_MAX_RESEND,
+    POSITION_TOLERANCE_MM, POSITION_TOLERANCE_DEG,
     SUCTION_SETTLE_DELAY, RELEASE_SETTLE_DELAY,
-    pick_pose_for, wrist_of, r_for, base_angle, arc_midpoint, needs_midpoint, _wrap_deg,
+    pick_pose_for, wrist_of, r_for, place_r_for, base_angle, arc_midpoint, needs_midpoint, _wrap_deg,
 )
 
 loop = asyncio.new_event_loop()
@@ -44,12 +46,69 @@ def get_pose():
     return loop.run_until_complete(safe_call(arm_api.GetPose(portName=DOBOT_PORT, isQueued=False)))
 
 
-def move_to(x, y, z, r, label="", wait_sec=MOVE_WAIT_SEC):
-    res = loop.run_until_complete(safe_call(
-        arm_api.SetPTPCmd(portName=DOBOT_PORT, ptpMode=0, x=x, y=y, z=z, r=r, isQueued=False)
-    ))
-    time.sleep(wait_sec)
-    print(f"[{label}] 명령:{res} 목표=({x:.1f},{y:.1f},{z:.1f},{r:.1f}) 실제:{get_pose()}")
+def _matches(actual, target):
+    if not isinstance(actual, dict):
+        return False
+    tx, ty, tz, tr = target
+    try:
+        return (abs(actual["x"] - tx) <= POSITION_TOLERANCE_MM
+                and abs(actual["y"] - ty) <= POSITION_TOLERANCE_MM
+                and abs(actual["z"] - tz) <= POSITION_TOLERANCE_MM
+                and abs(_wrap_deg(actual["r"] - tr)) <= POSITION_TOLERANCE_DEG)
+    except (KeyError, TypeError):
+        return False
+
+
+def _is_still(prev, cur):
+    """직전 조회 대비 거의 안 움직였으면 True (= 팔이 멈춘 상태)."""
+    try:
+        return (abs(cur["x"] - prev["x"]) <= MOVE_STABLE_MM
+                and abs(cur["y"] - prev["y"]) <= MOVE_STABLE_MM
+                and abs(cur["z"] - prev["z"]) <= MOVE_STABLE_MM
+                and abs(_wrap_deg(cur["r"] - prev["r"])) <= MOVE_STABLE_DEG)
+    except (KeyError, TypeError):
+        return False
+
+
+def move_to(x, y, z, r, label="", settle_sec=0.0):
+    """메인 코드와 같은 이동 방식 - 도착 + 멈춤까지 GetPose로 확인, 목표 못 간 채 멈춰 있으면
+    명령 재전송 (최대 MOVE_MAX_RESEND번), 최대 MOVE_TIMEOUT_SEC."""
+    def send():
+        return loop.run_until_complete(safe_call(
+            arm_api.SetPTPCmd(portName=DOBOT_PORT, ptpMode=0, x=x, y=y, z=z, r=r, isQueued=False)
+        ))
+
+    started = time.time()
+    res = send()
+    actual, arrived, resends = None, False, 0
+    prev = None
+    still_since = time.time()
+    while time.time() - started < MOVE_TIMEOUT_SEC:
+        time.sleep(MOVE_POLL_INTERVAL_SEC)
+        actual = get_pose()
+        if not isinstance(actual, dict):
+            continue
+        if prev is None or not _is_still(prev, actual):
+            still_since = time.time()   # 아직 움직이는 중
+        elif _matches(actual, (x, y, z, r)):
+            arrived = True
+            break
+        elif time.time() - still_since >= MOVE_RESEND_AFTER_SEC:
+            if resends >= MOVE_MAX_RESEND:
+                break
+            resends += 1
+            res = send()
+            print(f"[{label}] 목표 못 간 채 멈춤 -> 명령 재전송 {resends}/{MOVE_MAX_RESEND} ({res})")
+            still_since = time.time()
+        prev = actual
+    if arrived and settle_sec > 0:
+        time.sleep(settle_sec)
+    elapsed = time.time() - started
+    status = f"도착 {elapsed:.1f}초" if arrived else f"⚠️ 도착 실패({elapsed:.1f}초)"
+    if resends:
+        status += f", 재전송 {resends}회"
+    print(f"[{label}] 명령:{res} {status} 목표=({x:.1f},{y:.1f},{z:.1f},{r:.1f}) 실제:{actual}")
+    return actual
 
 
 def suck(on):
@@ -59,14 +118,14 @@ def suck(on):
     print(f"흡착 {'ON' if on else 'OFF'} 결과:", res)
 
 
-def travel(from_xyz, to_xyz, wrist, label, final_wait=MOVE_WAIT_SEC):
+def travel(from_xyz, to_xyz, wrist, label, final_settle=0.0):
     """메인 코드의 travel()과 같은 규칙 - 각도 차 크면 극좌표 중간점 경유."""
     if needs_midpoint(from_xyz[:2], to_xyz[:2]):
         mx, my = arc_midpoint(from_xyz[:2], to_xyz[:2])
         mz = max(from_xyz[2], to_xyz[2])
         move_to(mx, my, mz, r_for(mx, my, wrist), label=f"{label} - 중간점 경유")
     tx, ty, tz = to_xyz
-    move_to(tx, ty, tz, r_for(tx, ty, wrist), label=label, wait_sec=final_wait)
+    move_to(tx, ty, tz, r_for(tx, ty, wrist), label=label, settle_sec=final_settle)
 
 
 def parse_row_count(raw):
@@ -93,7 +152,7 @@ def main():
     print("현재 위치:", get_pose())
 
     hx, hy, hz = HOME_XYZ
-    move_to(hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG), label="초기위치로 이동", wait_sec=HOME_MOVE_WAIT_SEC)
+    move_to(hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG), label="초기위치로 이동")
 
     color = input("\n픽업할 색깔 (red/yellow/blue/green): ").strip().lower()
     if color not in BOARD_COLORS:
@@ -117,7 +176,7 @@ def main():
         return disconnect()
 
     travel((hx, hy, travel_z), (px, py, travel_z), wrist, "픽업 위치 위로 이동")
-    move_to(px, py, pz, r_for(px, py, wrist), label="픽업 위치로 하강", wait_sec=PRECISION_MOVE_WAIT_SEC)
+    move_to(px, py, pz, r_for(px, py, wrist), label="픽업 위치로 하강", settle_sec=PRECISION_SETTLE_SEC)
     suck(True)
     time.sleep(SUCTION_SETTLE_DELAY)
     move_to(px, py, travel_z, r_for(px, py, wrist), label="안전 높이로 들어올리기")
@@ -129,12 +188,17 @@ def main():
         return disconnect()
     travel((px, py, travel_z), (place_x, place_y, travel_z), wrist, "트레이 위로 이동")
 
-    current_r = r_for(place_x, place_y, wrist)
+    base_r = base_angle(place_x, place_y)   # 기준 R (손목 0도)
+    cur_offset = PLACE_R_OFFSET_DEG_BY_COLOR[color]
+    current_r = place_r_for(color)
+    move_to(place_x, place_y, travel_z, current_r,
+            label=f"트레이 위에서 R 회전 ({color} 현재 회전값 {cur_offset:+.1f}도)")
     step = 1.0
     print("\nR만 바꿔가며 방향 확인 (X,Y,Z 고정).")
     print("  +        -> 스텝만큼 증가 / -        -> 스텝만큼 감소")
     print("  +5 / -5  -> 그만큼 1회 증감 / step 0.5 -> 기본 스텝 변경")
-    print("  숫자     -> 그 R로 절대 이동 / release  -> 흡착 끄고 종료 (이 높이에서 떨어짐)")
+    print("  =-120 / =35 -> 그 R로 절대 이동 (음수 절대값은 반드시 = 붙일 것)")
+    print("  숫자(부호 없음) -> 그 R로 절대 이동 / release -> 흡착 끄고 종료 (이 높이에서 떨어짐)")
     while True:
         cmd = input(f"\n현재 R={current_r:.4f} (스텝={step}) / 명령: ").strip().lower()
 
@@ -153,7 +217,9 @@ def main():
             continue
 
         try:
-            if cmd == "+":
+            if cmd.startswith("="):
+                new_r = float(cmd[1:])
+            elif cmd == "+":
                 new_r = current_r + step
             elif cmd == "-":
                 new_r = current_r - step
@@ -162,7 +228,7 @@ def main():
             else:
                 new_r = float(cmd)
         except ValueError:
-            print("숫자, +, -, +숫자, -숫자, 'step 숫자', 'release' 중 하나")
+            print("=숫자, 숫자, +, -, +숫자, -숫자, 'step 숫자', 'release' 중 하나")
             continue
 
         move_to(place_x, place_y, travel_z, new_r, label="R 조정")
@@ -171,14 +237,14 @@ def main():
     suck(False)
     time.sleep(RELEASE_SETTLE_DELAY)
 
-    final_wrist = _wrap_deg(current_r - base_angle(place_x, place_y))
-    suggested_pick_r = _wrap_deg(base_angle(px, py) + final_wrist)
-    print(f"\n최종 R={current_r:.4f} (손목 {final_wrist:.2f}도)")
-    print(f"-> 메인 코드에 이 방향을 반영하려면 PICK_POSE_ROWS['{color}'][{row}]의 R을 "
-          f"{suggested_pick_r:.4f}로 바꾸면 됨 (현재 {pr:.4f})")
+    new_offset = current_r - base_r
+    print(f"\n최종 R={current_r:.4f} (기준 R {base_r:.4f}에서 {new_offset:+.2f}도)")
+    print(f"-> 메인 코드에 반영하려면 board_config.py의 PLACE_R_OFFSET_DEG_BY_COLOR['{color}']를 "
+          f"{new_offset:.2f}로 바꾸면 됨 (현재 {cur_offset:.2f})")
 
-    travel((place_x, place_y, travel_z), HOME_XYZ, final_wrist, "초기위치로 복귀",
-           final_wait=HOME_MOVE_WAIT_SEC)
+    move_to(place_x, place_y, travel_z, r_for(place_x, place_y, HOME_WRIST_DEG), label="R 원위치 (손목 0도)")
+
+    travel((place_x, place_y, travel_z), HOME_XYZ, HOME_WRIST_DEG, "초기위치로 복귀")
     disconnect()
 
 
