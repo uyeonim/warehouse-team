@@ -3,12 +3,15 @@
 픽업 위치 일괄 확인 - 흡착 없이 색별 픽업 위치로 이동만 해서 눈으로 확인하는 도구.
 입력 없이 끝까지 자동으로 돎 (각 위치에서 DWELL_SEC 동안 멈춤).
 
-사용: python board_pick_check.py [줄/개수] [멈춤초]
-  예) python board_pick_check.py 3/3 3     (기본값: 3/3, 3초)
+사용: python board_pick_check.py [색=재고 ...] [줄/개수] [멈춤초]
+  python board_pick_check.py                  -> 재고 기본값(DEFAULT_STOCK)으로 확인, 3초
+  python board_pick_check.py r=1 g=20 b=1 y=1 -> 색별 재고 지정 (0이면 그 색 건너뜀)
+  python board_pick_check.py 3/3 5            -> 4색 모두 줄3/3개 자리, 5초
+  재고 지정 시 위치는 메인과 같은 계산(compute_pick_pose) - 그 재고일 때 메인이 집으러 가는 자리
 
-경로는 메인 코드와 같은 규칙:
-  HOME -> 이동 높이로 픽업 위 -> 하강(멈춤) -> 이동 높이로 상승 -> 다음 색 ... -> HOME
-  이동 높이 = max(픽업 z, 트레이 z) + SAFE_LIFT_MM (메인 travel_z와 동일)
+경로: HOME -> 이동 높이로 픽업 위 -> 하강(멈춤) -> 이동 높이로 상승 -> 다음 색 ... -> HOME
+  이동 높이 = (이번에 갈 자리 중 제일 높은 z, 트레이 z 중 큰 값) + SAFE_LIFT_MM - 모든 이동 공통
+  (흡착 안 하니까 메인보다 보수적으로 - 높은 스택 위를 지나가도 안 부딪히게)
 
 ⚠️ 메인(main_board_robot_arm.py) 끄고 실행할 것 - 같은 팔에 명령이 섞임
 """
@@ -24,10 +27,13 @@ from board_config import (
     MOVE_TIMEOUT_SEC, MOVE_POLL_INTERVAL_SEC,
     MOVE_STABLE_MM, MOVE_STABLE_DEG, MOVE_RESEND_AFTER_SEC, MOVE_MAX_RESEND,
     POSITION_TOLERANCE_MM, POSITION_TOLERANCE_DEG,
-    pick_pose_for, wrist_of, r_for, arc_midpoint, needs_midpoint, _wrap_deg,
+    pick_pose_for, compute_pick_pose, wrist_of, r_for, arc_midpoint, needs_midpoint, _wrap_deg,
 )
 
 COLOR_ORDER = ["red", "green", "blue", "yellow"]
+COLOR_KEYS = {"r": "red", "g": "green", "b": "blue", "y": "yellow",
+              "red": "red", "green": "green", "blue": "blue", "yellow": "yellow"}
+DEFAULT_STOCK = {"red": 3, "green": 20, "blue": 3, "yellow": 3}
 
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
@@ -113,15 +119,41 @@ def travel(from_xyz, to_xyz, wrist, label):
     return move_to(tx, ty, tz, r_for(tx, ty, wrist), label=label)
 
 
-def main():
-    row, cnt = 3, 3
+def parse_args(argv):
+    """반환: (targets, dwell). targets = [(color, label, (x, y, z, r)), ...]"""
+    stock = dict(DEFAULT_STOCK)
+    row_cnt = None
     dwell = 3.0
-    if len(sys.argv) > 1:
-        row, cnt = (int(v) for v in sys.argv[1].split("/"))
-    if len(sys.argv) > 2:
-        dwell = float(sys.argv[2])
-    if not (0 <= row < NUM_ROWS and 1 <= cnt <= ROW_CAPACITY):
-        raise SystemExit(f"줄 0~{NUM_ROWS - 1}, 개수 1~{ROW_CAPACITY}")
+    for a in argv:
+        if "=" in a:
+            k, v = a.split("=", 1)
+            color = COLOR_KEYS.get(k.strip().lower())
+            if color is None:
+                raise SystemExit(f"색 '{k}' 잘못됨 - r/g/b/y")
+            stock[color] = int(v)
+        elif "/" in a:
+            row, cnt = (int(v) for v in a.split("/"))
+            if not (0 <= row < NUM_ROWS and 1 <= cnt <= ROW_CAPACITY):
+                raise SystemExit(f"줄 0~{NUM_ROWS - 1}, 개수 1~{ROW_CAPACITY}")
+            row_cnt = (row, cnt)
+        else:
+            dwell = float(a)
+
+    targets = []
+    for color in COLOR_ORDER:
+        if row_cnt:
+            targets.append((color, f"줄{row_cnt[0]}/{row_cnt[1]}개", pick_pose_for(color, *row_cnt)))
+        elif stock[color] > 0:
+            targets.append((color, f"재고 {stock[color]}", compute_pick_pose(color, stock[color])))
+    return targets, dwell
+
+
+def main():
+    targets, dwell = parse_args(sys.argv[1:])
+    if not targets:
+        raise SystemExit("확인할 자리가 없음 (재고 전부 0)")
+    travel_z = max(max(p[2] for _, _, p in targets), PLACE_XYZ[2]) + SAFE_LIFT_MM
+    print(f"이동 높이 {travel_z:.1f} / 멈춤 {dwell:.0f}초", flush=True)
 
     print("연결:", loop.run_until_complete(safe_call(arm_api.ConnectDobot(portName=DOBOT_PORT))), flush=True)
     try:
@@ -129,11 +161,9 @@ def main():
         move_to(hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG), label="HOME")
         cur = HOME_XYZ
 
-        for color in COLOR_ORDER:
-            px, py, pz, pr = pick_pose_for(color, row, cnt)
+        for color, label, (px, py, pz, pr) in targets:
             wrist = wrist_of(px, py, pr)
-            travel_z = max(pz, PLACE_XYZ[2]) + SAFE_LIFT_MM
-            print(f"\n=== {color} 줄{row}/{cnt}개: ({px:.1f},{py:.1f},{pz:.1f}) R={pr:.1f}", flush=True)
+            print(f"\n=== {color} {label}: ({px:.1f},{py:.1f},{pz:.1f}) R={pr:.1f}", flush=True)
             if cur != HOME_XYZ:
                 move_to(cur[0], cur[1], travel_z, r_for(cur[0], cur[1], cur_wrist), label="상승")
             travel((cur[0], cur[1], travel_z), (px, py, travel_z), wrist, f"{color} 위로")

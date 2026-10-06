@@ -183,7 +183,7 @@ from board_config import (
     CAMERA_INDEX_PREFERENCE, CAMERA_ROI, CAMERA_PRESENCE_MIN_RATIO, CAMERA_SETTLE_DELAY,
     CAMERA_WARMUP_FRAMES, SAVE_CAMERA_IMAGE, SHOW_CAMERA_WINDOW, CAMERA_WINDOW_MS,
     CAMERA_IMAGE_DIR, COLOR_RANGES_HSV,
-    BOARD_COLORS, compute_pick_pose, wrist_of, r_for, place_r_for, base_angle, arc_midpoint, needs_midpoint, _wrap_deg,
+    BOARD_COLORS, compute_pick_pose, travel_z_for, wrist_of, r_for, place_r_for, base_angle, arc_midpoint, needs_midpoint, _wrap_deg,
 )
 
 _MM_TO_PULSE = (360.0 / 1.8 * 5.0 * 16.0) / (3.1415926535898 * 32)
@@ -740,7 +740,7 @@ async def pick_and_place_board_async(arm_api, order_id, color, count):
         pick_x, pick_y, pick_z, pick_r = compute_pick_pose(color, count)
         wrist = wrist_of(pick_x, pick_y, pick_r)
         place_x, place_y, place_z = PLACE_XYZ
-        travel_z = max(pick_z, place_z) + SAFE_LIFT_MM
+        travel_z = travel_z_for(pick_z)
         log("ARM", f"[{color}] 픽업 좌표: ({pick_x:.1f},{pick_y:.1f},{pick_z:.1f}) R={pick_r:.1f} "
                     f"손목={wrist:.1f} / 이동 높이: {travel_z:.1f}")
 

@@ -23,7 +23,7 @@ from board_config import (
     MOVE_STABLE_MM, MOVE_STABLE_DEG, MOVE_RESEND_AFTER_SEC, MOVE_MAX_RESEND,
     POSITION_TOLERANCE_MM, POSITION_TOLERANCE_DEG,
     SUCTION_SETTLE_DELAY, RELEASE_SETTLE_DELAY,
-    pick_pose_for, wrist_of, r_for, place_r_for, base_angle, arc_midpoint, needs_midpoint, _wrap_deg,
+    pick_pose_for, travel_z_for, wrist_of, r_for, place_r_for, base_angle, arc_midpoint, needs_midpoint, _wrap_deg,
 )
 
 loop = asyncio.new_event_loop()
@@ -168,7 +168,7 @@ def main():
     px, py, pz, pr = pick_pose_for(color, row, cnt)
     wrist = wrist_of(px, py, pr)
     place_x, place_y, place_z = PLACE_XYZ
-    travel_z = max(pz, place_z) + SAFE_LIFT_MM
+    travel_z = travel_z_for(pz)
 
     print(f"\n[{color}] 줄{row}/{cnt}개 -> 픽업 ({px:.1f},{py:.1f},{pz:.1f}) R={pr:.1f} 손목={wrist:.1f}")
     if input("이 위치로 이동할까요? (y/n): ").strip().lower() != "y":

@@ -24,24 +24,46 @@ import math
 DOBOT_PORT = "COM3"   # 팔 + 컨베이어(Magic Box) 공유 포트 - 장치관리자에서 확인
 
 # =================================================================
-# 좌표 - 픽업 (x, y, base_z, r)
+# 좌표 - 픽업 (x, y, floor_z, r)
 # 색당 5개×4줄(대각선 배치) 적재. row0=제일 가까운 줄 ~ row3=제일 먼 줄.
-# 픽업은 가까운 줄부터 5개 다 빈 다음 다음 줄로.
-# base_z = 그 줄에 1개 남았을 때 높이. 개수가 늘면 BOARD_THICKNESS_MM씩 위로.
+# 픽업은 층별로 - 맨 위층을 가까운 줄부터 하나씩(0/5 1/5 2/5 3/5) 걷고 다음 층(0/4 1/4 ...)으로.
+#   그래서 재고 N개일 때 실물도 이 순서대로 남아 있어야 함 (예: 재고 3 = row1~3에 1개씩, row0 비어있음)
+# floor_z = 그 자리 바닥 높이(보드 0개). 수납함/받침대가 있으면 그 높이 포함.
+#           픽업 높이 = floor_z + 개수 × BOARD_THICKNESS_MM (맨 위 보드 윗면)
+#           실측할 때: floor_z = 실측 z - 그때 쌓인 개수 × BOARD_THICKNESS_MM
 # r = 픽업 시 R (이 값이 손목 각도를 정함 - 나머지 위치 R은 자동 계산)
+# 실측 2026-10-06 (Joint4=0, 손목 0도). green만 수납함, 나머지는 맨바닥.
+# "추정" 자리 = 그 색 row3 실측 + green의 같은 줄-row3 xy 차이, 바닥은 row3와 같게, R=베이스 각도
+#   -> board_pick_check.py로 위치 확인 후 실측값으로 교체할 것
 # =================================================================
 ROW_CAPACITY = 5      # 줄 하나당 최대 적재 개수
 NUM_ROWS = 4          # 줄 개수
 
 PICK_POSE_ROWS = {
-    "red":    [(229.4263, 190, -38, 41), (255.1454, 190, -38, 38),
-               (290.2512, 190, -38, 35), (320.1271, 165.9958, -37.1079, 27.3997)],
-    "green":  [(240.0187, 85, -38, 20), (267.8990, 85, -38, 20),
-               (296.3269, 85, -38, 20), (326.5881, 66.0017, -38, 20)],
-    "blue":   [(245.9397, -0.5, -38, 0.5), (271.3919, -0.5, -38, 0.5),
-               (298.0619, -0.5, -38, 0.5), (325.5233, -28.8626, -38, 0.5)],
-    "yellow": [(253.0182, -100, -38, -20), (279.8343, -100, -38, -18),
-               (303.9048, -100, -38, -16), (332.5840, -121.5756, -37.2979, -20.0798)],
+    "red": [
+        (254.6581, 154.6197, -58.5424, 31.2647),  # row0 추정 - 실측 필요
+        (279.2333, 156.9358, -58.5424, 29.3370),  # row1 추정 - 실측 필요
+        (302.6684, 158.3068, -58.5424, 27.6112),  # row2 추정 - 실측 필요
+        (323.5456, 158.6226, -58.5424, 26.1172),  # row3 실측 (맨바닥, 3개)
+    ],
+    "green": [
+        (259.3591, 64.2914, -46.7157, 13.9222),   # row0 실측 (수납함, 5개)
+        (283.9343, 66.6075, -49.2509, 13.2022),   # row1 실측 (수납함, 5개)
+        (307.3694, 67.9785, -45.8484, 12.4709),   # row2 실측 (수납함, 5개)
+        (328.2466, 68.2943, -43.6052, 11.7532),   # row3 실측 (수납함, 5개)
+    ],
+    "blue": [
+        (265.9353, -45.4868, -53.9105, -9.7062),  # row0 추정 - 실측 필요
+        (290.5105, -43.1707, -53.9105, -8.4525),  # row1 추정 - 실측 필요
+        (313.9456, -41.7997, -53.9105, -7.5839),  # row2 추정 - 실측 필요
+        (334.8228, -41.4839, -53.9105, -7.0629),  # row3 실측 (맨바닥, 3개)
+    ],
+    "yellow": [
+        (268.1114, -126.2881, -49.6555, -25.2218),  # row0 추정 - 실측 필요
+        (292.6866, -123.9720, -49.6555, -22.9558),  # row1 추정 - 실측 필요
+        (316.1217, -122.6010, -49.6555, -21.1977),  # row2 추정 - 실측 필요
+        (336.9989, -122.2852, -49.6555, -19.9441),  # row3 실측 (맨바닥, 3개)
+    ],
 }
 BOARD_THICKNESS_MM = 20.0
 
@@ -136,6 +158,10 @@ COLOR_RANGES_HSV = {
 BOARD_COLORS = list(PICK_POSE_ROWS.keys())
 TOTAL_CAPACITY = ROW_CAPACITY * NUM_ROWS
 
+# 모든 자리가 꽉 찼을 때 제일 높은 맨 위 보드 윗면 (수납함 벽/옆 스택 높이의 기준)
+FULL_STACK_TOP_Z = max(floor_z + ROW_CAPACITY * BOARD_THICKNESS_MM
+                       for rows in PICK_POSE_ROWS.values() for (_x, _y, floor_z, _r) in rows)
+
 
 def _wrap_deg(a):
     """각도를 (-180, 180] 범위로."""
@@ -177,6 +203,12 @@ def arc_midpoint(xy_from, xy_to):
     return (mid_r * math.cos(mid_a), mid_r * math.sin(mid_a))
 
 
+def travel_z_for(pick_z):
+    """보드 들고 이동하는 높이. 스택이 줄어도 낮아지지 않게 "꽉 찼을 때 제일 높은 자리" 기준으로 고정
+    (스택 높이 따라 낮추면 4층부터 들고 나올 때 수납함 벽에 걸리는 게 실물로 확인됨, 2026-10-06)."""
+    return max(pick_z, PLACE_XYZ[2], FULL_STACK_TOP_Z) + SAFE_LIFT_MM
+
+
 def needs_midpoint(xy_from, xy_to):
     """베이스 각도 차이가 MIDPOINT_MIN_ANGLE_DEG 이상이면 중간점 경유 필요."""
     diff = abs(_wrap_deg(base_angle(*xy_to) - base_angle(*xy_from)))
@@ -185,20 +217,22 @@ def needs_midpoint(xy_from, xy_to):
 
 def compute_pick_pose(color, count):
     """
-    count = 해당 색 전체 재고(1~TOTAL_CAPACITY). "가까운 줄부터 빈다"는 전제로
-    현재 줄과 그 줄 남은 개수를 역산해서 (x, y, z, r) 반환.
-    예: TOTAL_CAPACITY=20, count=3 -> row3(4번째 줄), 그 줄 3개.
+    count = 해당 색 전체 재고(1~TOTAL_CAPACITY). "층별로 빈다"(맨 위층을 row0->row3 순으로
+    하나씩, 다 걷으면 다음 층)는 전제로 집을 줄과 그 줄 남은 개수를 역산해서 (x, y, z, r) 반환.
+    예: TOTAL_CAPACITY=20 -> count 20: 0/5, 19: 1/5, 17: 3/5, 16: 0/4, 3: 1/1, 1: 3/1
     """
     if count <= 0:
         raise ValueError(f"[{color}] 재고 0 이하로 픽업 위치 계산 불가 (count={count})")
+    if count > TOTAL_CAPACITY:
+        raise ValueError(f"[{color}] 재고가 최대 적재량 초과 (count={count} > {TOTAL_CAPACITY})")
     emptied = TOTAL_CAPACITY - count
-    row_index = min(emptied // ROW_CAPACITY, NUM_ROWS - 1)
-    count_in_row = ROW_CAPACITY - (emptied % ROW_CAPACITY)
+    row_index = emptied % NUM_ROWS
+    count_in_row = ROW_CAPACITY - emptied // NUM_ROWS
     return pick_pose_for(color, row_index, count_in_row)
 
 
 def pick_pose_for(color, row_index, count_in_row):
     """줄 번호/그 줄 개수를 직접 지정해서 (x, y, z, r) 반환 (튜닝 스크립트용)."""
-    x, y, base_z, r = PICK_POSE_ROWS[color][row_index]
-    z = base_z + (count_in_row - 1) * BOARD_THICKNESS_MM
+    x, y, floor_z, r = PICK_POSE_ROWS[color][row_index]
+    z = floor_z + count_in_row * BOARD_THICKNESS_MM
     return (x, y, z, r)
