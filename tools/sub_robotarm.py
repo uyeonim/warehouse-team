@@ -1,3 +1,8 @@
+"""
+Mobius cnt_process 구독(sub_warehouse_robotarm) 재등록 - 한 번만 실행하는 설정용.
+실행: python tools/sub_robotarm.py  (확인 질문에 y 입력해야 실제로 삭제/재생성)
+import만 해서는 아무것도 안 함.
+"""
 import os
 import requests
 import json
@@ -32,32 +37,47 @@ common_headers = {
     "X-AUTH-CUSTOM-LECTURE": LECTURE
 }
 
-# 1) 기존 구독 삭제 시도 (없으면 실패해도 무시) - SUB_RN이 유니크하므로
-#    이 삭제는 로봇암 구독 자기 자신만 지움. 팀원 구독은 절대 안 건드림.
-del_headers = {**common_headers, "X-M2M-RI": "sub_process_robotarm_del_001"}
-del_res = requests.delete(SUB_PATH, headers=del_headers)
-print("삭제 시도 결과:", del_res.status_code, del_res.text)
+def main():
+    if not FLASK_BASE_URL:
+        raise SystemExit(".env에 FLASK_BASE_URL이 비어있음 - 중단 (빈 주소로 구독 만들면 알림이 안 옴)")
 
-# 2) net:[3] = Create of Direct Child Resource 로 재등록
-create_headers = {
-    **common_headers,
-    "X-M2M-RI": "sub_process_robotarm_req_002",
-    "Content-Type": "application/vnd.onem2m-res+json;ty=23"
-}
+    print(f"구독 rn  : {SUB_RN} (팀원 구독 sub_process_notify와 별개)")
+    print(f"대상 cnt : {AE_NAME}/{CNT_NAME}")
+    print(f"알림 주소: {FLASK_PUBLIC_URL}")
+    if input("이 구독을 삭제 후 재생성합니다. 계속할까요? (y/n): ").strip().lower() != "y":
+        print("취소 - 아무것도 안 바꿈")
+        return
 
-body = {
-    "m2m:sub": {
-        "rn": SUB_RN,
-        "nu": [FLASK_PUBLIC_URL],
-        "nct": 1,
-        "enc": {
-            "net": [3]
+    # 1) 기존 구독 삭제 시도 (없으면 실패해도 무시) - SUB_RN이 유니크하므로
+    #    이 삭제는 로봇암 구독 자기 자신만 지움. 팀원 구독은 절대 안 건드림.
+    del_headers = {**common_headers, "X-M2M-RI": "sub_process_robotarm_del_001"}
+    del_res = requests.delete(SUB_PATH, headers=del_headers)
+    print("삭제 시도 결과:", del_res.status_code, del_res.text)
+
+    # 2) net:[3] = Create of Direct Child Resource 로 재등록
+    create_headers = {
+        **common_headers,
+        "X-M2M-RI": "sub_process_robotarm_req_002",
+        "Content-Type": "application/vnd.onem2m-res+json;ty=23"
+    }
+
+    body = {
+        "m2m:sub": {
+            "rn": SUB_RN,
+            "nu": [FLASK_PUBLIC_URL],
+            "nct": 1,
+            "enc": {
+                "net": [3]
+            }
         }
     }
-}
 
-res = requests.post(CNT_PROCESS_PATH, headers=create_headers, data=json.dumps(body))
-print("Status Code:", res.status_code)
-print("Response:", res.text)
-print("등록된 nu 주소:", FLASK_PUBLIC_URL)
-print("구독 rn:", SUB_RN, "(팀원 구독 sub_process_notify와 별개)")
+    res = requests.post(CNT_PROCESS_PATH, headers=create_headers, data=json.dumps(body))
+    print("Status Code:", res.status_code)
+    print("Response:", res.text)
+    print("등록된 nu 주소:", FLASK_PUBLIC_URL)
+    print("구독 rn:", SUB_RN, "(팀원 구독 sub_process_notify와 별개)")
+
+
+if __name__ == "__main__":
+    main()
