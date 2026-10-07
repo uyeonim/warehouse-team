@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))  # 루트의 .env
 
 COSS_BASE_URL = os.getenv("COSS_BASE_URL")
 AE_NAME = os.getenv("AE_NAME")

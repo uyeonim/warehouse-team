@@ -3,10 +3,10 @@
 트레이 컨베이어 단독 구동 테스트 - 로봇암은 안 움직임.
 메인과 같은 방식으로 STP1 + STP2(벨트 2개)를 동시에 켜고, 지정 시간 뒤 정지.
 
-사용: python board_conveyor_test.py [초] [속도mm/s]
-  python board_conveyor_test.py          -> section1 시간(TRAY_CONVEYOR_RUN_TIME_SECTION1)만큼
-  python board_conveyor_test.py 5        -> 5초
-  python board_conveyor_test.py 5 30     -> 5초, 30mm/s
+사용: python tools/board_conveyor_test.py [초] [속도mm/s]
+  python tools/board_conveyor_test.py          -> section1 시간(TRAY_CONVEYOR_RUN_TIME_SECTION1)만큼
+  python tools/board_conveyor_test.py 5        -> 5초
+  python tools/board_conveyor_test.py 5 30     -> 5초, 30mm/s
 
 !! 메인(main_board_robot_arm.py) 끄고 실행할 것 - 같은 포트(Magic Box)를 씀
 """
@@ -17,6 +17,8 @@ import sys
 
 from DobotRPC import RPCClient, DobotlinkAdapter
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # 루트의 board_config.py
 from board_config import (
     DOBOT_PORT, TRAY_CONVEYOR_STP_1, TRAY_CONVEYOR_STP_2,
     TRAY_CONVEYOR_SPEED_MM_S, TRAY_CONVEYOR_RUN_TIME_SECTION1,

@@ -3,10 +3,10 @@
 픽업 위치 일괄 확인 - 흡착 없이 색별 픽업 위치로 이동만 해서 눈으로 확인하는 도구.
 입력 없이 끝까지 자동으로 돎 (각 위치에서 DWELL_SEC 동안 멈춤).
 
-사용: python board_pick_check.py [색=재고 ...] [줄/개수] [멈춤초]
-  python board_pick_check.py                  -> 재고 기본값(DEFAULT_STOCK)으로 확인, 3초
-  python board_pick_check.py r=1 g=20 b=1 y=1 -> 색별 재고 지정 (0이면 그 색 건너뜀)
-  python board_pick_check.py 3/3 5            -> 4색 모두 줄3/3개 자리, 5초
+사용: python tools/board_pick_check.py [색=재고 ...] [줄/개수] [멈춤초]
+  python tools/board_pick_check.py                  -> 재고 기본값(DEFAULT_STOCK)으로 확인, 3초
+  python tools/board_pick_check.py r=1 g=20 b=1 y=1 -> 색별 재고 지정 (0이면 그 색 건너뜀)
+  python tools/board_pick_check.py 3/3 5            -> 4색 모두 줄3/3개 자리, 5초
   재고 지정 시 위치는 메인과 같은 계산(compute_pick_pose) - 그 재고일 때 메인이 집으러 가는 자리
 
 경로: HOME -> 이동 높이로 픽업 위 -> 하강(멈춤) -> 이동 높이로 상승 -> 다음 색 ... -> HOME
@@ -22,6 +22,8 @@ import time
 
 from DobotRPC import RPCClient, DobotlinkAdapter
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # 루트의 board_config.py
 from board_config import (
     DOBOT_PORT, NUM_ROWS, ROW_CAPACITY, HOME_XYZ, HOME_WRIST_DEG, PLACE_XYZ, SAFE_LIFT_MM,
     MOVE_TIMEOUT_SEC, MOVE_POLL_INTERVAL_SEC,

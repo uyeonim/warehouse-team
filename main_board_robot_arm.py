@@ -101,7 +101,8 @@ restock 처리 (신규):
   - .env에 MQTT_HOST/PORT/USER/PASS, MQTT_TOPIC, FLASK_BASE_URL
   - pip install DobotRPC opencv-python numpy (Python 3.9 환경 - venv-dobot)
   - 좌표/컨베이어/카메라/HSV 등 튜닝값은 전부 board_config.py에서 수정
-    (CAMERA_ROI/COLOR_RANGES_HSV는 camera.py로 확인 후 board_config.py에 반영)
+    (CAMERA_ROI/COLOR_RANGES_HSV는 tools/camera.py로 확인 후 board_config.py에 반영)
+  - 테스트/튜닝 스크립트는 tools/ 폴더 (루트에서 python tools/xxx.py로 실행)
 =====================================================================
 """
 

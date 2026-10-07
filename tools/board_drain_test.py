@@ -4,9 +4,9 @@
 집는 자리는 메인과 같은 compute_pick_pose (층별: 0/5 1/5 2/5 3/5 0/4 ... 3/1).
 트레이에 놓을 때마다 멈춤 - 사람이 치우고 엔터 치면 다음 보드.
 
-사용: python board_drain_test.py [색] [시작 재고]
-  python board_drain_test.py green       -> green 20개부터 1까지
-  python board_drain_test.py green 12    -> green 12부터 이어서
+사용: python tools/board_drain_test.py [색] [시작 재고]
+  python tools/board_drain_test.py green       -> green 20개부터 1까지
+  python tools/board_drain_test.py green 12    -> green 12부터 이어서
 
 동작은 메인 pick_and_place와 같은 순서 (카메라 확인 / 서버 보고 / MQTT는 안 함 - 서버 재고 안 바뀜):
   이동 높이로 픽업 위 -> 하강 -> 흡착 ON -> 상승 -> (중간점) -> 트레이 위 -> 색별 놓기 R 회전
@@ -23,6 +23,8 @@ import time
 
 from DobotRPC import RPCClient, DobotlinkAdapter
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # 루트의 board_config.py
 from board_config import (
     DOBOT_PORT, BOARD_COLORS, TOTAL_CAPACITY, PICK_POSE_ROWS, BOARD_THICKNESS_MM, HOME_XYZ, HOME_WRIST_DEG, PLACE_XYZ, SAFE_LIFT_MM,
     PLACE_R_OFFSET_DEG_BY_COLOR,

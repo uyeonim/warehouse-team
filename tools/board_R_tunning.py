@@ -16,6 +16,8 @@ import time
 
 from DobotRPC import RPCClient, DobotlinkAdapter
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # 루트의 board_config.py
 from board_config import (
     DOBOT_PORT, NUM_ROWS, ROW_CAPACITY, BOARD_COLORS, PLACE_XYZ, PLACE_R_OFFSET_DEG_BY_COLOR,
     HOME_XYZ, HOME_WRIST_DEG,
