@@ -43,7 +43,8 @@ pickup 게이트) 패턴과 동일하게 맞춤:
     2026-10-02) 2-2 status 표와 일치 확인됨.
 
 fault 처리 - 우리가 관리하는 fault 3종만:
-    board_pack_failed / tray_01_belt_jammed / tray_02_belt_jammed
+    board_pack_failed / tray_00_belt_jammed / tray_01_belt_jammed / tray_02_belt_jammed
+    (tray_00은 section0 신설에 맞춰 임시로 정한 이름 - 플랫폼팀 확인 필요)
   흐름: 우리가 failed 보고 -> 플랫폼이 fault 채워서 push (status는 그대로
   유지) -> 사람이 물리적으로 해결 -> 관리자페이지에서 fault:null로 push
   -> 우리가 그 전이(있었다가 없어짐)를 감지 -> 같은 동작 재시도 -> done/failed
@@ -78,12 +79,12 @@ restock 처리 (신규):
     0. jobKey 중복체크 -> 로컬 큐 + 서버 큐 적재 (게이트 열렸을 때만 실제 처리)
     1. cnt_board_status/cnt_{색} = busy
     2. 배출 (A안 높이계산)
-    3. 카메라로 배치 확인 (색상+존재 여부)
+    3. HOME 복귀 후 고정 카메라로 배치 확인 (색상+존재 여부)
     4. cnt_robot_arm/cnt_board_robot_arm = done/failed
     5. 성공 시 cnt_warehouse/cnt_board_dispense
     6. cnt_board_status/cnt_{색} = idle + count-1  -> 플랫폼이 board_packed로 전이
     7. 게이트 잠금 + 서버 큐에서 제거
-  [트레이 컨베이어 - keycap_packed(section1) / board_packed(section2)]
+  [트레이 컨베이어 - keycap_dispensed(section0) / keycap_packed(section1) / board_packed(section2)]
     8. 컨베이어(Magic Box) 해당 section 구간 구동 (게이트/큐 없음 - 직접 반응)
     9. cnt_conveyor/cnt_tray_conveyor = {"order_id":..., "sectionN": "done"|"failed"}
   [fault 해제 재시도] - 위 픽업/컨베이어 실패 후 fault 걸렸다가 null 되면
@@ -150,11 +151,13 @@ COSS_ORIGIN = os.getenv("ORIGIN")
 
 STATUS_PICK = "tray_reached"           # 보드 픽업 트리거
 STATUS_MISMATCH = "board_mismatched"   # 재출고 트리거 - tray_reached와 같은 핸들러로 처리
+STATUS_CONVEYOR_0 = "keycap_dispensed" # 컨베이어 section0 - 키캡 로봇암 앞까지 이동
 STATUS_CONVEYOR_1 = "keycap_packed"    # 컨베이어 section1 - 보드 로봇암 앞까지 이동
 STATUS_CONVEYOR_2 = "board_packed"     # 컨베이어 section2 - 픽업대까지 이동
 
 FAULT_RETRY_MAP = {
     "board_pack_failed": "pick",
+    "tray_00_belt_jammed": "conveyor0",   # section0용 - 이름은 임시, 플랫폼팀 확인 필요
     "tray_01_belt_jammed": "conveyor1",
     "tray_02_belt_jammed": "conveyor2",
 }
@@ -173,13 +176,13 @@ CALL_TIMEOUT = 5
 # 튜닝값(좌표/컨베이어/타이밍/카메라/HSV)은 전부 board_config.py에 있음
 from board_config import (
     DOBOT_PORT,
-    PICK_POSE_ROWS, PLACE_XYZ, PLACE_R_OFFSET_DEG_BY_COLOR, CAMERA_CHECK_XYZ, HOME_XYZ, HOME_WRIST_DEG, SAFE_LIFT_MM,
+    PICK_POSE_ROWS, PLACE_XYZ, PLACE_R_OFFSET_DEG_BY_COLOR, HOME_XYZ, HOME_WRIST_DEG, SAFE_LIFT_MM,
     MOVE_TIMEOUT_SEC, MOVE_POLL_INTERVAL_SEC, PRECISION_SETTLE_SEC,
     MOVE_STABLE_MM, MOVE_STABLE_DEG, MOVE_RESEND_AFTER_SEC, MOVE_MAX_RESEND,
     SUCTION_SETTLE_DELAY, RELEASE_SETTLE_DELAY,
     POSITION_TOLERANCE_MM, POSITION_TOLERANCE_DEG,
     TRAY_CONVEYOR_STP_1, TRAY_CONVEYOR_STP_2, TRAY_CONVEYOR_SPEED_MM_S,
-    TRAY_CONVEYOR_RUN_TIME_SECTION1, TRAY_CONVEYOR_RUN_TIME_SECTION2,
+    TRAY_CONVEYOR_RUN_TIME_SECTION0, TRAY_CONVEYOR_RUN_TIME_SECTION1, TRAY_CONVEYOR_RUN_TIME_SECTION2,
     CAMERA_INDEX_PREFERENCE, CAMERA_ROI, CAMERA_PRESENCE_MIN_RATIO, CAMERA_SETTLE_DELAY,
     CAMERA_WARMUP_FRAMES, SAVE_CAMERA_IMAGE, SHOW_CAMERA_WINDOW, CAMERA_WINDOW_MS,
     CAMERA_IMAGE_DIR, COLOR_RANGES_HSV,
@@ -725,7 +728,7 @@ async def travel(arm_api, from_xyz, to_xyz, wrist, label, final_settle=0.0):
 async def pick_and_place_board_async(arm_api, order_id, color, count):
     """
     HOME -> (중간점) -> 픽업 위 -> 픽업 하강 -> 흡착 -> 들어올림 -> (중간점) ->
-    트레이 위 -> 하강 -> 놓기 -> 들어올림 -> 카메라 확인 위치 -> 확인 -> (중간점) -> HOME.
+    트레이 위 -> 하강 -> 놓기 -> 들어올림 -> (중간점) -> HOME -> 고정 카메라로 확인.
 
     픽업 위치 / 트레이 하강 두 구간만 GetPose로 도착 확인. 여기서 실패하면 카메라
     확인 없이 즉시 board:"failed" 보고. 성공(board:"done")은 카메라 확인까지 통과해야만.
@@ -796,16 +799,12 @@ async def pick_and_place_board_async(arm_api, order_id, color, count):
         await move_and_wait(arm_api, (place_x, place_y, travel_z, r_for(place_x, place_y, HOME_WRIST_DEG)),
                             label="놓은 뒤 R 원위치 (손목 0도)")
 
-        # 카메라 확인 위치로 이동 후 확인 (카메라 위치/HOME은 항상 손목 0도 고정)
-        await travel(arm_api, (place_x, place_y, travel_z), CAMERA_CHECK_XYZ, HOME_WRIST_DEG,
-                     "카메라 체크 위치로 이동")
+        # 트레이 -> (중간점) -> HOME 복귀 후 고정 카메라로 확인 (팔이 트레이 위에 있으면 화면을 가림)
+        await travel(arm_api, (place_x, place_y, travel_z), HOME_XYZ, HOME_WRIST_DEG, "초기위치로 복귀")
         await asyncio.sleep(CAMERA_SETTLE_DELAY)
         log("ARM", "카메라로 배치 확인 중")
         verified, detected_color, reason = verify_board_on_tray(color)
         log("ARM", f"카메라 확인 결과: {reason} (감지된 색={detected_color})")
-
-        # 카메라 위치 -> (중간점) -> HOME
-        await travel(arm_api, CAMERA_CHECK_XYZ, HOME_XYZ, HOME_WRIST_DEG, "초기위치로 복귀")
 
         report_board_robot_arm(order_id, "done" if verified else "failed")
 
@@ -932,8 +931,10 @@ def process_board_job(loop, arm_api, box_api, order_id, color):
 
 
 def handle_tray_conveyor(loop, box_api, order_id, section):
-    """section: "1" (keycap_packed -> 보드 로봇암 앞) 또는 "2" (board_packed -> 픽업대)."""
-    run_time = TRAY_CONVEYOR_RUN_TIME_SECTION1 if section == "1" else TRAY_CONVEYOR_RUN_TIME_SECTION2
+    """section: "0" (keycap_dispensed -> 키캡 로봇암 앞) / "1" (keycap_packed -> 보드 로봇암 앞)
+    / "2" (board_packed -> 픽업대)."""
+    run_time = {"0": TRAY_CONVEYOR_RUN_TIME_SECTION0, "1": TRAY_CONVEYOR_RUN_TIME_SECTION1,
+                "2": TRAY_CONVEYOR_RUN_TIME_SECTION2}[section]
     log("CONV", f"{order_id}: 컨베이어 section{section} 구동 시작")
     success = loop.run_until_complete(run_tray_conveyor_async(box_api, run_time, f" (section{section})"))
     report_conveyor_tray(order_id, section, "done" if success else "failed")
@@ -984,6 +985,8 @@ def check_fault_transitions(loop, arm_api, box_api, orders):
             color = order.get("board")
             if retry_kind == "pick":
                 process_board_job(loop, arm_api, box_api, oid, color)
+            elif retry_kind == "conveyor0":
+                handle_tray_conveyor(loop, box_api, oid, "0")
             elif retry_kind == "conveyor1":
                 handle_tray_conveyor(loop, box_api, oid, "1")
             elif retry_kind == "conveyor2":
@@ -1131,6 +1134,11 @@ def handle_snapshot(loop, arm_api, box_api, data):
                     enqueue_to_server(order_id, color)
                     log("QUEUE", f"{order_id}({color}, {status}, retry={retry}) 큐 적재 - 대기 {len(job_queue)}건")
 
+        elif status == STATUS_CONVEYOR_0:
+            if handled_status.get(order_id) != status:
+                handle_tray_conveyor(loop, box_api, order_id, "0")
+                handled_status[order_id] = status
+
         elif status == STATUS_CONVEYOR_1:
             if handled_status.get(order_id) != status:
                 handle_tray_conveyor(loop, box_api, order_id, "1")
@@ -1184,7 +1192,7 @@ def main():
     loop.run_until_complete(move_and_wait(arm_api, (hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG)),
                                           label="시작 - 초기위치로 이동"))
 
-    log("INIT", f"준비 완료 (픽업:{STATUS_PICK}/{STATUS_MISMATCH}, 컨베이어1:{STATUS_CONVEYOR_1}, "
+    log("INIT", f"준비 완료 (픽업:{STATUS_PICK}/{STATUS_MISMATCH}, 컨베이어0:{STATUS_CONVEYOR_0}, 컨베이어1:{STATUS_CONVEYOR_1}, "
                 f"컨베이어2:{STATUS_CONVEYOR_2}, 큐 {len(job_queue)}건, "
                 f"게이트 {'닫힘' if not gate_open else '열림'}) - 대기 시작. Ctrl+C로 종료")
 

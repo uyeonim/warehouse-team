@@ -60,6 +60,7 @@ NORMAL_FLOW = [
 FAULTS = {
     "keycap_01_belt_jammed":   lambda o: "keycap_conveyor:01",
     "keycap_02_belt_jammed":   lambda o: "keycap_conveyor:02",
+    "tray_00_belt_jammed":     lambda o: "tray_conveyor:00",   # section0 - 이름 임시
     "tray_01_belt_jammed":     lambda o: "tray_conveyor:01",
     "tray_02_belt_jammed":     lambda o: "tray_conveyor:02",
     "keycap_cartridge_failed": lambda o: f"keycap_cartridge:keycap1:{_slot(o, 0)}",

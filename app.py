@@ -368,10 +368,11 @@ def report_conveyor(which):
       body: {"order_id": "...", "keycap1": "done", "keycap2": "done",
              "keycap3": "done", "keycap4": "failed"}  (4개 다 명시)
 
-    tray 컨베이어: section1 / section2 각각 별도 보고. 실패 시 플랫폼이
-      fault:tray_01_belt_jammed(section1) / tray_02_belt_jammed(section2)로 판정.
+    tray 컨베이어: section0 / section1 / section2 각각 별도 보고. 실패 시 플랫폼이
+      fault:tray_00_belt_jammed(section0, 이름 임시) / tray_01_belt_jammed(section1) /
+      tray_02_belt_jammed(section2)로 판정.
       fault 해제 후 재시도도 이 라우트를 그대로 재사용.
-      body: {"order_id": "...", "section": "1" | "2", "status": "done" | "failed"}
+      body: {"order_id": "...", "section": "0" | "1" | "2", "status": "done" | "failed"}
     """
     data = request.get_json(force=True, silent=True) or {}
     order_id = data.get("order_id")
@@ -389,8 +390,8 @@ def report_conveyor(which):
     elif which == "tray":
         section = data.get("section")
         status = data.get("status")
-        if section not in ("1", "2") or status not in ("done", "failed"):
-            return jsonify({"error": "section(1/2), status(done/failed)는 필수"}), 400
+        if section not in ("0", "1", "2") or status not in ("done", "failed"):
+            return jsonify({"error": "section(0/1/2), status(done/failed)는 필수"}), 400
         content = {"order_id": order_id, f"section{section}": status}
         cnt_path = "cnt_conveyor/cnt_tray_conveyor"
 

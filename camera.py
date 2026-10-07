@@ -6,7 +6,7 @@
 (그러면 메인 코드에도 같은 값이 그대로 적용됨).
 
 사용법:
-  1. 로봇암을 CAMERA_CHECK_XYZ 위치에 두고 python camera.py
+  1. 트레이 위 고정 카메라 - 로봇암은 HOME(트레이 밖)에 두고 python camera.py
   2. 초록 사각형(ROI)이 트레이 위 보드 자리에 오는지 확인 -> 안 맞으면
      board_config.py의 CAMERA_ROI 수정 후 재실행
   3. 's': ROI 안 HSV 출력 (중앙 픽셀 + ROI 전체 중앙값)
