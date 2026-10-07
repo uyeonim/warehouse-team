@@ -75,4 +75,10 @@ if __name__ == "__main__":
     asyncio.set_event_loop(loop)
     # DobotlinkAdapter는 루프가 돌기 전에 만들어야 함 (내부에서 run_until_complete 호출)
     dobotlink = DobotlinkAdapter(RPCClient(), is_sync=False)
-    loop.run_until_complete(main(dobotlink.MagicianLite, dobotlink.MagicBox, run_time, speed))
+    try:
+        loop.run_until_complete(main(dobotlink.MagicianLite, dobotlink.MagicBox, run_time, speed))
+    except KeyboardInterrupt:
+        # Ctrl+C는 이벤트 루프 밖에서 터져서 main()의 finally(정지 명령)가 안 돎 - 여기서 직접 정지
+        s1, s2 = loop.run_until_complete(stop_both(dobotlink.MagicBox))
+        print(f"[CONV] Ctrl+C - 정지 결과: STP1={s1}, STP2={s2}")
+        loop.run_until_complete(safe_call(dobotlink.MagicianLite.DisconnectDobot(portName=DOBOT_PORT)))

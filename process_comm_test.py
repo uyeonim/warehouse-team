@@ -56,6 +56,34 @@ NORMAL_FLOW = [
     "assigned", "keycap_dispensed", "keycap_reached", "keycap_packed", "tray_reached",
     "board_packed", "pickup_reached", "loaded", "arrived", "verified", "received", "completed",
 ]
+# 보드 로봇암(main_board_robot_arm.py)이 각 status/fault에 하는 일 - 메뉴 목록 옆에 표시용
+BOARD_ARM_ON_STATUS = {
+    "keycap_dispensed": "컨베이어 section0",
+    "keycap_packed":    "컨베이어 section1",
+    "tray_reached":     "보드 픽업",
+    "board_mismatched": "보드 재투입",
+    "board_packed":     "컨베이어 section2",
+    "pickup_reached":   "게이트 열림",
+    "loaded":           "게이트 열림",
+    "arrived":          "게이트 열림",
+    "unclaimed":        "게이트 열림",
+    "verified":         "게이트 열림",
+    "received":         "게이트 열림",
+    "completed":        "게이트 열림",
+}
+BOARD_ARM_ON_FAULT_CLEAR = {   # fault 걸었다가 해제(null)하면 보드 로봇암이 재시도하는 것
+    "board_pack_failed":   "보드 픽업 재시도",
+    "tray_00_belt_jammed": "section0 재구동",
+    "tray_01_belt_jammed": "section1 재구동",
+    "tray_02_belt_jammed": "section2 재구동",
+}
+
+
+def _with_arm(item, table, suffix=""):
+    action = table.get(item)
+    return f"{item:<24} (보드암: {action}{suffix})" if action else item
+
+
 # 2-3 fault 전체 - 값은 fault_section 기본값을 만드는 함수 (order -> str)
 FAULTS = {
     "keycap_01_belt_jammed":   lambda o: "keycap_conveyor:01",
@@ -164,9 +192,9 @@ def ask(prompt, default=None):
     return raw if raw else default
 
 
-def choose(title, items):
+def choose(title, items, labels=None):
     for i, it in enumerate(items, 1):
-        print(f"  {i:>2}) {it}")
+        print(f"  {i:>2}) {labels[i - 1] if labels else it}")
     raw = input(f"{title} 번호 (엔터=취소): ").strip()
     if not raw:
         return None
@@ -217,10 +245,10 @@ def need_order(st):
 def set_status(st):
     if not need_order(st):
         return
-    s = choose("status", STATUSES)
+    s = choose("status", STATUSES, [_with_arm(s, BOARD_ARM_ON_STATUS) for s in STATUSES])
     if s:
         st.order["status"] = s
-        print(f"status={s}")
+        print(f"status={_with_arm(s, BOARD_ARM_ON_STATUS)}")
 
 
 def next_status(st):
@@ -235,13 +263,13 @@ def next_status(st):
         print("이미 completed")
         return
     st.order["status"] = NORMAL_FLOW[i + 1]
-    print(f"status: {cur} -> {st.order['status']}")
+    print(f"status: {cur} -> {_with_arm(st.order['status'], BOARD_ARM_ON_STATUS)}")
 
 
 def set_fault(st):
     if not need_order(st):
         return
-    f = choose("fault", list(FAULTS))
+    f = choose("fault", list(FAULTS), [_with_arm(f, BOARD_ARM_ON_FAULT_CLEAR, " - 해제 시") for f in FAULTS])
     if not f:
         return
     section = ask("fault_section", FAULTS[f](st.order))

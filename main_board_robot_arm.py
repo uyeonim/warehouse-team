@@ -1220,6 +1220,16 @@ def main():
             loop.run_until_complete(suck(arm_api, False))
         except Exception as e:
             log("SHUTDOWN", f"흡착 OFF 시도 중 에러(무시 가능): {e}")
+        # 컨베이어 도는 중에 Ctrl+C로 끄면 run_tray_conveyor_async의 정지 명령이 안 나가서
+        # 벨트가 계속 돌 수 있음 - 종료 시 무조건 두 벨트 정지
+        try:
+            r1, r2 = loop.run_until_complete(asyncio.gather(
+                _set_conveyor(box_api, TRAY_CONVEYOR_STP_1, False, 0),
+                _set_conveyor(box_api, TRAY_CONVEYOR_STP_2, False, 0),
+            ))
+            log("SHUTDOWN", f"컨베이어 정지: STP1={r1}, STP2={r2}")
+        except Exception as e:
+            log("SHUTDOWN", f"컨베이어 정지 중 에러(무시 가능): {e}")
         try:
             loop.run_until_complete(safe_call(arm_api.DisconnectDobot(portName=DOBOT_PORT)))
         except Exception as e:
