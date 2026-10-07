@@ -22,16 +22,16 @@
        바로 배출해버리는 문제가 있었음)
 
   ============================== 통신 대상 (Flask) ==============================
-   GET  /stock/keycap?board=NS         부팅 시 재고 8칸 초기 조회
-   GET  /queue/NS/next                 부팅 시 미완료 큐 복원
-   POST /queue/NS/enqueue              새 주문 감지 시 서버 큐에도 적재
-   POST /queue/NS/complete             배출 성공 후(또는 유령 주문 정리 시) 서버 큐에서 제거
+   GET  /stock/keycap?board=TF         부팅 시 재고 8칸 초기 조회
+   GET  /queue/TF/next                 부팅 시 미완료 큐 복원
+   POST /queue/TF/enqueue              새 주문 감지 시 서버 큐에도 적재
+   POST /queue/TF/complete             배출 성공 후(또는 유령 주문 정리 시) 서버 큐에서 제거
    POST /restock/{letter}/{color}                restock 감지 시 호출, 채워진 개수 응답받음
    POST /report/keycap-status              기존 그대로 (상태 보고, 성공/실패 무관 항상)
    POST /report/keycap-dispense            기존 그대로 (배출 성공했을 때만)
-   GET  /gate/NS                       부팅 시 게이트(픽업 대기) 상태 복원
-   POST /gate/NS                       게이트 잠글 때 서버에 기록 (body: order_id)
-   POST /gate/NS/clear                 게이트 열릴 때 서버 기록 해제
+   GET  /gate/TF                       부팅 시 게이트(픽업 대기) 상태 복원
+   POST /gate/TF                       게이트 잠글 때 서버에 기록 (body: order_id)
+   POST /gate/TF/clear                 게이트 열릴 때 서버 기록 해제
 
   ※ 위 신규 라우트(/stock, /queue/*, /restock/*, /gate/*)는 이번에 새로 정의한
     스펙이라 Flask 쪽 실제 응답 형식과 어긋나면 즉시 팀원과 맞춰서 파싱부만 고칠 것.
@@ -419,6 +419,37 @@
    - SERVO_HOME_ANGLE 170 -> 165: 170도에서 일부 서보가 끝단에 걸려 계속 떨림
      (Servo_Jitter_Test로 확인, 5도 낮추니 해소). PUSH_ANGLE(70)은 그대로.
 
+  [2026-10-06 IR 판정 진단 출력 추가 + IR 설정 정리]
+   - 배경: N_r만 연결해 테스트했는데 키캡이 정상 통과했는데도 disable로 판정됨.
+     원인 후보: (1) IR_MIN_BREAK_MS(7)가 실측 최소 끊김(7ms)과 같아서 짧은 통과가
+     걸러짐 (2) 감시 중 MQTT 콜백의 HTTP 호출로 loop()가 막혀 폴링을 놓침
+     (3) 빔이 안 읽힘(IR_DETECT_LEVEL 반대/센서 전원·GND).
+   - 대응: 배출 판정 직후 시리얼에 "[IR] 최대 끊김(ms) / 최대 폴링 간격(ms) / 판정"을
+     출력. 이 값으로 위 셋 중 어느 쪽인지 가를 것 (최대 끊김 1~6 -> IR_MIN_BREAK_MS
+     낮춤, 0 + 간격 큼 -> loop 블로킹, 0 + 간격 정상 -> 레벨/배선 점검).
+   - IR 설정: EI는 E_r, NS는 N_r에만 센서 켬(IR_SENSOR_INSTALLED=1,
+     IR_INSTALLED[0][0]=true), TF/PJ는 센서 없음(0 / 전부 false). 이전에 어긋나 있던
+     IR 관련 주석도 현재 값에 맞게 정리함. IR_MIN_BREAK_MS 값(7) 자체는 그대로 둠.
+
+  [2026-10-06 IR 끊김 측정을 폴링 -> 핀 변화 인터럽트 병행으로 보강]
+   - 배경: N_r 테스트에서 "[IR] 최대 끊김=0, 최대 폴링 간격=39ms, 판정=실패". 핀/레벨/전원은
+     이상 없음이 확인됨. 최대 끊김=0은 "한 번도 안 끊김"이 아니라 "끊김이 폴링 샘플
+     1개로만 잡힘"일 때도 0이라, loop() 폴링 간격(WiFi/MQTT 호출 포함 수십 ms)이
+     키캡 끊김(7~19ms)보다 길어서 놓쳤을 가능성이 큼.
+   - 대응: 배선된 레일 핀에 attachInterrupt(CHANGE)를 걸어 끊김 시간을 마이크로초로
+     직접 측정(irIsr). 판정은 폴링 래치 OR 인터럽트 래치. 시리얼 진단에 폴링 횟수,
+     끊김 샘플 수, 인터럽트 최대 끊김(us)을 같이 출력. 레일을 늘릴 때 핀별 인터럽트 지원 여부를 확인할 것.
+
+  [2026-10-07 서보 각도 재실측 + IR 감시 시간/디바운스 조정 + 4개 보드 코드 동기화]
+   - 서보: 혼을 0도 기준으로 다시 조립한 뒤 배출(PUSH_ANGLE)=20도로 변경. 대기
+     (SERVO_HOME_ANGLE)는 170도로 시험해봤으나 165도일 때 더 안정적으로 작동해서
+     165도 유지(09-30 값 그대로).
+   - IR_POLL_WINDOW_MS 4500 -> 7000 (모터 시작 시각 기준 전체 감시 시간 7초).
+   - IR_MIN_BREAK_MS 5 -> 10: 반복 테스트에서 끊김이 대체로 20ms 이상으로 관찰되어 상향.
+     (인터럽트 측정값 "최대끊김(us)"를 시리얼 [IR] 진단에서 계속 확인하며 조정할 것)
+   - 시리얼 [IR] 진단 출력 + 핀 변화 인터럽트 측정을 NS에만 있던 상태에서 4개 보드
+     전부로 통일 (센서 미배선 보드는 IR_SENSOR_INSTALLED=0이라 해당 블록이 컴파일에서 빠짐).
+
   다른 3개 보드는 이 파일을 복사한 뒤 "보드별 설정" 블록만 아래 표대로
   바꿔서 각 보드에 업로드하면 됩니다. (지금 이 파일은 TF 보드용입니다)
 
@@ -481,8 +512,8 @@ const uint8_t IR_PIN[2][4] = {
 // ---- 서보 동작 파라미터 (실측 후 조정) ----
 #define SERVO_MIN_PULSE       150
 #define SERVO_MAX_PULSE       600
-#define SERVO_HOME_ANGLE      165   // 대기 각도 (170도에서 일부 서보가 끝단에서 떨어서 165로 하향 - Servo_Jitter_Test로 확인)
-#define PUSH_ANGLE             70   // 배출(푸시) 각도 (실측 확정값) - 대기(165)에서 이 값까지 "감소"하며 이동함에 주의
+#define SERVO_HOME_ANGLE      165   // 대기 각도 (170도에서 일부 서보가 끝단에서 떨어서 165로 하향 - Servo_Jitter_Test로 확인, 10/07 재시험에서도 165가 더 안정적)
+#define PUSH_ANGLE             20   // 배출(푸시) 각도 (10/07 실측 확정값) - 대기(165)에서 이 값까지 "감소"하며 이동함에 주의
 #define SWEEP_STEP_DELAY_MS    10   // 1도 이동마다 대기 (실측 확정값)
 #define RETURN_DELAY_MS       400   // 복귀 명령 후 실제 도달까지 대기
 #define DISPENSE_HOLD_MS      400   // 푸시 각도 도달 후 유지 시간
@@ -493,17 +524,18 @@ const uint8_t IR_PIN[2][4] = {
 #define SERVO_STARTUP_STAGGER_MS 200 // 부팅 시 서보를 한 채널씩 순서대로 홈으로 보낼 때 채널 사이 간격 (돌입전류 분산용, 8개 x 200ms = 약 1.6초)
 
 // ---- [브레이크빔(송신부/수신부 분리형) 센서 판정 파라미터] ----
-// 키캡이 정확히 언제 떨어질지 알 수 없음(서보가 180도까지 도는 도중일 수도,
+// 키캡이 정확히 언제 떨어질지 알 수 없음(서보가 푸시 각도까지 도는 도중일 수도,
 // 홀드 중일 수도, 복귀 중일 수도 있음) -> "복귀가 끝난 뒤에만 잠깐 감시"하는
 // 방식 대신, 모터가 움직이기 시작하는 순간(DS_HOMING 진입)부터 배출 사이클이
 // 끝날 때까지 매 loop()마다 IR 핀을 계속 폴링함(pollIrForCurrentJob() 참고).
 // 빔이 IR_MIN_BREAK_MS 이상 연속으로 끊기면 그 순간 "유효 통과"로 래치(확정)
 // 하고, 그 뒤로 빔이 복구돼도 래치는 유지됨.
 // IR_POLL_WINDOW_MS는 "모터 시작 시각(irWindowStart)" 기준 전체 감시 윈도우
-// 길이 - 실제 서보 동작 시퀀스(복귀대기+킥+스윕+홀드+복귀대기 ≈ 3.5~4초)를
-// 전부 덮고도 여유가 남도록 넉넉하게 잡음.
-#define IR_POLL_WINDOW_MS  4500   // 모터 시작 시각 기준 전체 감시 윈도우 (약 4.5초, 넉넉하게) - 실측 후 조정
-#define IR_MIN_BREAK_MS       7   // 이 이상 연속으로 끊겨야 유효 통과로 인정(노이즈 필터) - IR_Sensor_Test로 실측(7~19ms)한 결과 반영, 여유 두고 7로 설정
+// 길이 - 실제 서보 동작 시퀀스(복귀대기+킥+스윕+홀드+복귀대기 ≈ 2.6~3초)를
+// 전부 덮고도 여유가 남도록 넉넉하게 잡음. 판정은 성공이든 실패든 이 윈도우가
+// 다 끝난 뒤에만 내려지므로, 센서가 배선된 레일은 배출 1건당 최소 이 시간만큼 걸림.
+#define IR_POLL_WINDOW_MS  7000   // 모터 시작 시각 기준 전체 감시 윈도우 (7초) - 10/07 확정
+#define IR_MIN_BREAK_MS      10   // 이 이상 연속으로 끊겨야 유효 통과로 인정(노이즈 필터). 10/07 반복 테스트에서 끊김이 대체로 20ms 이상이라 5 -> 10으로 상향. 시리얼 [IR] 진단의 "최대끊김" 값을 보고 조정할 것
 
 // ---- [IR 센서 장착 여부 토글 - 보드 전체] ----
 // 1 = 이 보드에 브레이크빔 IR 센서가 최소 1개 이상 배선됨 (판정 로직 컴파일 포함)
@@ -519,9 +551,9 @@ const uint8_t IR_PIN[2][4] = {
 // 폴링+디바운스 판정을 하고, false인 레일은 핀을 읽지 않고 즉시 성공 처리함
 // (플로팅 핀을 실수로 읽어서 오판정하는 일을 방지). 배선이 추가될 때마다
 // 이 표만 갱신하면 됨 - IR_PIN 배열과 인덱스([글자슬롯][색상슬롯])가 동일하게 대응.
-// ※ 현재 배선 완료: 없음 (센서는 EI 보드의 E_r에만 배선됨)
+// ※ 현재 배선 완료: 없음 (전 레일 센서 미배선)
 const bool IR_INSTALLED[2][4] = {
-  {false, false, false, false},  // 이 보드는 센서 미배선
+  {false, false, false, false},  // 센서 미배선
   {false, false, false, false}
 };
 
@@ -693,6 +725,37 @@ int           sweepAngle = 0;
 unsigned long irWindowStart = 0;  // 감시 윈도우 시작 시각 (=모터 시작 시각, DS_IDLE->DS_HOMING 전환 시점에 기록)
 unsigned long irBreakStart  = 0;  // 지금 이어지고 있는 "빔 끊김" 구간의 시작 시각 (0 = 지금은 안 끊긴 상태)
 bool          irLatched     = false; // 윈도우 안에서 유효 통과(디바운스 통과)가 한 번이라도 확정됐는지
+unsigned long irMaxBreakMs = 0;  // [진단] 이번 배출에서 관측된 가장 긴 연속 끊김 시간(ms)
+unsigned long irLastPollMs = 0;  // [진단] 직전 폴링 시각
+unsigned long irMaxGapMs   = 0;  // [진단] 폴링 사이 가장 긴 간격(ms) - 크면 loop()가 막혀서 감시를 놓쳤다는 뜻
+unsigned long irPollCount = 0;     // [진단] 이번 배출 동안 폴링한 횟수
+unsigned long irBrokenSamples = 0; // [진단] 그 중 "끊김"으로 읽힌 샘플 수
+
+#if IR_SENSOR_INSTALLED
+// ---- 핀 변화 인터럽트로 끊김 시간 측정 ----
+// loop()에서 폴링하면 WiFi/MQTT 호출 때문에 폴링 간격이 길어져서(수십 ms) 짧은
+// 끊김을 놓치거나 샘플 1개로만 잡히는 문제가 있었음 -> 핀 변화 시각을 마이크로초로
+// 직접 기록해서 loop() 속도와 무관하게 끊김 길이를 잼. 현재 배출 중인 레일의 핀(irIsrPin)만 봄.
+volatile int8_t        irIsrPin = -1;          // -1 = 감시 안 함
+volatile unsigned long irIsrBreakStartUs = 0;  // 지금 이어지는 끊김의 시작 시각(us), 0 = 안 끊김
+volatile unsigned long irIsrMaxUs = 0;         // 이번 배출에서 관측된 가장 긴 끊김(us)
+volatile bool          irIsrLatched = false;   // IR_MIN_BREAK_MS 이상 끊김이 한 번이라도 있었는지
+
+void irIsr() {
+  if (irIsrPin < 0) return;
+  unsigned long now = micros();
+  if (now == 0) now = 1;
+  bool broken = (digitalRead(irIsrPin) == IR_DETECT_LEVEL);
+  if (broken) {
+    if (irIsrBreakStartUs == 0) irIsrBreakStartUs = now;
+  } else if (irIsrBreakStartUs != 0) {
+    unsigned long len = now - irIsrBreakStartUs;
+    irIsrBreakStartUs = 0;
+    if (len > irIsrMaxUs) irIsrMaxUs = len;
+    if (len >= (unsigned long)IR_MIN_BREAK_MS * 1000UL) irIsrLatched = true;
+  }
+}
+#endif
 
 // ---- 마지막으로 처리한 cnt_process 스냅샷 seq (문자열 비교, 자릿수 제한 없음) ----
 String lastSeqStr = "";
@@ -769,6 +832,18 @@ void setup() {
     }
   }
 
+#if IR_SENSOR_INSTALLED
+  // 배선된 레일의 IR 핀에 변화 인터럽트 연결 (끊김 시간을 loop() 속도와 무관하게 측정)
+  for (int l = 0; l < 2; l++) {
+    for (int c = 0; c < 4; c++) {
+      if (!IR_INSTALLED[l][c]) continue;
+      // UNO R4 코어에는 NOT_AN_INTERRUPT가 없어서 유효성 검사 없이 바로 연결함
+      // (2번 핀은 인터럽트 지원 핀). 레일을 늘릴 때는 해당 핀의 인터럽트 지원 여부 확인할 것.
+      attachInterrupt(digitalPinToInterrupt(IR_PIN[l][c]), irIsr, CHANGE);
+    }
+  }
+#endif
+
   // PCA9685 초기화 및 전 채널 홈 포지션 이동
   Wire.begin();
   pwm.begin();
@@ -821,6 +896,11 @@ void setup() {
   Serial.print("[");
   Serial.print(AXIS_NAME);
   Serial.println("] setup 완료");
+  Serial.print("[설정] 대기=");  Serial.print(SERVO_HOME_ANGLE);
+  Serial.print("도, 푸시=");     Serial.print(PUSH_ANGLE);
+  Serial.print("도, IR감시=");   Serial.print(IR_POLL_WINDOW_MS);
+  Serial.print("ms, 최소끊김="); Serial.print(IR_MIN_BREAK_MS);
+  Serial.print("ms, IR센서=");   Serial.println(IR_SENSOR_INSTALLED ? "사용" : "없음(항상 성공 처리)");
   Serial.println("[안내] 시리얼 명령: SETEMPTY E_r / REPAIR E_r (테스트용)");
 }
 
@@ -1191,7 +1271,7 @@ void handleOrderFaults(JsonObject orders) {
   }
 }
 
-// ============================== 배출 상태 머신 (170->70도 non-blocking 스윕 + 시작 스티션 킥 + 게이트) ==============================
+// ============================== 배출 상태 머신 (대기->푸시 방향 non-blocking 스윕 + 시작 스티션 킥 + 게이트) ==============================
 void runDispenseStateMachine() {
   // 지금 배출 진행 중(DS_IDLE이 아님)이면, 상태 단계와 무관하게 매 loop()마다
   // IR 핀을 계속 폴링함 - 키캡이 스윕 도중/홀드 중/복귀 중 언제 떨어질지
@@ -1281,7 +1361,21 @@ void runDispenseStateMachine() {
     irWindowStart = millis();
     irBreakStart = 0;
     irLatched = false;
+    irMaxBreakMs = 0;
+    irMaxGapMs = 0;
+    irLastPollMs = millis();
+    irPollCount = 0;
+    irBrokenSamples = 0;
+#if IR_SENSOR_INSTALLED
+    noInterrupts();
+    irIsrBreakStartUs = 0;
+    irIsrMaxUs = 0;
+    irIsrLatched = false;
+    irIsrPin = IR_INSTALLED[l][c] ? (int8_t)IR_PIN[l][c] : (int8_t)-1;
+    interrupts();
+#endif
 
+    Serial.println("[배출] 시작 " + letterColorKey(l, c) + " order=" + job.orderId);
     moveServoAngle(SERVO_CHANNEL[l][c], SERVO_HOME_ANGLE);
     dsTimer = millis();
     dsState = DS_HOMING;
@@ -1294,7 +1388,7 @@ void runDispenseStateMachine() {
     int l = letterSlot(currentJob.letter);
     int c = colorSlot(currentJob.color);
 
-    sweepAngle = SERVO_HOME_ANGLE - BREAKAWAY_KICK_DEG; // 방향 반전: 대기(170)->푸시(70)는 감소 방향이라 킥도 뺌
+    sweepAngle = SERVO_HOME_ANGLE - BREAKAWAY_KICK_DEG; // 방향 반전: 대기(165)->푸시(20)는 감소 방향이라 킥도 뺌
     moveServoAngle(SERVO_CHANNEL[l][c], sweepAngle);
     dsTimer = millis();
     dsState = DS_BREAKAWAY_WAIT;
@@ -1358,7 +1452,24 @@ void runDispenseStateMachine() {
       // 쌓인 irLatched 값으로 최종 판정함.
       if (millis() - irWindowStart < IR_POLL_WINDOW_MS) return;  // 윈도우 안 끝났으면 다음 loop()에서 계속 대기
 
-      success = irLatched;
+      noInterrupts();
+      bool isrLatchedCopy = irIsrLatched;
+      unsigned long isrMaxUsCopy = irIsrMaxUs;
+      irIsrPin = -1;  // 이 배출의 감시 종료
+      interrupts();
+
+      success = irLatched || isrLatchedCopy;  // 폴링 또는 인터럽트 중 하나라도 유효 통과를 잡았으면 성공
+      // [진단] 판정 직후 실측값 출력
+      //  - 인터럽트 최대 끊김이 수천 us(=수 ms)인데 폴링 최대 끊김은 0 -> 폴링이 느려서 놓친 것
+      //  - 인터럽트 최대 끊김도 0 -> 핀 자체가 안 변함(배선/레벨/핀 번호 재확인)
+      Serial.print("[IR] "); Serial.print(letterColorKey(l, c));
+      Serial.print(" 폴링: 횟수="); Serial.print(irPollCount);
+      Serial.print(" 끊김샘플="); Serial.print(irBrokenSamples);
+      Serial.print(" 최대끊김(ms)="); Serial.print(irMaxBreakMs);
+      Serial.print(" 최대간격(ms)="); Serial.print(irMaxGapMs);
+      Serial.print(" | 인터럽트: 최대끊김(us)="); Serial.print(isrMaxUsCopy);
+      Serial.print(" | 기준(ms)="); Serial.print(IR_MIN_BREAK_MS);
+      Serial.print(" | 판정="); Serial.println(success ? "통과" : "실패");
     }
     // IR_INSTALLED[l][c]==false인 레일: 폴링 없이 위의 기본값(success=true) 그대로 즉시 판정
 #endif
@@ -1381,6 +1492,7 @@ void runDispenseStateMachine() {
     gateOpen = false;
     lockGateOnServer(gateOrderId);
 
+    Serial.println("[배출] 종료 " + letterColorKey(l, c) + " -> " + (success ? "성공" : "실패(disable)") + ", 남은 count=" + String(rail[l][c].count));
     dsState = DS_IDLE;
     return;
   }
@@ -1397,11 +1509,19 @@ void pollIrForCurrentJob() {
   if (l < 0 || c < 0) return;
   if (!IR_INSTALLED[l][c]) return; // 이 레일은 센서 미배선 - 폴링할 것 없음
 
+  unsigned long nowMs = millis();
+  if (nowMs - irLastPollMs > irMaxGapMs) irMaxGapMs = nowMs - irLastPollMs;
+  irLastPollMs = nowMs;
+
   bool broken = (digitalRead(IR_PIN[l][c]) == IR_DETECT_LEVEL);
+  irPollCount++;
+  if (broken) irBrokenSamples++;
   if (broken) {
-    if (irBreakStart == 0) irBreakStart = millis();          // 끊김 시작
-    else if (!irLatched && millis() - irBreakStart >= IR_MIN_BREAK_MS) {
-      irLatched = true;                                       // 디바운스 통과 - 유효 통과 확정
+    if (irBreakStart == 0) irBreakStart = nowMs;               // 끊김 시작
+    unsigned long len = nowMs - irBreakStart;
+    if (len > irMaxBreakMs) irMaxBreakMs = len;                 // [진단] 최대 끊김 기록
+    if (!irLatched && len >= IR_MIN_BREAK_MS) {
+      irLatched = true;                                         // 디바운스 통과 - 유효 통과 확정
     }
   } else {
     irBreakStart = 0;  // 끊김 해제 - 다음 끊김 구간을 새로 잴 준비 (이미 래치됐으면 irLatched는 안 건드림)
