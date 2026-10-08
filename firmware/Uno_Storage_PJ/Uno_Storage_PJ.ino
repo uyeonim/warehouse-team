@@ -1,6 +1,6 @@
 /*
   ================================================================================
-  키캡 배출 아두이노 - N/S 축 담당 (Arduino Uno R4 WiFi)
+  키캡 배출 아두이노 - P/J 축 담당 (Arduino Uno R4 WiFi)
   ================================================================================
   역할
    1) HiveMQ Cloud(MQTT, TLS)에 직접 연결해서 "sjuiot/warehouse/process" 구독
@@ -22,16 +22,16 @@
        바로 배출해버리는 문제가 있었음)
 
   ============================== 통신 대상 (Flask) ==============================
-   GET  /stock/keycap?board=NS         부팅 시 재고 8칸 초기 조회
-   GET  /queue/NS/next                 부팅 시 미완료 큐 복원
-   POST /queue/NS/enqueue              새 주문 감지 시 서버 큐에도 적재
-   POST /queue/NS/complete             배출 성공 후(또는 유령 주문 정리 시) 서버 큐에서 제거
+   GET  /stock/keycap?board=PJ         부팅 시 재고 8칸 초기 조회
+   GET  /queue/PJ/next                 부팅 시 미완료 큐 복원
+   POST /queue/PJ/enqueue              새 주문 감지 시 서버 큐에도 적재
+   POST /queue/PJ/complete             배출 성공 후(또는 유령 주문 정리 시) 서버 큐에서 제거
    POST /restock/{letter}/{color}                restock 감지 시 호출, 채워진 개수 응답받음
    POST /report/keycap-status              기존 그대로 (상태 보고, 성공/실패 무관 항상)
    POST /report/keycap-dispense            기존 그대로 (배출 성공했을 때만)
-   GET  /gate/NS                       부팅 시 게이트(픽업 대기) 상태 복원
-   POST /gate/NS                       게이트 잠글 때 서버에 기록 (body: order_id)
-   POST /gate/NS/clear                 게이트 열릴 때 서버 기록 해제
+   GET  /gate/PJ                       부팅 시 게이트(픽업 대기) 상태 복원
+   POST /gate/PJ                       게이트 잠글 때 서버에 기록 (body: order_id)
+   POST /gate/PJ/clear                 게이트 열릴 때 서버 기록 해제
 
   ※ 위 신규 라우트(/stock, /queue/*, /restock/*, /gate/*)는 이번에 새로 정의한
     스펙이라 Flask 쪽 실제 응답 형식과 어긋나면 즉시 팀원과 맞춰서 파싱부만 고칠 것.
