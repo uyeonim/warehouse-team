@@ -1,6 +1,6 @@
 /*
   ================================================================================
-  키캡 배출 아두이노 - P/J 축 담당 (Arduino Uno R4 WiFi)
+  키캡 배출 아두이노 - N/S 축 담당 (Arduino Uno R4 WiFi)
   ================================================================================
   역할
    1) HiveMQ Cloud(MQTT, TLS)에 직접 연결해서 "sjuiot/warehouse/process" 구독
@@ -22,16 +22,16 @@
        바로 배출해버리는 문제가 있었음)
 
   ============================== 통신 대상 (Flask) ==============================
-   GET  /stock/keycap?board=PJ         부팅 시 재고 8칸 초기 조회
-   GET  /queue/PJ/next                 부팅 시 미완료 큐 복원
-   POST /queue/PJ/enqueue              새 주문 감지 시 서버 큐에도 적재
-   POST /queue/PJ/complete             배출 성공 후(또는 유령 주문 정리 시) 서버 큐에서 제거
+   GET  /stock/keycap?board=NS         부팅 시 재고 8칸 초기 조회
+   GET  /queue/NS/next                 부팅 시 미완료 큐 복원
+   POST /queue/NS/enqueue              새 주문 감지 시 서버 큐에도 적재
+   POST /queue/NS/complete             배출 성공 후(또는 유령 주문 정리 시) 서버 큐에서 제거
    POST /restock/{letter}/{color}                restock 감지 시 호출, 채워진 개수 응답받음
    POST /report/keycap-status              기존 그대로 (상태 보고, 성공/실패 무관 항상)
    POST /report/keycap-dispense            기존 그대로 (배출 성공했을 때만)
-   GET  /gate/PJ                       부팅 시 게이트(픽업 대기) 상태 복원
-   POST /gate/PJ                       게이트 잠글 때 서버에 기록 (body: order_id)
-   POST /gate/PJ/clear                 게이트 열릴 때 서버 기록 해제
+   GET  /gate/NS                       부팅 시 게이트(픽업 대기) 상태 복원
+   POST /gate/NS                       게이트 잠글 때 서버에 기록 (body: order_id)
+   POST /gate/NS/clear                 게이트 열릴 때 서버 기록 해제
 
   ※ 위 신규 라우트(/stock, /queue/*, /restock/*, /gate/*)는 이번에 새로 정의한
     스펙이라 Flask 쪽 실제 응답 형식과 어긋나면 즉시 팀원과 맞춰서 파싱부만 고칠 것.
@@ -140,7 +140,7 @@
    - IR_SENSOR_INSTALLED 매크로로 제어: 1이면 기존처럼 IR_PIN을 실제로 읽어서
      성공/실패 판정, 0이면 DS_WAIT_IR 단계에서 핀을 읽지 않고 무조건 성공(idle)
      처리함. 센서 장착/배선 완료되는 대로 이 값만 1로 바꾸면 원래 동작으로
-     복귀함 - 이 보드(NS)의 현재 기본값은 아래 "보드별 설정" 블록에서
+     복귀함 - 각 보드의 현재 기본값은 아래 "IR 센서 장착 여부" 블록에서
      확인/조정할 것.
 
   [2026-09-13 게이트 상태를 Redis에 영속화 (재부팅 복원)]
@@ -450,6 +450,25 @@
    - 시리얼 [IR] 진단 출력 + 핀 변화 인터럽트 측정을 NS에만 있던 상태에서 4개 보드
      전부로 통일 (센서 미배선 보드는 IR_SENSOR_INSTALLED=0이라 해당 블록이 컴파일에서 빠짐).
 
+  [2026-10-08 안정성 보강 (기존 동작 흐름은 그대로)]
+   - restock 플래그 초기값: presentNow 배열이 전부 false로 시작하는지 4개 보드 모두
+     확인/통일 (EI 쪽에 [0][0]=true 오타가 있어서 E_r restock이 부팅 후 1회만 동작했음).
+   - 주문 큐잉 순서: markProcessed()를 queuePush() 성공 "이후"로 이동. 큐가 가득 차서
+     push가 실패해도 중복방지 기록이 남지 않으므로, 다음 스냅샷에서 다시 주워짐
+     (이전엔 기록만 남고 큐에는 없어서 그 주문이 영구 유실됐음).
+   - fault 해제 후 재배출 분기: 게이트 해제와 레일 원복을 재고(count)와 무관하게 수행하고,
+     원복 상태를 reportRailStatus로 서버(Mobius)에도 보고. 재배출 job 적재만 count>0일 때.
+     (이전엔 전부 count>0 안에 있어서, 재고 0이면 그 주문이 잡고 있던 게이트가 영원히
+     안 풀려 보드 전체 배출이 멈출 수 있었고, Mobius엔 계속 disable로 남았음)
+   - 중복방지 기록 ORDER_HISTORY_SIZE 8 -> 32: 큐 크기(8)와 같아서 기록이 금방 밀려나
+     같은 주문이 다시 큐에 들어갈(이중 배출) 위험이 있었음.
+   - MQTT 수신 버퍼/JSON 문서 2048 -> 4096, JSON 문서는 스택 대신 힙(DynamicJsonDocument).
+     주문이 몰려 스냅샷이 커지면 PubSubClient가 메시지를 조용히 버리거나 NoMemory로
+     파싱 실패하던 위험 완화. 파싱 실패 시 수신 길이도 같이 출력.
+   - seq 필드가 없는 스냅샷은 중복 비교를 건너뜀 (없으면 "null" 문자열끼리 같다고
+     판단해 이후 스냅샷을 전부 무시할 수 있었음).
+   - IR 센서: 현재 E/I 보드(E_r)만 사용. N/S, T/F, P/J는 IR_SENSOR_INSTALLED=0.
+
   다른 3개 보드는 이 파일을 복사한 뒤 "보드별 설정" 블록만 아래 표대로
   바꿔서 각 보드에 업로드하면 됩니다. (지금 이 파일은 PJ 보드용입니다)
 
@@ -542,7 +561,7 @@ const uint8_t IR_PIN[2][4] = {
 // 0 = 이 보드는 센서가 전혀 없음, DS_WAIT_IR 단계에서 핀을 읽지 않고 무조건 성공(idle) 처리
 // 아래 IR_INSTALLED 배열로 레일 단위 세부 제어를 하므로, 이 매크로는
 // "이 보드에 센서 배선이 하나라도 있는가"만 나타내는 최상위 스위치임.
-// ※ 이 보드(PJ)의 현재 값: 0 (센서 미배선 - 배출 후 무조건 성공 처리)
+// ※ 이 보드(PJ)의 현재 값: 0 (센서 없음 - 배출 후 무조건 성공 처리)
 #define IR_SENSOR_INSTALLED 0
 
 // ---- [레일별 IR 센서 배선 여부] ----
@@ -551,9 +570,9 @@ const uint8_t IR_PIN[2][4] = {
 // 폴링+디바운스 판정을 하고, false인 레일은 핀을 읽지 않고 즉시 성공 처리함
 // (플로팅 핀을 실수로 읽어서 오판정하는 일을 방지). 배선이 추가될 때마다
 // 이 표만 갱신하면 됨 - IR_PIN 배열과 인덱스([글자슬롯][색상슬롯])가 동일하게 대응.
-// ※ 현재 배선 완료: 없음 (전 레일 센서 미배선)
+// ※ 현재 배선 완료: 없음 (이 보드(PJ)는 센서 미배선 - 배선하면 IR_SENSOR_INSTALLED도 1로)
 const bool IR_INSTALLED[2][4] = {
-  {false, false, false, false},  // 센서 미배선
+  {false, false, false, false},  // 센서 없음
   {false, false, false, false}
 };
 
@@ -601,7 +620,7 @@ bool isKnownFault(const char* fault) {
 }
 
 // ============================== 최근 처리한 주문 기록 (중복 배출 방지) ==============================
-#define ORDER_HISTORY_SIZE 8
+#define ORDER_HISTORY_SIZE 32   // 큐(8)보다 넉넉하게 - 작으면 기록이 밀려나 같은 주문이 다시 큐에 들어갈 수 있음
 String processedJobKeys[ORDER_HISTORY_SIZE];
 uint8_t processedIdx = 0;
 
@@ -879,7 +898,7 @@ void setup() {
   // Flask 보고/조회용 httpSSLClient도 같은 방식으로 인증서가 미리 등록돼 있어야 함.
 
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  mqttClient.setBufferSize(2048);
+  mqttClient.setBufferSize(4096); // 이보다 큰 메시지는 PubSubClient가 콜백 없이 조용히 버림 - 주문이 몰릴 때 대비해 여유 있게
   mqttClient.setCallback(mqttCallback);
 
   // 서버(Redis)에서 재고/큐/게이트 복원 - WiFi 연결된 상태에서만 의미 있음
@@ -953,17 +972,25 @@ bool tryConnectMQTT() {
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (strcmp(topic, TOPIC_CNT_PROCESS) != 0) return;
 
-  StaticJsonDocument<2048> doc;
+  // 스택(지역 2KB 배열) 대신 힙에 할당 - 주문이 많아지면 2048로는 NoMemory로 파싱 실패함
+  DynamicJsonDocument doc(4096);
   DeserializationError err = deserializeJson(doc, payload, length);
   if (err) {
     Serial.print("[MQTT] JSON 파싱 실패: ");
-    Serial.println(err.c_str());
+    Serial.print(err.c_str());
+    Serial.print(" (수신 길이=");
+    Serial.print(length);
+    Serial.println("바이트)");
     return;
   }
 
-  String seqStr = doc["seq"].as<String>();
-  if (seqStr == lastSeqStr) return; // 동일 스냅샷 -> 재전송 무시
-  lastSeqStr = seqStr;
+  // seq가 없는 스냅샷은 중복 비교를 하지 않음 (없을 때 "null" 문자열끼리 같다고
+  // 판단해서 이후 스냅샷을 전부 버리는 일을 막음)
+  if (!doc["seq"].isNull()) {
+    String seqStr = doc["seq"].as<String>();
+    if (seqStr == lastSeqStr) return; // 동일 스냅샷 -> 재전송 무시
+    lastSeqStr = seqStr;
+  }
 
   JsonObject orders = doc["orders"];
 
@@ -1101,13 +1128,14 @@ void handleAssignedOrder(const String& orderId, const char* keycap, JsonArray co
 
   String jobKey = orderId + "_" + String(letter) + "_" + String(color);
   if (alreadyProcessed(jobKey)) return;
-  markProcessed(jobKey);
 
   DispenseJob job{orderId, letter, color};
   if (!queuePush(job)) {
-    Serial.println("[큐] 가득 참 - 주문이 유실될 수 있음. JOB_QUEUE_SIZE 조정 검토 필요");
+    // 중복방지 기록을 남기지 않았으므로 다음 스냅샷에서 다시 주워짐 (유실 아님)
+    Serial.println("[큐] 가득 참 - " + orderId + " 이번엔 보류, 다음 스냅샷에서 재시도");
     return;
   }
+  markProcessed(jobKey); // push 성공 후에만 기록 (실패 시 기록이 남으면 주문이 영구 유실됨)
   enqueueToServer(job); // 서버(Redis) 큐에도 동일하게 적재 - 재부팅 복원용
 }
 
@@ -1240,30 +1268,36 @@ void handleOrderFaults(JsonObject orders) {
           // 경우이므로 재배출
           Serial.println("[fault] " + letterColorKey(l, c) + " " + orderId + " 해제 (우리 레일 disable이었음) -> 재배출 큐 적재");
 
+          // 게이트가 바로 이 주문 자신을 기다리며 잠겨있으면 영원히 안 풀림
+          // (이 주문이 pickup_reached 되기를 기다리는 중인데, 그 배출 자체를
+          // 다시 하려는 거라 애초에 기다릴 이유가 없음) - 먼저 풀어줌.
+          // 재고가 0이라 재배출을 못 하는 경우에도 풀어야 함(안 그러면 이 주문은
+          // 우리 키캡 없이 pickup_reached까지 못 가서 보드 전체 배출이 멈춤).
+          if (!gateOpen && gateOrderId == orderId) {
+            gateOpen = true;
+            gateOrderId = "";
+            clearGateOnServer();
+            Serial.println("[fault] " + orderId + " 이 게이트를 걸고 있었음 -> 게이트 해제");
+          }
+
+          // disable -> 사용 가능한 상태로 되돌림 (재고 0이면 empty). fault가
+          // 풀렸다는 것 자체가 "사람이 고쳤다"는 신호이므로 REPAIR 명령과
+          // 동일하게 신뢰하고 엶 (PCA 드라이버 고장이었을 경우 다음 배출
+          // 시도 직전 PCA 헬스체크가 다시 확인하므로, 진짜 안 고쳐졌으면
+          // 즉시 재차 disable되는 안전망이 있음). 서버(Mobius)에도 보고해서
+          // 플랫폼 쪽에 disable로 남아있지 않게 함.
+          rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
+          reportRailStatus(letter, color, rail[l][c].status, orderId);
+
           if (rail[l][c].count > 0) {
-            // disable -> 재배출 전에 먼저 사용 가능한 상태로 되돌림. fault가
-            // 풀렸다는 것 자체가 "사람이 고쳤다"는 신호이므로 REPAIR 명령과
-            // 동일하게 신뢰하고 엶 (PCA 드라이버 고장이었을 경우 다음 배출
-            // 시도 직전 PCA 헬스체크가 다시 확인하므로, 진짜 안 고쳐졌으면
-            // 즉시 재차 disable되는 안전망이 있음).
-            rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
-
-            // 게이트가 바로 이 주문 자신을 기다리며 잠겨있으면 영원히 안 풀림
-            // (이 주문이 pickup_reached 되기를 기다리는 중인데, 그 배출 자체를
-            // 다시 하려는 거라 애초에 기다릴 이유가 없음) - 먼저 풀어줌
-            if (!gateOpen && gateOrderId == orderId) {
-              gateOpen = true;
-              gateOrderId = "";
-              clearGateOnServer();
-              Serial.println("[fault] " + orderId + " 이 게이트를 걸고 있었음 -> 재배출 위해 게이트 해제");
-            }
-
             DispenseJob job{orderId, letter, color};
             if (queuePush(job)) {
               enqueueToServer(job);
             } else {
               Serial.println("[fault] 재배출 큐 적재 실패 - 큐 가득 참");
             }
+          } else {
+            Serial.println("[fault] " + letterColorKey(l, c) + " 재고 0 - 재배출 없이 empty로 원복만 함");
           }
         }
       }
