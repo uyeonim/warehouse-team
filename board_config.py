@@ -70,7 +70,7 @@ BOARD_THICKNESS_MM = 22.0   # 실측 (2026-10-07)
 # =================================================================
 # 좌표 - 나머지 위치 (x, y, z) - R은 자동 계산이라 안 적음
 # =================================================================
-PLACE_XYZ = (-124.8803, -265.2661, 34.3968)          # 트레이에 보드 놓는 위치 (흡착 상태로 트레이에 닿는 높이) - 2026-10-07 재조정
+PLACE_XYZ = (-136.4731, -256.1524, 31.3968)          # 트레이에 보드 놓는 위치 (흡착 상태로 트레이에 닿는 높이) - 2026-10-08 재조정 (z는 기존 -3)
 # 트레이에 놓을 때 R - 픽업 R과 무관하게 "기준 R(손목 0도, 놓는 위치 베이스 각도)"에서
 # 색별로 이만큼 돌린 값으로 놓음. 트레이 위에서 제자리로 R만 돌린 뒤 하강.
 PLACE_R_OFFSET_DEG_BY_COLOR = {
@@ -118,8 +118,8 @@ POSITION_TOLERANCE_DEG = 2.0
 TRAY_CONVEYOR_STP_1 = 0
 TRAY_CONVEYOR_STP_2 = 1
 TRAY_CONVEYOR_SPEED_MM_S = 50
-TRAY_CONVEYOR_RUN_TIME_SECTION0 = 4.0    # keycap_dispensed -> 키캡 로봇암 앞까지 (초)
-TRAY_CONVEYOR_RUN_TIME_SECTION1 = 11.5   # keycap_packed -> 보드 로봇암 앞까지 (초)
+TRAY_CONVEYOR_RUN_TIME_SECTION0 = 3.2    # keycap_dispensed -> 키캡 로봇암 앞까지 (초)
+TRAY_CONVEYOR_RUN_TIME_SECTION1 = 12   # keycap_packed -> 보드 로봇암 앞까지 (초)
 TRAY_CONVEYOR_RUN_TIME_SECTION2 = 6.5    # board_packed  -> 픽업대까지 (초)
 
 # =================================================================
