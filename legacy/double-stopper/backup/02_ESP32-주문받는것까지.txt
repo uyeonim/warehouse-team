@@ -1,0 +1,28 @@
+//주문 받는것 까지
+// config.h
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// WiFi 정보
+#define WIFI_SSID "****"
+#define WIFI_PASSWORD "****"
+
+// Mobius 서버 정보
+#define COSS_HOST "https://onem2m.iotcoss.ac.kr"   // 실제 호스트 주소
+#define COSS_API_KEY "****"             // API
+#define COSS_LECTURF "****"           // 강의코드
+#define COSS_ORIGIN "****"              // origin
+#define COSS_CREATOR "****"           // 식별코드
+
+// AE/CNT 경로
+#define AE_NAME "ae_sjuiot"          // 실제 AE 이름
+#define CNT_ORDER_NAME "cnt_order"
+#define CNT_STOCK_NAME "cnt_stock"
+
+// 층별 우노 IP (테스트용, 나중에 실제 IP로 교체)
+#define UNO_FLOOR1_IP "172.20.10.12"
+#define UNO_FLOOR2_IP "172.20.10.6"
+#define UNO_FLOOR3_IP "172.20.10.7"
+#define UNO_FLOOR4_IP "172.20.10.8"
+
+#endif
