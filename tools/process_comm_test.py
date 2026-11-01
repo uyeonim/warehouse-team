@@ -31,8 +31,8 @@ COSS_LECTURE = os.getenv("COSS_LECTURE")
 COSS_CREATOR = os.getenv("COSS_CREATOR")
 ORIGIN = os.getenv("ORIGIN")
 
-_missing = [k for k, v in {"COSS_BASE_URL": COSS_BASE_URL, "AE_NAME": AE_NAME, "COSS_API_KEY": COSS_API_KEY,
-                           "COSS_LECTURE": COSS_LECTURE, "COSS_CREATOR": COSS_CREATOR, "ORIGIN": ORIGIN}.items()
+# COSS_API_KEY/LECTURE/CREATOR는 필수 아님 - 비어있으면 헤더에서 빠짐(로컬 Mobius는 인증 헤더 안 씀)
+_missing = [k for k, v in {"COSS_BASE_URL": COSS_BASE_URL, "AE_NAME": AE_NAME, "ORIGIN": ORIGIN}.items()
             if not v]
 if _missing:
     raise RuntimeError(f".env에 {', '.join(_missing)}가 비어있음")
