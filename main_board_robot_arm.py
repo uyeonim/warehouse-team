@@ -136,6 +136,8 @@ import requests
 from dotenv import load_dotenv
 from DobotRPC import RPCClient, DobotlinkAdapter
 
+from log_tee import start_file_log
+
 load_dotenv()
 
 # ---------------------------------------------------------------
@@ -1231,6 +1233,7 @@ def handle_snapshot(loop, arm_api, box_api, data):
 def main():
     global local_stock, job_queue, gate_open, gate_order_id
 
+    log("INIT", f"로그 파일: {start_file_log('main')}")
     local_stock = fetch_initial_stock()
 
     # 복원분 중복 적재 방지는 handle_snapshot()에서 job_queue 존재 여부로 처리

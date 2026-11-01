@@ -427,5 +427,7 @@ def clear_board_gate():
 
 
 if __name__ == "__main__":
+    from log_tee import start_file_log
+    print(f"[BOOT] 로그 파일: {start_file_log('flask')}")
     # debug=False: 디버그 모드는 파일 저장 시 자동 재시작(그 순간 요청 유실) + 에러 화면에 코드 노출
     app.run(host="0.0.0.0", port=5000, debug=False)

@@ -18,3 +18,4 @@ venv/
 *.venv/
 DobotRPC_*
 board_camera_capture_log/
+logs/
