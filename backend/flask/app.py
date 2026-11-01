@@ -1,25 +1,45 @@
 import os
 import json
-import ssl
 import uuid
 import logging
 import sys
 import requests
 import paho.mqtt.client as mqtt
+import redis as redis_lib
 from flask import Flask, request, abort, jsonify
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from upstash_redis import Redis
-
-redis = Redis(
-    url=os.environ["UPSTASH_REDIS_REST_URL"],
-    token=os.environ["UPSTASH_REDIS_REST_TOKEN"]
-)
+# ============================================================
+# [2026-11-01 로컬 전환] Cloud Run/Upstash/HiveMQ -> 창고 PC(192.168.0.12) 로컬 구성
+#  - 이 Flask는 창고 PC에서 실행 (보드 Flask(5000)와 같은 PC, 포트 5002)
+#  - Redis: Upstash(REST) -> 창고 PC의 로컬 Redis (REDIS_URL=redis://127.0.0.1:6379/0)
+#    보드 Flask와 같은 Redis/DB를 같이 씀 (키 이름이 달라서 안 섞임: stock:E_r vs stock:board_r)
+#    플랫폼 서버(192.168.0.100)의 Redis(DB 0)와는 별개의 서버라 DB 번호가 같아도 무관함.
+#    변수명을 redis 그대로 두어서 아래 라우트 코드는 수정 없음.
+#    decode_responses=True 필수 (없으면 값이 bytes로 나와서 json/비교가 깨짐)
+#  - MQTT publish: TLS 제거. Mosquitto는 플랫폼 서버(192.168.0.100:1883)에 있음.
+#    MQTT_USER가 비어있으면 익명 접속
+#  - Mobius: 플랫폼 서버 주소(COSS_BASE_URL). 인증 헤더(X-API-KEY 등)는 값이 있을 때만 보냄
+#  - 실행(Windows): gunicorn은 Windows에서 안 돌아감 -> waitress 사용
+#      pip install waitress
+#      waitress-serve --listen=0.0.0.0:5002 app:app
+# ============================================================
+_redis_url = os.getenv("REDIS_URL")
+if _redis_url:
+    redis = redis_lib.Redis.from_url(_redis_url, decode_responses=True)
+else:
+    redis = redis_lib.Redis(
+        host=os.getenv("REDIS_HOST", "127.0.0.1"),
+        port=int(os.getenv("REDIS_PORT", 6379)),
+        db=int(os.getenv("REDIS_DB", 0)),
+        password=os.getenv("REDIS_PASS") or None,
+        decode_responses=True,
+    )
 
 # ============================================================
-# 로깅 설정: print() 대신 이걸 씀 — Cloud Run/gunicorn 환경에서
+# 로깅 설정: print() 대신 이걸 씀 — gunicorn 환경에서
 # 버퍼링 없이 즉시 flush됨 (PYTHONUNBUFFERED 이슈 회피)
 # ============================================================
 logging.basicConfig(
@@ -30,10 +50,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("warehouse")
 
-MQTT_HOST = os.getenv("MQTT_HOST")
-MQTT_PORT = int(os.getenv("MQTT_PORT", 8883))
-MQTT_USER = os.getenv("MQTT_USER")
-MQTT_PASS = os.getenv("MQTT_PASS")
+MQTT_HOST = os.getenv("MQTT_HOST", "192.168.0.100")  # Mosquitto는 플랫폼 서버에 있음 (창고 PC의 localhost 아님)
+MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
+MQTT_USER = os.getenv("MQTT_USER", "")
+MQTT_PASS = os.getenv("MQTT_PASS", "")
 
 # 컨테이너 종류 → MQTT 토픽 (Mobius --웹훅--> Flask --publish--> MQTT, 주문/재고 push 전용)
 # /notify/process 는 con 내용을 파싱하지 않고 그대로 relay만 함.
@@ -43,11 +63,12 @@ TOPICS = {
     "process": "sjuiot/warehouse/process",
 }
 
-# ---- Mobius (COSS API) 연결 정보: 기존 .env 변수 그대로 사용, 새로 추가하는 값 없음 ----
-COSS_BASE_URL = os.getenv("COSS_BASE_URL")
-COSS_API_KEY = os.getenv("COSS_API_KEY")
-COSS_LECTURE = os.getenv("COSS_LECTURE")
-COSS_CREATOR = os.getenv("COSS_CREATOR")
+# ---- Mobius 연결 정보 ----
+# 로컬 Mobius는 인증 헤더 없이도 응답함(플랫폼팀 확인) -> API_KEY가 비어있으면 헤더 생략
+COSS_BASE_URL = os.getenv("COSS_BASE_URL", "http://192.168.0.100:7579/Mobius")  # Mobius도 플랫폼 서버
+COSS_API_KEY = os.getenv("COSS_API_KEY", "")
+COSS_LECTURE = os.getenv("COSS_LECTURE", "")
+COSS_CREATOR = os.getenv("COSS_CREATOR", "")
 ORIGIN = os.getenv("ORIGIN")
 AE_NAME = os.getenv("AE_NAME")
 
@@ -68,16 +89,25 @@ RAIL_CAPACITY = 30  # 카트리지(stock) 최대 장전 개수, 아두이노 MAX
 # 모비우스 cnt_board_status 밑 컨테이너가 cnt_r/cnt_y/cnt_b/cnt_g로 확인되어
 # 키캡과 동일한 한 글자 색상 코드를 그대로 재사용함 (cnt_red 같은 전체 단어 아님)
 BOARD_COLORS = COLORS  # ["r", "y", "b", "g"]
-BOARD_CARTRIDGE_CAPACITY = 3  # 카트리지에 실제로 장전되는 재고
+BOARD_CARTRIDGE_CAPACITY = 20  # 카트리지에 실제로 장전되는 재고
 BOARD_POOL_TOTAL = 300  # 색상별 전체 재고 총량(카트리지 포함) — 창고 pool = 이 값 - 카트리지분
 
 app = Flask(__name__)
 
 
+def _new_mqtt_client():
+    # paho-mqtt 2.x는 callback_api_version 인자가 필수, 1.x는 없음 -> 둘 다 대응
+    try:
+        return mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+    except AttributeError:
+        return mqtt.Client()
+
+
 def publish(topic: str, payload: str) -> bool:
-    c = mqtt.Client()
-    c.username_pw_set(MQTT_USER, MQTT_PASS)
-    c.tls_set(tls_version=ssl.PROTOCOL_TLS_CLIENT)
+    c = _new_mqtt_client()
+    if MQTT_USER:  # 계정이 설정된 경우에만 인증 (비어있으면 익명 접속)
+        c.username_pw_set(MQTT_USER, MQTT_PASS)
+    # 로컬 Mosquitto(1883)는 평문이라 tls_set() 호출 없음
     try:
         c.connect(MQTT_HOST, MQTT_PORT, keepalive=10)
         c.loop_start()
@@ -103,15 +133,16 @@ def post_cin_to_mobius(cnt_path: str, content: dict) -> bool:
     """
     url = f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/{cnt_path.strip('/')}"
     headers = {
-        "X-API-KEY": COSS_API_KEY,
-        "X-AUTH-CUSTOM-LECTURE": COSS_LECTURE,
-        "X-AUTH-CUSTOM-CREATOR": COSS_CREATOR,
         "Accept": "application/json",
         "X-M2M-RI": str(uuid.uuid4()),
         "X-M2M-RVI": "3",
         "X-M2M-Origin": ORIGIN,
         "Content-Type": "application/json;ty=4",
     }
+    if COSS_API_KEY:  # 로컬 Mobius는 인증 헤더가 필요 없음 - 값이 있을 때만 추가
+        headers["X-API-KEY"] = COSS_API_KEY
+        headers["X-AUTH-CUSTOM-LECTURE"] = COSS_LECTURE
+        headers["X-AUTH-CUSTOM-CREATOR"] = COSS_CREATOR
     body = {
         "m2m:cin": {
             "con": json.dumps(content, ensure_ascii=False)
@@ -196,7 +227,7 @@ def notify(kind):
 
 
 # ============================================================
-# 아웃바운드: 아두이노 --HTTPS POST--> Flask --> Mobius CIN
+# 아웃바운드: 아두이노 --HTTP POST--> Flask --> Mobius CIN
 # ============================================================
 @app.route("/report/keycap-status", methods=["POST"])
 def report_keycap_status():
@@ -543,7 +574,8 @@ def clear_gate(board):
 #   하드웨어를 고쳐주는 건 아니므로, 실제 마지막 상태 정보를 잃어버리면 안 됨.
 #
 # 주의: 키캡의 pool:{letter}_{color}(전체 재고) 총량은 이 코드에서 관리하지 않으므로
-# 하드 리셋에서도 건드리지 않음.
+# 하드 리셋에서도 건드리지 않음. (로컬 Redis 최초 구성 시 redis-cli -n 2 set pool:E_r 158
+# 처럼 직접 넣어야 restock이 0개로 채워지지 않음)
 # ============================================================
 def _all_keycap_letter_colors():
     return [
@@ -622,4 +654,5 @@ def reset_hard():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # 개발용 단독 실행 (실제 운영은 Windows: waitress-serve --listen=0.0.0.0:5002 app:app)
+    app.run(host="0.0.0.0", port=5002, debug=False)
