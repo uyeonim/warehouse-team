@@ -78,8 +78,10 @@ restock 처리 (신규):
   Mobius --POST--> 이 PC :NOTIFY_PORT/notify/process -> snapshot_queue -> 메인 루프
   - 수신 서버는 별도 스레드, 요청을 한 번에 하나씩 순서대로 처리(스냅샷 순서 보장)
   - 응답(200)은 바로 주고 실제 처리는 메인 루프가 함
-  - 시작 시 cnt_process/la(최신 스냅샷)를 직접 한 번 읽어서 첫 스냅샷으로 씀 -
-    꺼져 있던 동안 바뀐 상태를 다음 알림을 기다리지 않고 바로 따라잡음
+  - 안전망: MOBIUS_POLL_INTERVAL_SEC(5초)마다 cnt_process/la(최신 스냅샷)를 직접 읽음.
+    Mobius는 알림을 한 번만 보내고 재전송하지 않아서, 네트워크가 잠깐 끊겨 놓친 스냅샷을
+    이걸로 보충함(로그: "주기 조회 - 알림 누락 보충"). 조회 결과는 seq가 직전보다 클 때만 받음.
+    첫 조회는 시작 시 꺼져 있던 동안 바뀐 상태를 바로 따라잡는 역할
   - 구독 등록(tools/sub_robotarm.py)은 이 프로그램이 켜진 상태에서 할 것
     (등록 시 Mobius가 확인 요청(vrq)을 보냄)
 
@@ -185,7 +187,7 @@ CALL_TIMEOUT = 5
 from board_config import (
     DOBOT_PORT,
     PICK_POSE_ROWS, PLACE_XYZ, PLACE_R_OFFSET_DEG_BY_COLOR, HOME_XYZ, HOME_WRIST_DEG, SAFE_LIFT_MM,
-    MOVE_TIMEOUT_SEC, MOVE_POLL_INTERVAL_SEC, PRECISION_SETTLE_SEC,
+    MOVE_TIMEOUT_SEC, MOVE_POLL_INTERVAL_SEC, PRECISION_SETTLE_SEC, MOBIUS_POLL_INTERVAL_SEC,
     MOVE_STABLE_MM, MOVE_STABLE_DEG, MOVE_RESEND_AFTER_SEC, MOVE_MAX_RESEND,
     SUCTION_SETTLE_DELAY, RELEASE_SETTLE_DELAY,
     POSITION_TOLERANCE_MM, POSITION_TOLERANCE_DEG,
@@ -264,16 +266,19 @@ def parse_con(con):
     return con if isinstance(con, dict) else None
 
 
-def accept_snapshot(data, source, only_if_first=False):
-    """스냅샷을 메인 루프 큐로 넘김. seq가 직전과 같으면(중복 알림) 버림.
-    only_if_first: 시작 시 la 조회용 - 그 사이 알림이 먼저 들어왔으면 그게 더 최신이라 버림."""
+def accept_snapshot(data, source, from_poll=False):
+    """스냅샷을 메인 루프 큐로 넘김.
+    - 알림: seq가 직전과 같으면(중복 알림) 버림. 알림은 순서대로 오고, 플랫폼 재시작으로
+      seq가 처음부터 다시 시작해도 따라가야 해서 "다르면 받음"
+    - 주기 조회(from_poll): seq가 직전보다 클 때만 받음 - 조회 응답이 오는 사이 더 새 알림이
+      먼저 처리됐을 수 있어서, 옛 스냅샷으로 상태가 뒤로 돌아가는 걸 막음
+      (seq가 숫자가 아니면 비교 불가라 "다르면 받음"으로 처리)"""
     global last_seq
     with _seq_lock:
-        if only_if_first and last_seq != -1:
-            log("RECV", f"{source}: 알림이 먼저 도착해서 건너뜀")
-            return
         seq = data.get("seq", -1)
         if seq == last_seq:
+            return
+        if from_poll and isinstance(seq, int) and isinstance(last_seq, int) and seq < last_seq:
             return
         last_seq = seq
         orders = data.get("orders", {})
@@ -320,6 +325,32 @@ def start_notify_server():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log("RECV", f"Mobius 알림 수신 대기: 0.0.0.0:{NOTIFY_PORT}{NOTIFY_PATH}")
     return server
+
+
+def _poll_cnt_process():
+    """MOBIUS_POLL_INTERVAL_SEC마다 cnt_process/la를 읽어 알림으로 못 받은 스냅샷을 보충.
+    Mobius는 알림을 한 번만 보내고 재전송하지 않아서, 네트워크가 잠깐 끊기면 그 스냅샷이
+    다음 변화 때까지 안 들어옴 -> 이 조회가 안전망. 알림이 정상이면 항상 같은 seq라 아무 일 없음.
+    첫 조회가 시작 시 최신 상태 따라잡기 역할도 함. 실패 로그는 상태가 바뀔 때만 남김."""
+    first, failing = True, False
+    while True:
+        latest = fetch_latest_cin("cnt_process", quiet=True)
+        if latest is None:
+            if not failing:
+                log("RECV", f"cnt_process 주기 조회 실패 - {MOBIUS_POLL_INTERVAL_SEC:g}초마다 재시도 (알림 수신은 계속)")
+                failing = True
+        else:
+            if failing:
+                log("RECV", "cnt_process 주기 조회 복구됨")
+                failing = False
+            accept_snapshot(latest, "시작 시 la 조회" if first else "주기 조회 - 알림 누락 보충", from_poll=True)
+            first = False
+        time.sleep(MOBIUS_POLL_INTERVAL_SEC)
+
+
+def start_cnt_process_poller():
+    # 수신 서버를 먼저 켠 뒤에 시작해야 함 - 반대면 그 사이 온 알림을 놓침
+    threading.Thread(target=_poll_cnt_process, daemon=True).start()
 
 
 # ============================== Flask 보고 헬퍼 ==============================
@@ -483,10 +514,12 @@ def clear_gate_on_server():
 
 
 # ---- Mobius 직접 조회 ----
-def fetch_latest_cin(cnt_path):
-    """{AE}/{cnt_path} 최신 CIN의 con(dict). .env에 COSS 값이 없거나 조회 실패면 None."""
+def fetch_latest_cin(cnt_path, quiet=False):
+    """{AE}/{cnt_path} 최신 CIN의 con(dict). .env에 COSS 값이 없거나 조회 실패면 None.
+    quiet: 실패 로그 생략 (주기 조회용 - 실패 로그는 호출 쪽에서 상태가 바뀔 때만 남김)"""
     if not all([COSS_BASE_URL, AE_NAME, COSS_ORIGIN]):
-        log("MOBIUS", f".env에 COSS_BASE_URL/AE_NAME/ORIGIN이 없어 {cnt_path} 조회 생략")
+        if not quiet:
+            log("MOBIUS", f".env에 COSS_BASE_URL/AE_NAME/ORIGIN이 없어 {cnt_path} 조회 생략")
         return None
     url = f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/{cnt_path}/la"
     headers = {
@@ -501,11 +534,13 @@ def fetch_latest_cin(cnt_path):
     try:
         resp = requests.get(url, headers=headers, timeout=REPORT_TIMEOUT)
         if resp.status_code != 200:
-            log("MOBIUS", f"{cnt_path} 최신 CIN 조회 실패 ({resp.status_code})")
+            if not quiet:
+                log("MOBIUS", f"{cnt_path} 최신 CIN 조회 실패 ({resp.status_code})")
             return None
         return parse_con(resp.json().get("m2m:cin", {}).get("con"))
     except Exception as e:
-        log("MOBIUS", f"{cnt_path} 조회 에러: {e}")
+        if not quiet:
+            log("MOBIUS", f"{cnt_path} 조회 에러: {e}")
         return None
 
 
@@ -1210,13 +1245,7 @@ def main():
         gate_order_id = ""
 
     notify_server = start_notify_server()
-    # 수신 서버를 먼저 켜고 la를 읽음 - 반대 순서면 그 사이 온 알림을 놓침.
-    # la보다 알림이 먼저 들어오면 only_if_first로 la 쪽을 버림(알림이 더 최신)
-    latest = fetch_latest_cin("cnt_process")
-    if latest is not None:
-        accept_snapshot(latest, "시작 시 la 조회", only_if_first=True)
-    else:
-        log("RECV", "cnt_process 최신 스냅샷 조회 실패 - 첫 알림이 올 때까지 큐 처리 대기")
+    start_cnt_process_poller()   # 첫 조회 = 시작 시 최신 상태 따라잡기, 이후 알림 누락 보충
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

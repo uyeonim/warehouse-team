@@ -109,6 +109,9 @@ PRECISION_SETTLE_SEC = 0.5      # 픽업/트레이 하강처럼 정밀 접촉 �
 SUCTION_SETTLE_DELAY = 1.0      # 흡착 ON 후 흡착력 형성 대기
 RELEASE_SETTLE_DELAY = 0.5      # 흡착 OFF 후 대기
 
+# Mobius cnt_process 주기 조회 - 알림(1회 전송, 재전송 없음)을 놓쳤을 때 이 간격 안에 따라잡음
+MOBIUS_POLL_INTERVAL_SEC = 5.0
+
 # 도착 판정 허용오차 (모든 이동에 사용. 픽업 위치 / 트레이 하강은 도착 실패 시 failed 처리)
 POSITION_TOLERANCE_MM = 2.0
 POSITION_TOLERANCE_DEG = 2.0
