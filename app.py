@@ -31,7 +31,7 @@ redis = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
 BOARD_COLORS = ["red", "yellow", "blue", "green"]
 BOARD_STATUS_VALUES = ("idle", "busy", "disable", "empty")  # idle/busy/disable(오배출)/empty(재고부족)
 BOARD_COLOR_CODE = {"red": "r", "yellow": "y", "blue": "b", "green": "g"}  # Redis 키 + Mobius 컨테이너명 공용
-BOARD_CARTRIDGE_CAPACITY = 3  # 한 번에 진열하는 단위 개수 (restock 시 pool에서 이만큼씩 채움)
+BOARD_CARTRIDGE_CAPACITY = 20  # 수납함 한 스택 = 20개 (restock 시 pool에서 이만큼씩 채움, board_config.TOTAL_CAPACITY와 같음)
 
 # ---- Mobius (COSS API) 연결 정보: 팀 공용 .env 값 그대로 사용 ----
 COSS_BASE_URL = os.getenv("COSS_BASE_URL")
