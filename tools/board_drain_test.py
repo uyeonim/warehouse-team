@@ -8,7 +8,7 @@
   python tools/board_drain_test.py green       -> green 20개부터 1까지
   python tools/board_drain_test.py green 12    -> green 12부터 이어서
 
-동작은 메인 pick_and_place와 같은 순서 (카메라 확인 / 서버 보고 / MQTT는 안 함 - 서버 재고 안 바뀜):
+동작은 메인 pick_and_place와 같은 순서 (카메라 확인 / 서버 보고는 안 함 - 서버 재고 안 바뀜):
   이동 높이로 픽업 위 -> 하강 -> 흡착 ON -> 상승 -> (중간점) -> 트레이 위 -> 색별 놓기 R 회전
   -> 하강 -> 흡착 OFF -> 상승 -> 손목 0도 -> [엔터 대기] -> 다음 픽업
   이동 높이 = travel_z_for() - 꽉 찼을 때 제일 높은 자리 기준 고정 (메인과 동일)

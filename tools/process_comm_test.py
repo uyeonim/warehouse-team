@@ -3,7 +3,7 @@
 cnt_process 통신 테스트 - 플랫폼 대신 cnt_process 스냅샷을 손으로 조립해서 Mobius에 CIN으로 올림.
 형식은 "Mobius CNT·CIN 구조 정리"(2026-10-02) 2-1 기준.
 
-경로: 이 스크립트 -> Mobius cnt_process CIN -> (구독) Flask /notify/process -> MQTT -> 메인 등
+경로: 이 스크립트 -> Mobius cnt_process CIN -> (구독) 메인 :NOTIFY_PORT/notify/process
 
 ⚠️ cnt_process는 플랫폼이 쓰는 공용 명령 채널:
   - 키캡 팀 구독도 같은 알림을 받음 -> 테스트 주문에 키캡 쪽 장비가 반응할 수 있음 (미리 공지)

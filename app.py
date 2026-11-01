@@ -1,29 +1,22 @@
 import os
 import json
-import ssl
 import uuid
 import requests
-import paho.mqtt.client as mqtt
 from flask import Flask, request, abort, jsonify
 from dotenv import load_dotenv
+from redis import Redis
 
 load_dotenv()
 
-from upstash_redis import Redis
-
-redis = Redis(
-    url=os.environ["UPSTASH_REDIS_REST_URL"],
-    token=os.environ["UPSTASH_REDIS_REST_TOKEN"]
-)
+# 예) redis://:비밀번호@192.168.0.100:6379/1  (끝 숫자 = DB 번호, 플랫폼팀 데이터와 분리)
+redis = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
 
 # ============================================================
-# 이 Flask는 "로봇암/컨베이어 파트" 전용 릴레이.
-# 키캡 카트리지 파트(팀원 Cloud Run)와는 완전히 분리된 인프라:
-#   - 별도 Cloud Run 서비스
-#   - 별도 HiveMQ 계정/크리덴셜
-#   - 별도 Mobius 구독 (sub 이름이 팀원 것과 겹치면 안 됨!)
-# Mobius AE/인증 정보(COSS_*)는 팀 공용 값을 그대로 씀 (원래 팀 공용
-# 크리덴셜이라 여기서 새로 만들 필요 없음)
+# 이 Flask는 "로봇암/컨베이어 파트" 전용 - 전시장 로컬망에서 로봇암 PC가
+# 직접 실행함 (python app.py). 로봇암 PC의 main이 보고/재고/큐/게이트를
+# 이 서버로 요청하면, 여기서 Mobius CIN 생성 + Redis 갱신을 처리함.
+# Mobius 알림(cnt_process)은 이 Flask를 거치지 않고 main이 직접 받음.
+# Mobius AE/인증 정보(COSS_*)는 팀 공용 값을 그대로 씀
 #
 # 보드는 카트리지·아두이노가 없어서, 이 릴레이가 board 재고(Redis)도
 # 같이 관리함 - 로봇암 PC가 busy/idle+count를 보고하면 여기서 캐싱.
@@ -40,18 +33,6 @@ BOARD_STATUS_VALUES = ("idle", "busy", "disable", "empty")  # idle/busy/disable(
 BOARD_COLOR_CODE = {"red": "r", "yellow": "y", "blue": "b", "green": "g"}  # Redis 키 + Mobius 컨테이너명 공용
 BOARD_CARTRIDGE_CAPACITY = 3  # 한 번에 진열하는 단위 개수 (restock 시 pool에서 이만큼씩 채움)
 
-MQTT_HOST = os.getenv("MQTT_HOST")
-MQTT_PORT = int(os.getenv("MQTT_PORT", 8883))
-MQTT_USER = os.getenv("MQTT_USER")
-MQTT_PASS = os.getenv("MQTT_PASS")
-
-# 컨테이너 종류 -> MQTT 토픽 (Mobius --웹훅--> Flask --publish--> MQTT)
-# /notify/process 는 con 내용을 파싱하지 않고 그대로 relay만 함.
-# 로봇암 PC(board_robot_arm.py)가 이 토픽을 구독해서 자기 status에 반응함.
-TOPICS = {
-    "process": os.getenv("MQTT_TOPIC", "sjuiot/warehouse/robotarm"),
-}
-
 # ---- Mobius (COSS API) 연결 정보: 팀 공용 .env 값 그대로 사용 ----
 COSS_BASE_URL = os.getenv("COSS_BASE_URL")
 COSS_API_KEY = os.getenv("COSS_API_KEY")
@@ -60,37 +41,17 @@ COSS_CREATOR = os.getenv("COSS_CREATOR")
 ORIGIN = os.getenv("ORIGIN")
 AE_NAME = os.getenv("AE_NAME")
 
-# 필수 환경변수 누락을 배포 직후 부팅 로그에서 바로 드러나게 함
+# 필수 환경변수 누락을 시작 로그에서 바로 드러나게 함
 # (없으면 None이 조용히 들어갔다가, 나중에 요청 처리 중 .rstrip() 등에서
 #  AttributeError로 터져서 502만 뜨고 원인 파악이 어려워짐)
-_REQUIRED_ENV = {
-    "COSS_BASE_URL": COSS_BASE_URL, "AE_NAME": AE_NAME, "ORIGIN": ORIGIN,
-    "COSS_API_KEY": COSS_API_KEY, "COSS_CREATOR": COSS_CREATOR, "COSS_LECTURE": COSS_LECTURE,
-    "MQTT_HOST": os.getenv("MQTT_HOST"), "MQTT_USER": os.getenv("MQTT_USER"), "MQTT_PASS": os.getenv("MQTT_PASS"),
-}
+# COSS_API_KEY/CREATOR/LECTURE는 필수 아님 - 비어있으면 헤더에서 빠짐(requests가 None 헤더를 안 보냄).
+# 로컬 Mobius가 이 인증 헤더를 요구하지 않으면 .env에서 비워둬도 됨
+_REQUIRED_ENV = {"COSS_BASE_URL": COSS_BASE_URL, "AE_NAME": AE_NAME, "ORIGIN": ORIGIN}
 _missing = [k for k, v in _REQUIRED_ENV.items() if not v]
 if _missing:
     print(f"[BOOT] ⚠️ 환경변수 누락: {', '.join(_missing)} - 관련 기능이 500/502로 실패함")
 
 app = Flask(__name__)
-
-
-def publish(topic: str, payload: str) -> bool:
-    c = mqtt.Client()
-    c.username_pw_set(MQTT_USER, MQTT_PASS)
-    c.tls_set(tls_version=ssl.PROTOCOL_TLS_CLIENT)
-    try:
-        c.connect(MQTT_HOST, MQTT_PORT, keepalive=10)
-        c.loop_start()
-        info = c.publish(topic, payload, qos=1)
-        info.wait_for_publish(timeout=5)
-        return info.is_published()
-    except Exception as e:
-        print("MQTT 오류:", e)
-        return False
-    finally:
-        c.loop_stop()
-        c.disconnect()
 
 
 def post_cin_to_mobius(cnt_path: str, content: dict) -> bool:
@@ -141,36 +102,7 @@ def hello():
 
 
 # ============================================================
-# 인바운드: Mobius --웹훅--> Flask --publish--> MQTT
-# con 내용은 파싱하지 않고 그대로 relay만 함
-# (status별 로봇암 동작 분기는 board_robot_arm.py 쪽에서 처리)
-# ============================================================
-@app.route("/notify/<kind>", methods=["POST"])
-def notify(kind):
-    if kind not in TOPICS:
-        abort(404)
-
-    data = request.get_json(force=True, silent=True) or {}
-    sgn = data.get("m2m:sgn", {})
-    if sgn.get("vrq"):
-        return "", 200
-
-    cin = sgn.get("nev", {}).get("rep", {}).get("m2m:cin")
-    if cin:
-        con = cin.get("con")
-        if isinstance(con, str):
-            try:
-                con = json.loads(con)
-            except ValueError:
-                pass
-        payload = json.dumps(con, ensure_ascii=False)
-        ok = publish(TOPICS[kind], payload)
-        print(f"[{kind}] → MQTT {'전송 완료' if ok else '전송 실패'}:", payload)
-    return "", 200
-
-
-# ============================================================
-# 아웃바운드: 로봇암 PC --HTTPS POST--> Flask --> Mobius CIN
+# 아웃바운드: 로봇암 PC --HTTP POST--> Flask --> Mobius CIN
 # ============================================================
 
 @app.route("/report/tray-robot-arm", methods=["POST"])
@@ -495,4 +427,5 @@ def clear_board_gate():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # debug=False: 디버그 모드는 파일 저장 시 자동 재시작(그 순간 요청 유실) + 에러 화면에 코드 노출
+    app.run(host="0.0.0.0", port=5000, debug=False)

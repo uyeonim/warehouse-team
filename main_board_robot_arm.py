@@ -54,7 +54,7 @@ fault 처리 - 우리가 관리하는 fault 3종만:
   "게이트가 열려야 큐 처리하는데 게이트는 이 주문 성공해야 열림"이라는
   데드락이 생기기 때문.
   ⚠️ fault 추적은 로컬 변수만 씀(Redis 영속화 안 함) - fault 정보의
-  원본(source of truth)이 우리 메모리가 아니라 매번 오는 MQTT 스냅샷
+  원본(source of truth)이 우리 메모리가 아니라 매번 오는 cnt_process 스냅샷
   자체라서, 재부팅으로 추적 상태를 잃어도 다음 스냅샷에서 "새로 발견"으로
   자동 복구됨 (게이트와 달리 우리 판단이 원본이 아니라서 영속화 불필요).
   ⚠️ 컨베이어 jam은 아직 센서로 자체 감지 안 함(추후 section1/2에 센서
@@ -73,6 +73,15 @@ restock 처리 (신규):
   채우고 그 결과(filled)를 반환 -> local_stock 갱신.
   같은 색이 여러 스냅샷에 걸쳐 반복 등장해도 한 번만 처리(handled_restock),
   배열에서 사라지면 추적 해제해서 나중에 또 restock 떠도 재처리 가능.
+
+주문 수신 - Mobius cnt_process 구독 알림을 이 프로그램이 직접 받음 (MQTT/Flask 거치지 않음):
+  Mobius --POST--> 이 PC :NOTIFY_PORT/notify/process -> snapshot_queue -> 메인 루프
+  - 수신 서버는 별도 스레드, 요청을 한 번에 하나씩 순서대로 처리(스냅샷 순서 보장)
+  - 응답(200)은 바로 주고 실제 처리는 메인 루프가 함
+  - 시작 시 cnt_process/la(최신 스냅샷)를 직접 한 번 읽어서 첫 스냅샷으로 씀 -
+    꺼져 있던 동안 바뀐 상태를 다음 알림을 기다리지 않고 바로 따라잡음
+  - 구독 등록(tools/sub_robotarm.py)은 이 프로그램이 켜진 상태에서 할 것
+    (등록 시 Mobius가 확인 요청(vrq)을 보냄)
 
 전체 흐름
   [보드 픽업 - tray_reached / board_mismatched(재출고)]
@@ -98,7 +107,10 @@ restock 처리 (신규):
 실행 전 확인
   - DobotLab 연결 끊어둘 것 (COM 포트 충돌 방지)
   - DobotLink.exe 실행 중이어야 함
-  - .env에 MQTT_HOST/PORT/USER/PASS, MQTT_TOPIC, FLASK_BASE_URL
+  - 같은 PC에서 Flask(python app.py) 실행 중이어야 함
+  - .env에 FLASK_BASE_URL(예: http://127.0.0.1:5000), COSS_BASE_URL/AE_NAME/ORIGIN,
+    NOTIFY_PORT(생략 시 5001)
+  - Windows 방화벽에서 NOTIFY_PORT 인바운드 허용 (Mobius가 이 PC로 알림을 보냄)
   - pip install DobotRPC opencv-python numpy (Python 3.9 환경 - venv-dobot)
   - 좌표/컨베이어/카메라/HSV 등 튜닝값은 전부 board_config.py에서 수정
     (CAMERA_ROI/COLOR_RANGES_HSV는 tools/camera.py로 확인 후 board_config.py에 반영)
@@ -111,12 +123,13 @@ import json
 import math
 import os
 import queue
+import threading
 import time
 import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cv2
 import numpy as np
-import paho.mqtt.client as mqtt
 import requests
 from dotenv import load_dotenv
 from DobotRPC import RPCClient, DobotlinkAdapter
@@ -124,17 +137,10 @@ from DobotRPC import RPCClient, DobotlinkAdapter
 load_dotenv()
 
 # ---------------------------------------------------------------
-# MQTT 설정
+# Mobius 알림 수신 (cnt_process 구독 nu = http://<이 PC IP>:NOTIFY_PORT/notify/process)
 # ---------------------------------------------------------------
-MQTT_HOST = os.getenv("MQTT_HOST")
-MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
-MQTT_USER = os.getenv("MQTT_USER")
-MQTT_PASS = os.getenv("MQTT_PASS")
-MQTT_TOPIC = os.getenv("MQTT_TOPIC", "sjuiot/warehouse/robotarm")
-MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "pc_robot_arm_board")
-
-if not all([MQTT_HOST, MQTT_USER, MQTT_PASS]):
-    raise RuntimeError(".env에 MQTT_HOST / MQTT_USER / MQTT_PASS가 비어있음")
+NOTIFY_PORT = int(os.getenv("NOTIFY_PORT", "5001"))   # Flask(5000)와 같은 PC라 겹치지 않게
+NOTIFY_PATH = "/notify/process"
 
 FLASK_BASE_URL = os.getenv("FLASK_BASE_URL")
 if not FLASK_BASE_URL:
@@ -142,7 +148,8 @@ if not FLASK_BASE_URL:
 FLASK_BASE_URL = FLASK_BASE_URL.rstrip("/")
 REPORT_TIMEOUT = 5
 
-# Mobius 직접 조회용 (재부팅 복구 때 cnt_board_robot_arm 최신 보고 확인) - 없으면 그 확인만 건너뜀
+# Mobius 직접 조회용 (시작 시 cnt_process 최신 스냅샷 + 재부팅 복구 때 cnt_board_robot_arm 최신 보고)
+# - COSS_BASE_URL/AE_NAME/ORIGIN이 없으면 조회만 건너뜀. API_KEY/LECTURE/CREATOR는 비어있으면 헤더에서 빠짐
 COSS_BASE_URL = os.getenv("COSS_BASE_URL")
 AE_NAME = os.getenv("AE_NAME")
 COSS_API_KEY = os.getenv("COSS_API_KEY")
@@ -199,6 +206,7 @@ def mm_per_sec_to_pulses(speed_mm_s):
 
 snapshot_queue: "queue.Queue" = queue.Queue()
 last_seq = -1
+_seq_lock = threading.Lock()   # 수신 스레드와 시작 시 la 조회가 last_seq를 같이 건드림
 local_stock = {}
 handled_status = {}   # (order_id -> status) - 컨베이어(keycap_packed/board_packed) 트리거 전용 dedup
 
@@ -244,45 +252,74 @@ def log(tag, msg):
     print(f"[{time.strftime('%H:%M:%S')}] [{tag:<8}] {msg}")
 
 
-# ============================== MQTT 콜백 ==============================
-def on_connect(client, userdata, flags, rc):
-    log("MQTT", f"연결 결과 rc={rc}")
-    if rc == 0:
-        client.subscribe(MQTT_TOPIC, qos=1)
-        log("MQTT", f"구독 완료: {MQTT_TOPIC}")
-    else:
-        log("MQTT", f"연결 실패 rc={rc}")
+# ============================== Mobius 알림 수신 ==============================
+def parse_con(con):
+    """CIN의 con -> dict. 문자열이면 JSON 파싱(이중 인코딩 대비 최대 2회), dict가 아니면 None."""
+    for _ in range(2):
+        if isinstance(con, str):
+            try:
+                con = json.loads(con)
+            except ValueError:
+                return None
+    return con if isinstance(con, dict) else None
 
 
-def on_disconnect(client, userdata, rc):
-    log("MQTT", f"연결 끊김 rc={rc} - 자동 재연결 대기 중")
-
-
-def on_message(client, userdata, msg):
+def accept_snapshot(data, source, only_if_first=False):
+    """스냅샷을 메인 루프 큐로 넘김. seq가 직전과 같으면(중복 알림) 버림.
+    only_if_first: 시작 시 la 조회용 - 그 사이 알림이 먼저 들어왔으면 그게 더 최신이라 버림."""
     global last_seq
-    try:
-        data = json.loads(msg.payload)
-    except json.JSONDecodeError as e:
-        log("MQTT", f"JSON 파싱 실패: {e}")
-        return
-    seq = data.get("seq", -1)
-    if seq == last_seq:
-        return
-    last_seq = seq
-    orders = data.get("orders", {})
-    log("MQTT", f"새 스냅샷 수신 seq={seq}, 진행 중 주문={list(orders.keys())}")
-    snapshot_queue.put(data)
+    with _seq_lock:
+        if only_if_first and last_seq != -1:
+            log("RECV", f"{source}: 알림이 먼저 도착해서 건너뜀")
+            return
+        seq = data.get("seq", -1)
+        if seq == last_seq:
+            return
+        last_seq = seq
+        orders = data.get("orders", {})
+        log("RECV", f"새 스냅샷({source}) seq={seq}, 진행 중 주문={list(orders.keys())}")
+        snapshot_queue.put(data)
 
 
-def build_mqtt_client():
-    client = mqtt.Client(client_id=MQTT_CLIENT_ID, transport="tcp")
-    client.tls_set()
-    client.username_pw_set(MQTT_USER, MQTT_PASS)
-    client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
-    client.on_message = on_message
-    client.reconnect_delay_set(min_delay=1, max_delay=30)
-    return client
+class NotifyHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path != NOTIFY_PATH:
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError as e:
+            log("RECV", f"JSON 파싱 실패: {e}")
+            data = {}
+        # 응답 먼저 - 실제 처리(로봇 동작)는 메인 루프가 하니까 Mobius를 기다리게 할 이유 없음
+        self.send_response(200)
+        self.end_headers()
+
+        sgn = data.get("m2m:sgn", {}) if isinstance(data, dict) else {}
+        if sgn.get("vrq"):
+            log("RECV", "Mobius 구독 확인 요청(vrq) - 응답 완료")
+            return
+        cin = sgn.get("nev", {}).get("rep", {}).get("m2m:cin")
+        if not cin:
+            return
+        con = parse_con(cin.get("con"))
+        if con is None:
+            log("RECV", "con이 JSON 객체가 아님 - 무시")
+            return
+        accept_snapshot(con, "알림")
+
+    def log_message(self, fmt, *args):
+        pass   # 기본 접속 로그(요청마다 한 줄) 끔 - 필요한 건 위에서 log()로 남김
+
+
+def start_notify_server():
+    # HTTPServer(단일 스레드) - 알림을 도착 순서대로 하나씩 처리해서 스냅샷 순서가 안 뒤집힘
+    server = HTTPServer(("0.0.0.0", NOTIFY_PORT), NotifyHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log("RECV", f"Mobius 알림 수신 대기: 0.0.0.0:{NOTIFY_PORT}{NOTIFY_PATH}")
+    return server
 
 
 # ============================== Flask 보고 헬퍼 ==============================
@@ -446,13 +483,12 @@ def clear_gate_on_server():
 
 
 # ---- Mobius 직접 조회 ----
-def fetch_latest_board_robot_arm():
-    """cnt_robot_arm/cnt_board_robot_arm 최신 CIN의 con(dict) - 플랫폼이 board_packed 판단에
-    쓰는 원본. .env에 COSS 값이 없거나 조회 실패면 None (판단 근거 없음)."""
-    if not all([COSS_BASE_URL, AE_NAME, COSS_API_KEY, COSS_LECTURE, COSS_CREATOR, COSS_ORIGIN]):
-        log("MOBIUS", ".env에 COSS 값이 없어 cnt_board_robot_arm 조회 생략")
+def fetch_latest_cin(cnt_path):
+    """{AE}/{cnt_path} 최신 CIN의 con(dict). .env에 COSS 값이 없거나 조회 실패면 None."""
+    if not all([COSS_BASE_URL, AE_NAME, COSS_ORIGIN]):
+        log("MOBIUS", f".env에 COSS_BASE_URL/AE_NAME/ORIGIN이 없어 {cnt_path} 조회 생략")
         return None
-    url = f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/cnt_robot_arm/cnt_board_robot_arm/la"
+    url = f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/{cnt_path}/la"
     headers = {
         "X-API-KEY": COSS_API_KEY,
         "X-AUTH-CUSTOM-LECTURE": COSS_LECTURE,
@@ -465,16 +501,17 @@ def fetch_latest_board_robot_arm():
     try:
         resp = requests.get(url, headers=headers, timeout=REPORT_TIMEOUT)
         if resp.status_code != 200:
-            log("MOBIUS", f"cnt_board_robot_arm 최신 CIN 조회 실패 ({resp.status_code})")
+            log("MOBIUS", f"{cnt_path} 최신 CIN 조회 실패 ({resp.status_code})")
             return None
-        con = resp.json().get("m2m:cin", {}).get("con")
-        for _ in range(2):   # 이중 인코딩 대비 최대 2회 파싱
-            if isinstance(con, str):
-                con = json.loads(con)
-        return con if isinstance(con, dict) else None
+        return parse_con(resp.json().get("m2m:cin", {}).get("con"))
     except Exception as e:
-        log("MOBIUS", f"cnt_board_robot_arm 조회 에러: {e}")
+        log("MOBIUS", f"{cnt_path} 조회 에러: {e}")
         return None
+
+
+def fetch_latest_board_robot_arm():
+    """cnt_robot_arm/cnt_board_robot_arm 최신 보고 - 플랫폼이 board_packed 판단에 쓰는 원본."""
+    return fetch_latest_cin("cnt_robot_arm/cnt_board_robot_arm")
 
 
 # ============================== DobotRPC 공용 헬퍼 ==============================
@@ -1172,9 +1209,14 @@ def main():
         gate_open = True
         gate_order_id = ""
 
-    mqtt_client = build_mqtt_client()
-    mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
-    mqtt_client.loop_start()
+    notify_server = start_notify_server()
+    # 수신 서버를 먼저 켜고 la를 읽음 - 반대 순서면 그 사이 온 알림을 놓침.
+    # la보다 알림이 먼저 들어오면 only_if_first로 la 쪽을 버림(알림이 더 최신)
+    latest = fetch_latest_cin("cnt_process")
+    if latest is not None:
+        accept_snapshot(latest, "시작 시 la 조회", only_if_first=True)
+    else:
+        log("RECV", "cnt_process 최신 스냅샷 조회 실패 - 첫 알림이 올 때까지 큐 처리 대기")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1235,8 +1277,8 @@ def main():
             loop.run_until_complete(safe_call(arm_api.DisconnectDobot(portName=DOBOT_PORT)))
         except Exception as e:
             log("SHUTDOWN", f"연결 종료 중 에러(무시 가능): {e}")
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
+        notify_server.shutdown()
+        notify_server.server_close()
 
 
 if __name__ == "__main__":
