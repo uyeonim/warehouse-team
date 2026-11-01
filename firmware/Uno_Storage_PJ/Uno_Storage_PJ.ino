@@ -3,7 +3,7 @@
   키캡 배출 아두이노 - P/J 축 담당 (Arduino Uno R4 WiFi)
   ================================================================================
   역할
-   1) HiveMQ Cloud(MQTT, TLS)에 직접 연결해서 "sjuiot/warehouse/process" 구독
+   1) 로컬 Mosquitto(MQTT, 평문)에 직접 연결해서 "sjuiot/warehouse/process" 구독
       (주문/재고보충 push는 MQTT 한 방향으로만 옴: Mobius -> Flask 웹훅 -> MQTT publish.
        Flask(/notify/process)는 con 내용을 파싱하지 않고 그대로 relay만 하므로,
        orders/restock 파싱과 그에 따른 후속 HTTP 호출은 전부 이 아두이노가 직접 함)
@@ -22,16 +22,16 @@
        바로 배출해버리는 문제가 있었음)
 
   ============================== 통신 대상 (Flask) ==============================
-   GET  /stock/keycap?board=PJ         부팅 시 재고 8칸 초기 조회
-   GET  /queue/PJ/next                 부팅 시 미완료 큐 복원
-   POST /queue/PJ/enqueue              새 주문 감지 시 서버 큐에도 적재
-   POST /queue/PJ/complete             배출 성공 후(또는 유령 주문 정리 시) 서버 큐에서 제거
+   GET  /stock/keycap?board=NS         부팅 시 재고 8칸 초기 조회
+   GET  /queue/NS/next                 부팅 시 미완료 큐 복원
+   POST /queue/NS/enqueue              새 주문 감지 시 서버 큐에도 적재
+   POST /queue/NS/complete             배출 성공 후(또는 유령 주문 정리 시) 서버 큐에서 제거
    POST /restock/{letter}/{color}                restock 감지 시 호출, 채워진 개수 응답받음
    POST /report/keycap-status              기존 그대로 (상태 보고, 성공/실패 무관 항상)
    POST /report/keycap-dispense            기존 그대로 (배출 성공했을 때만)
-   GET  /gate/PJ                       부팅 시 게이트(픽업 대기) 상태 복원
-   POST /gate/PJ                       게이트 잠글 때 서버에 기록 (body: order_id)
-   POST /gate/PJ/clear                 게이트 열릴 때 서버 기록 해제
+   GET  /gate/NS                       부팅 시 게이트(픽업 대기) 상태 복원
+   POST /gate/NS                       게이트 잠글 때 서버에 기록 (body: order_id)
+   POST /gate/NS/clear                 게이트 열릴 때 서버 기록 해제
 
   ※ 위 신규 라우트(/stock, /queue/*, /restock/*, /gate/*)는 이번에 새로 정의한
     스펙이라 Flask 쪽 실제 응답 형식과 어긋나면 즉시 팀원과 맞춰서 파싱부만 고칠 것.
@@ -88,6 +88,8 @@
      타이밍 이슈로 추정).
    - getJsonFromFlask / postJsonToFlask 모두 실패 시 300ms 대기 후 1회 재시도.
      재시도까지 실패하면 기존과 동일하게 실패 처리(재고 0/empty, 재고보충 재시도 등).
+   - (11/01 참고: 로컬 평문 HTTP 전환 후엔 TLS 핸드셰이크 이슈가 사라질 가능성이
+     크지만, 일시적 연결 실패 대비용으로 재시도 로직은 그대로 유지함)
 
   [2026-09-09 restock 필드명 확정 + order_id 명시]
    - Mobius cnt_process의 실제 재고보충 필드명은 "keycap_restock"임 ->
@@ -469,6 +471,76 @@
      판단해 이후 스냅샷을 전부 무시할 수 있었음).
    - IR 센서: 현재 E/I 보드(E_r)만 사용. N/S, T/F, P/J는 IR_SENSOR_INSTALLED=0.
 
+  [2026-11-01 전시장 로컬 서버 전환 - HiveMQ Cloud/Cloud Run(TLS) -> 로컬 Mosquitto/Flask(평문)]
+   - 배경: 전시장은 인터넷이 없다고 가정하고, 클라우드에서 돌던 Mobius/MQTT/Redis를
+     플랫폼 서버(192.168.0.100, 고정 IP)로 옮김. 키캡 Flask(릴레이 + /stock /queue
+     /gate /restock /report)도 같은 로컬망에서 돌리기로 함(포트 5000, HTTP).
+     Redis는 플랫폼팀이 DB 0번, 보드 로봇암이 1번을 쓰므로 키캡 Flask는 겹치지 않는
+     번호를 써야 함(Flask 쪽 설정이며 아두이노 코드에는 영향 없음).
+   - TLS 제거: MQTT용 WiFiSSLClient -> WiFiClient, Flask용 httpSSLClient -> httpClient
+     (WiFiClient). 로컬 Mosquitto(1883)/Flask(5000)는 인증서 없는 평문이라 TLS를 쓰면
+     접속이 안 됨. "SSL 루트 인증서 업로드"도 더 이상 필요 없음(예전에 구워둔
+     인증서가 모듈에 남아 있어도 무해).
+   - MQTT 계정 미정 대응: tryConnectMQTT()가 MQTT_USER가 빈 문자열이면 익명으로
+     connect(clientId), 아니면 계정으로 connect(clientId, user, pass)를 부름.
+     Mosquitto가 익명 허용이면 config.h의 MQTT_USER/MQTT_PASS를 ""로 두면 되고,
+     계정이 생기면 그 두 줄만 채워서 4개 보드에 다시 업로드하면 됨.
+     접속 실패 시 시리얼 state 값: -2 = TCP 연결 불가(Mosquitto 외부 접속 미허용/
+     방화벽/IP 오류), 4 = 계정/비번 틀림, 5 = 인증 필요(익명 불가).
+   - 시리얼 로그의 "[HTTPS]" 접두어를 "[HTTP]"로 변경(실제로 TLS를 안 쓰므로).
+   - 아직 확인 필요(플랫폼팀 답변 대기): Mosquitto 외부 접속 허용(listener 1883
+     0.0.0.0) + 계정 여부, sjuiot/warehouse/process publish 주체(우리 Flask 웹훅 릴레이
+     그대로 쓰는지), Mobius 구독 notification URL을 새 Flask 주소로 바꿨는지.
+   - config.h에서 쓰는 이름은 WIFI_SSID/WIFI_PASS/MQTT_HOST/MQTT_PORT/MQTT_USER/
+     MQTT_PASS/FLASK_HOST/FLASK_PORT 8개뿐(인증서 관련 정의 삭제).
+
+  [2026-11-01 IR 센서를 4개 보드 8개 레일 전부 활성화]
+   - 4개 보드(EI/NS/TF/PJ) 모두 8개 레일 전부에 브레이크빔 센서를 배선함 ->
+     IR_SENSOR_INSTALLED=1, IR_INSTALLED 8칸 전부 true. 이제 IR 관련 설정은
+     4개 보드가 완전히 동일하고, 보드마다 다른 건 맨 위 "보드별 설정" 블록뿐임.
+   - 배선은 IR_PIN 표 그대로: LETTER_0 r,g,b,y = D2,D3,D4,D5 /
+     LETTER_1 r,g,b,y = D6,D7,D8,D9 (수신부 신호선 기준).
+   - 주의 1) 이제 모든 레일이 실제 IR 판정을 함 - 센서가 빠졌거나 배선이 안 된
+     레일은 핀이 플로팅이라 판정이 랜덤해지고, 감지가 안 되면 배출할 때마다
+     disable(keycap_cartridge_failed)로 보고됨. 8개 다 배선한 뒤 업로드할 것.
+   - 주의 2) UNO R4 WiFi는 모든 디지털 핀이 외부 인터럽트를 지원하지 않음.
+     인터럽트가 안 붙는 핀의 레일은 폴링 판정만 동작함(판정 = 폴링 OR 인터럽트).
+     시리얼 [IR] 진단에서 "끊김샘플>0인데 인터럽트 최대끊김(us)=0"이 반복되는
+     레일은 인터럽트가 안 걸리는 핀이라는 뜻 - 그 레일에서 통과를 자주 놓치면
+     인터럽트 지원 핀으로 옮기는 걸 검토할 것.
+   - 주의 3) 판정은 IR_POLL_WINDOW_MS(7초)가 끝나야 내려지므로, 이제 모든 레일이
+     배출 1건당 최소 7초씩 걸림(기존엔 센서 레일만).
+
+  [2026-11-01 PCA 드라이버 고장 복구를 "PCA 응답 회복 시 자동" -> "사람이 fault 내릴 때만"으로 변경]
+   - 원칙: failed가 뜨면 무조건 사람이 fault를 내린 뒤에만 복구/재배출함.
+   - 기존: PCA가 다시 I2C 응답하면 주문과 무관한 7개 레일을 자동 원복함. 그런데
+     I2C 응답만 보고 판단해서 서보 전원선이 빠져있어도 "복구"로 보고, 재부팅되면
+     pcaDriverFailed(RAM)가 지워져서 8개가 Redis의 disable 그대로 남는 문제가 실기에서 발생함
+     (fault를 내려도 주문 걸린 레일 1개만 풀림).
+   - 변경: PCA 응답이 돌아와도 아무것도 자동으로 안 풀고 배출 금지(pcaDriverFailed) 유지.
+     keycap_driver_failed fault가 내려가는 순간 이 보드의 disable 레일을 전부 원복+보고하고
+     배출 금지 해제, 주문 걸린 레일은 기존처럼 재배출. 단 다른 fault가 따로 걸려있는
+     레일은 그 fault가 풀릴 때 따로 처리되도록 건드리지 않음.
+   - 재부팅 대응: 스냅샷에 keycap_driver_failed가 보이면 배출 금지를 다시 걸고, 부팅 시
+     8개 레일이 전부 disable로 복원되면 driver 고장 중 재부팅된 것으로 보고 배출 금지로 시작함.
+   - 배출 금지 중엔 큐의 job을 꺼내지 않고 그대로 둠 -> fault 해제 시 같은 job이 큐에
+     이미 있으면 재적재하지 않음(이중 배출 방지, queueContains()).
+   - 고장 당시 대기 주문이 없었으면 모든 레일이 order_id 없이 보고돼서 플랫폼에 내릴
+     fault 자체가 없음 -> 이 경우는 시리얼 "REPAIR ALL"로 사람이 직접 풂(새로 추가한 명령).
+
+  [2026-11-01 MQTT 연결 상태 LED 표시 추가]
+   - 시리얼 모니터 없이도 연결 여부를 알 수 있게 보드 기본 LED(LED_BUILTIN, "L" 표시, D13)를 씀.
+   - MQTT 연결 성공 순간 5번 깜빡이고, 이후 연결이 유지되는 동안은 계속 켜짐.
+     연결이 끊기면 꺼짐 -> 꺼져 있으면 WiFi 또는 MQTT 연결 안 된 상태.
+   - 깜빡임은 millis() 기반 non-blocking이라 배출 동작/IR 감시를 막지 않음.
+
+  [2026-11-01 restock이 disable 레일을 풀어버리던 구멍 수정]
+   - 기존 callRestock()은 채워진 개수만 보고 status를 idle/empty로 덮어써서, disable 레일에
+     restock이 들어오면 fault를 내리기 전에 풀려버림. 그 뒤 fault를 내려도 "우리 레일은
+     disable 아니었음"으로 판단해 실패했던 주문을 재배출하지 않는 문제까지 생김.
+   - 변경: 레일이 disable이면 count만 갱신하고 status는 disable 유지. 사람이 fault를
+     내리거나 REPAIR 해야만 풀리고, 풀릴 때 갱신된 count 기준으로 idle/empty가 정해짐.
+
   다른 3개 보드는 이 파일을 복사한 뒤 "보드별 설정" 블록만 아래 표대로
   바꿔서 각 보드에 업로드하면 됩니다. (지금 이 파일은 PJ 보드용입니다)
 
@@ -524,8 +596,8 @@ const uint8_t SERVO_CHANNEL[2][4] = {
 
 // ---- IR 센서 핀 매핑: [글자슬롯(0/1)][색상슬롯(0~3)] (실배선에 맞게 수정) ----
 const uint8_t IR_PIN[2][4] = {
-  {2, 3, 4, 5},
-  {6, 7, 8, 9}
+  {2, 3, 4, 5},      // LETTER_0 - r,g,b,y
+  {6, 7, 8, 9}       // LETTER_1 - r,g,b,y
 };
 
 // ---- 서보 동작 파라미터 (실측 후 조정) ----
@@ -561,19 +633,19 @@ const uint8_t IR_PIN[2][4] = {
 // 0 = 이 보드는 센서가 전혀 없음, DS_WAIT_IR 단계에서 핀을 읽지 않고 무조건 성공(idle) 처리
 // 아래 IR_INSTALLED 배열로 레일 단위 세부 제어를 하므로, 이 매크로는
 // "이 보드에 센서 배선이 하나라도 있는가"만 나타내는 최상위 스위치임.
-// ※ 이 보드(PJ)의 현재 값: 0 (센서 없음 - 배출 후 무조건 성공 처리)
-#define IR_SENSOR_INSTALLED 0
+// ※ 현재 값: 1 (11/01부터 4개 보드 공통 - 8개 레일 전부 브레이크빔 IR 센서 배선)
+#define IR_SENSOR_INSTALLED 1
 
 // ---- [레일별 IR 센서 배선 여부] ----
-// 레일(글자슬롯×색상슬롯) 8개가 각자 독립된 센서를 필요로 하지만, 아직 전부
-// 배선되지 않은 상태라 레일 단위로 관리함. true인 레일만 실제로 IR_PIN을 읽어
-// 폴링+디바운스 판정을 하고, false인 레일은 핀을 읽지 않고 즉시 성공 처리함
-// (플로팅 핀을 실수로 읽어서 오판정하는 일을 방지). 배선이 추가될 때마다
-// 이 표만 갱신하면 됨 - IR_PIN 배열과 인덱스([글자슬롯][색상슬롯])가 동일하게 대응.
-// ※ 현재 배선 완료: 없음 (이 보드(PJ)는 센서 미배선 - 배선하면 IR_SENSOR_INSTALLED도 1로)
+// 레일(글자슬롯×색상슬롯) 8개가 각자 독립된 센서를 필요로 함. true인 레일만
+// 실제로 IR_PIN을 읽어 폴링+디바운스 판정을 하고, false인 레일은 핀을 읽지 않고
+// 즉시 성공 처리함(플로팅 핀을 실수로 읽어서 오판정하는 일을 방지).
+// IR_PIN 배열과 인덱스([글자슬롯][색상슬롯])가 동일하게 대응.
+// ※ 현재 배선: 8개 레일 전부 (11/01부터 4개 보드 공통). 특정 레일 센서를 뺄 때는
+//   그 칸만 false로 바꾸면 그 레일은 다시 "판정 없이 항상 성공"으로 돌아감.
 const bool IR_INSTALLED[2][4] = {
-  {false, false, false, false},  // 센서 없음
-  {false, false, false, false}
+  {true, true, true, true},   // LETTER_0 - r,g,b,y (핀 2,3,4,5)
+  {true, true, true, true}    // LETTER_1 - r,g,b,y (핀 6,7,8,9)
 };
 
 // ---- 카트리지 최대 용량 (restock 시 이 값까지 채움, 전체 풀 부족하면 서버가 그보다 적게 응답) ----
@@ -650,11 +722,12 @@ bool pcaDriverFailed = false;
 unsigned long lastPcaCheckMs = 0;
 const unsigned long PCA_CHECK_INTERVAL_MS = 1000; // I2C 버스 부담 줄이려고 매 loop()가 아니라 1초 간격으로만 확인
 
-// 고장 감지 시점에 큐 맨 앞에 있던(=order_id가 실제로 붙었던) job을 기억해둠.
-// 복구 감지 시, 이 레일만은 즉시 원복하지 않고 disable 그대로 둬서 - 그 주문의
-// fault가 실제로 플랫폼에서 풀릴 때(handleOrderFaults)만 재배출되도록 함.
-// 나머지 7개 레일은 애초에 특정 주문에 안 걸려있어서(order_id null) 기다릴
-// fault 자체가 없으므로 복구 즉시 원복해도 됨.
+// 고장 감지 시점에 큐 맨 앞에 있던(=order_id가 실제로 붙었던) job을 기억해둠
+// (그 레일에만 order_id를 실어 보고하기 위함).
+// [11/01] PCA가 다시 응답해도 자동 원복은 하지 않음. 8개 레일 전부 disable +
+// 배출 금지(pcaDriverFailed) 상태를 유지하다가, 사람이 keycap_driver_failed
+// fault를 내리면(handleOrderFaults -> restoreRailsAfterDriverFault) 한꺼번에 풀림.
+// 고장 당시 대기 주문이 없어서 fault가 안 생긴 경우는 시리얼 REPAIR ALL로 풂.
 // (DispenseJob 타입 인스턴스는 struct DispenseJob 전체 정의 뒤에서 선언해야
 // 해서 pcaRelatedJob 변수는 "배출 대기열" 섹션 아래에 별도로 선언함)
 bool pcaHasRelatedOrder = false;
@@ -672,6 +745,7 @@ bool pcaHasRelatedOrder = false;
 //     빼고 영구 재큐잉 차단함 (아래 handleOrderFaults 참고).
 bool   faultActive[2][4] = { {false, false, false, false}, {false, false, false, false} };
 String faultOrderId[2][4];
+String faultType[2][4];   // [11/01] 추적 중인 fault 문자열 (해제 시 driver_failed였는지 구분용)
 
 // ============================== 배출 대기열 (로컬 캐시, 서버 큐와 동기화) ==============================
 struct DispenseJob {
@@ -699,6 +773,13 @@ bool queuePop(DispenseJob& job) {
   job = jobQueue[jobHead];
   jobHead = (jobHead + 1) % JOB_QUEUE_SIZE;
   return true;
+}
+// [11/01] 같은 job이 이미 큐에 대기 중인지 확인 (fault 해제 시 중복 적재 방지)
+bool queueContains(const String& orderId, char letter, char color) {
+  for (uint8_t i = jobHead; i != jobTail; i = (i + 1) % JOB_QUEUE_SIZE) {
+    if (jobQueue[i].orderId == orderId && jobQueue[i].letter == letter && jobQueue[i].color == color) return true;
+  }
+  return false;
 }
 
 // ============================== pickup 게이트 ==============================
@@ -755,6 +836,8 @@ unsigned long irBrokenSamples = 0; // [진단] 그 중 "끊김"으로 읽힌 샘
 // loop()에서 폴링하면 WiFi/MQTT 호출 때문에 폴링 간격이 길어져서(수십 ms) 짧은
 // 끊김을 놓치거나 샘플 1개로만 잡히는 문제가 있었음 -> 핀 변화 시각을 마이크로초로
 // 직접 기록해서 loop() 속도와 무관하게 끊김 길이를 잼. 현재 배출 중인 레일의 핀(irIsrPin)만 봄.
+// (8개 핀이 같은 ISR을 공유함 - 어느 핀에서 불리든 irIsrPin의 현재 레벨만 읽으므로
+//  다른 레일 핀의 변화로 불려도 판정에는 영향 없음)
 volatile int8_t        irIsrPin = -1;          // -1 = 감시 안 함
 volatile unsigned long irIsrBreakStartUs = 0;  // 지금 이어지는 끊김의 시작 시각(us), 0 = 안 끊김
 volatile unsigned long irIsrMaxUs = 0;         // 이번 배출에서 관측된 가장 긴 끊김(us)
@@ -780,15 +863,16 @@ void irIsr() {
 String lastSeqStr = "";
 
 // ---- 네트워크 / 하드웨어 객체 ----
-WiFiSSLClient wifiSSLClient;      // MQTT 전용 - 상시 연결 유지 (주문 수신)
-PubSubClient  mqttClient(wifiSSLClient);
-WiFiSSLClient httpSSLClient;      // Flask 보고/조회 전용 - 필요할 때만 짧게 연결
+// [11/01] 로컬 서버(평문) 전환: WiFiSSLClient -> WiFiClient
+WiFiClient    wifiClient;         // MQTT 전용 - 상시 연결 유지 (주문 수신, 로컬 Mosquitto 평문)
+PubSubClient  mqttClient(wifiClient);
+WiFiClient    httpClient;         // Flask 보고/조회 전용 - 필요할 때만 짧게 연결 (로컬 HTTP 평문)
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
 // ---- MQTT 토픽 ----
 const char* TOPIC_CNT_PROCESS = "sjuiot/warehouse/process";
 
-// ---- Flask(Cloud Run) 엔드포인트 ----
+// ---- Flask(로컬 서버) 엔드포인트 ----
 const char* REPORT_STATUS_PATH   = "/report/keycap-status";
 const char* REPORT_DISPENSE_PATH = "/report/keycap-dispense";
 const char* GATE_PATH            = "/gate"; // GET/POST {GATE_PATH}/{BOARD_NAME}, POST {GATE_PATH}/{BOARD_NAME}/clear
@@ -798,6 +882,15 @@ const char* GATE_PATH            = "/gate"; // GET/POST {GATE_PATH}/{BOARD_NAME}
 // 그보다 여유 있게 8초로 설정. REPORT_STATUS_PATH / REPORT_DISPENSE_PATH,
 // 즉 실제로 Mobius를 거치는 두 호출에만 적용 (나머지는 기본 5000ms 유지).
 #define FLASK_MOBIUS_TIMEOUT_MS 8000UL
+
+// ---- [11/01] MQTT 연결 상태 LED (보드 기본 LED, "L" 표시) ----
+// 연결 성공 순간 MQTT_OK_BLINKS번 깜빡인 뒤, 연결 유지 중엔 켜짐 / 끊기면 꺼짐
+#define STATUS_LED_PIN   LED_BUILTIN
+#define MQTT_OK_BLINKS   5
+#define LED_BLINK_MS     150
+uint8_t       ledTogglesLeft = 0;   // 남은 켜짐/꺼짐 전환 횟수 (깜빡임 1번 = 2회)
+unsigned long ledTimer = 0;
+bool          ledState = false;
 
 // ============================== 함수 선언 ==============================
 void ensureWiFi();
@@ -811,6 +904,7 @@ bool getOrderLetterColor(JsonObject order, char& letter, char& color);
 void checkGateAgainstOrders(JsonObject orders);
 void pruneDeadJobsFromQueue(JsonObject orders);
 void removeOrderFromQueue(const String& orderId);
+void restoreRailsAfterDriverFault(int keepL, int keepC);
 void handleAssignedOrder(const String& orderId, const char* keycap, JsonArray colors);
 void runDispenseStateMachine();
 void pollIrForCurrentJob();
@@ -831,11 +925,16 @@ void checkSerialCommand();
 void restoreGateFromServer();
 void lockGateOnServer(const String& orderId);
 void clearGateOnServer();
+void startConnectBlink();
+void updateStatusLed();
 
 // ============================== setup / loop ==============================
 void setup() {
   Serial.begin(115200);
   delay(500);
+
+  pinMode(STATUS_LED_PIN, OUTPUT);   // [11/01] MQTT 연결 상태 LED
+  digitalWrite(STATUS_LED_PIN, LOW);
 
   // IR 센서 핀 설정
   // - 배선 완료된 레일(IR_INSTALLED[l][c]==true): 브레이크빔 수신부 신호선이
@@ -856,8 +955,10 @@ void setup() {
   for (int l = 0; l < 2; l++) {
     for (int c = 0; c < 4; c++) {
       if (!IR_INSTALLED[l][c]) continue;
-      // UNO R4 코어에는 NOT_AN_INTERRUPT가 없어서 유효성 검사 없이 바로 연결함
-      // (2번 핀은 인터럽트 지원 핀). 레일을 늘릴 때는 해당 핀의 인터럽트 지원 여부 확인할 것.
+      // UNO R4 코어에는 NOT_AN_INTERRUPT가 없어서 유효성 검사 없이 바로 연결함.
+      // UNO R4 WiFi는 모든 핀이 외부 인터럽트를 지원하지는 않으므로, 인터럽트가
+      // 안 붙는 핀의 레일은 폴링 판정만 동작함 (판정 = 폴링 OR 인터럽트라 동작 자체는 함).
+      // 시리얼 [IR] 진단에서 레일별로 "인터럽트 최대끊김(us)"이 계속 0인지 확인할 것.
       attachInterrupt(digitalPinToInterrupt(IR_PIN[l][c]), irIsr, CHANGE);
     }
   }
@@ -893,9 +994,8 @@ void setup() {
     Serial.println("[WiFi] 30초 내 연결 실패, loop()에서 계속 재시도함");
   }
 
-  // TLS 인증서는 Arduino IDE "SSL 루트 인증서 업로드" 도구로 R4 WiFi 모듈에
-  // 직접 구워 넣는 방식을 쓰므로, 코드에서 setCACert() 등을 호출할 필요 없음.
-  // Flask 보고/조회용 httpSSLClient도 같은 방식으로 인증서가 미리 등록돼 있어야 함.
+  // [11/01] 로컬 Mosquitto(1883)/Flask(5000)는 TLS 없는 평문 통신이라 인증서가
+  // 필요 없음 (이전의 "SSL 루트 인증서 업로드"도 더 이상 불필요).
 
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setBufferSize(4096); // 이보다 큰 메시지는 PubSubClient가 콜백 없이 조용히 버림 - 주문이 몰릴 때 대비해 여유 있게
@@ -908,6 +1008,19 @@ void setup() {
     fetchInitialStock();
     restoreQueueFromServer();
     restoreGateFromServer();
+
+    // [11/01] 8개 레일이 전부 disable로 복원됐으면 driver 고장 중에 재부팅된 것으로 보고
+    // 배출 금지 상태로 시작 (사람이 keycap_driver_failed fault를 내리거나 REPAIR ALL 할 때까지)
+    bool allDisabled = true;
+    for (int l = 0; l < 2; l++) {
+      for (int c = 0; c < 4; c++) {
+        if (rail[l][c].status != RAIL_DISABLE) allDisabled = false;
+      }
+    }
+    if (allDisabled) {
+      pcaDriverFailed = true;
+      Serial.println("[PCA] 8개 레일 전부 disable로 복원됨 - fault 해제(또는 REPAIR ALL) 전까지 배출 금지");
+    }
   } else {
     Serial.println("[경고] WiFi 미연결 상태로 setup 종료 - 재고/큐/게이트 복원 실패, 로컬 기본값 사용됨");
   }
@@ -920,7 +1033,7 @@ void setup() {
   Serial.print("도, IR감시=");   Serial.print(IR_POLL_WINDOW_MS);
   Serial.print("ms, 최소끊김="); Serial.print(IR_MIN_BREAK_MS);
   Serial.print("ms, IR센서=");   Serial.println(IR_SENSOR_INSTALLED ? "사용" : "없음(항상 성공 처리)");
-  Serial.println("[안내] 시리얼 명령: SETEMPTY E_r / REPAIR E_r (테스트용)");
+  Serial.println("[안내] 시리얼 명령: SETEMPTY P_r / REPAIR P_r / REPAIR ALL (테스트용)");
 }
 
 void loop() {
@@ -929,6 +1042,7 @@ void loop() {
   mqttClient.loop();
   runDispenseStateMachine();
   checkSerialCommand();
+  updateStatusLed();
 }
 
 // ============================== WiFi / MQTT 연결 관리 (논블로킹) ==============================
@@ -956,16 +1070,53 @@ void ensureMQTT() {
   tryConnectMQTT();
 }
 
+// [11/01] MQTT_USER가 빈 문자열이면 익명 접속, 아니면 계정 접속
+// 실패 시 state: -2 = TCP 연결 불가(Mosquitto 외부 접속 미허용/방화벽/IP 오류),
+//                 4 = 계정/비번 틀림, 5 = 인증 필요(익명 불가)
 bool tryConnectMQTT() {
   Serial.print("[MQTT] 연결 시도... ");
-  if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+  bool ok;
+  if (strlen(MQTT_USER) == 0) {
+    ok = mqttClient.connect(MQTT_CLIENT_ID);                        // 익명
+  } else {
+    ok = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS);  // 계정
+  }
+  if (ok) {
     Serial.println("성공");
     mqttClient.subscribe(TOPIC_CNT_PROCESS, 1);
+    startConnectBlink();  // [11/01] 연결 성공 표시
     return true;
   }
   Serial.print("실패, state=");
   Serial.println(mqttClient.state());
   return false;
+}
+
+// ---- [11/01] MQTT 연결 상태 LED ----
+void startConnectBlink() {
+  ledTogglesLeft = MQTT_OK_BLINKS * 2;
+  ledTimer = millis();
+  ledState = false;
+  digitalWrite(STATUS_LED_PIN, LOW);
+}
+
+// loop()마다 호출: 깜빡임 진행 중이면 LED_BLINK_MS 간격으로 토글,
+// 끝났으면 MQTT 연결 상태 그대로 표시 (연결=켜짐, 끊김=꺼짐)
+void updateStatusLed() {
+  if (ledTogglesLeft > 0) {
+    if (millis() - ledTimer >= LED_BLINK_MS) {
+      ledTimer = millis();
+      ledState = !ledState;
+      digitalWrite(STATUS_LED_PIN, ledState ? HIGH : LOW);
+      ledTogglesLeft--;
+    }
+    return;
+  }
+  bool connected = mqttClient.connected();
+  if (connected != ledState) {
+    ledState = connected;
+    digitalWrite(STATUS_LED_PIN, ledState ? HIGH : LOW);
+  }
 }
 
 // ============================== MQTT 수신 콜백 ==============================
@@ -1145,7 +1296,7 @@ void handleRestockField(JsonArray restock) {
   bool presentNow[2][4] = { {false,false,false,false}, {false,false,false,false} };
 
   for (JsonVariant item : restock) {
-    String rc = item.as<String>(); // 예: "E_r"
+    String rc = item.as<String>(); // 예: "P_r"
     if (rc.length() < 3) continue;
     char letter = rc.charAt(0);
     char color  = rc.charAt(2);
@@ -1192,6 +1343,27 @@ bool getOrderLetterColor(JsonObject order, char& letter, char& color) {
   return true;
 }
 
+// ---- [11/01] keycap_driver_failed fault가 내려갔을 때 호출 ----
+// PCA 고장으로 같이 disable됐던 레일들을 원복하고 배출 금지를 해제함.
+// keepL/keepC(fault가 걸려있던 주문의 레일)는 handleOrderFaults의 기존 흐름이
+// 원복+재배출까지 처리하므로 여기선 건드리지 않음. 다른 fault가 따로 걸려있는
+// 레일도 그 fault가 풀릴 때 처리돼야 하므로 건드리지 않음.
+// 만약 PCA가 실제로는 안 고쳐졌으면, 다음 배출 직전 헬스체크가 바로 다시 disable 시킴.
+void restoreRailsAfterDriverFault(int keepL, int keepC) {
+  for (int l = 0; l < 2; l++) {
+    for (int c = 0; c < 4; c++) {
+      if (l == keepL && c == keepC) continue;
+      if (faultActive[l][c]) continue;
+      if (rail[l][c].status != RAIL_DISABLE) continue;
+      rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
+      reportRailStatus(letterOf(l), colorOf(c), rail[l][c].status, "");
+    }
+  }
+  pcaDriverFailed = false;
+  pcaHasRelatedOrder = false;
+  Serial.println("[fault] keycap_driver_failed 해제 - disable 레일 원복, 배출 금지 해제");
+}
+
 // ---- fault 필드 처리: 우리 축 담당 주문의 fault 등장/해제를 감지 ----
 // stage_timeout: rail 상태와 무관하게 뜰 수 있어서 해제 시점 판단이 불가능함
 // (사람이 수동 폐기하기로 결정됨) -> **등장하는 즉시** 큐에서 빼고 영구
@@ -1231,6 +1403,7 @@ void handleOrderFaults(JsonObject orders) {
       if (faultActive[l][c] && faultOrderId[l][c] == orderId) {
         faultActive[l][c] = false;
         faultOrderId[l][c] = "";
+        faultType[l][c] = "";
       }
       continue;
     }
@@ -1239,10 +1412,25 @@ void handleOrderFaults(JsonObject orders) {
       // 등장 시엔 추적만 하고 disable/보고는 하지 않음 (이유는 위 주석 참고)
       faultActive[l][c] = true;
       faultOrderId[l][c] = orderId;
+      faultType[l][c] = faultStr;
+      // [11/01] driver_failed가 걸려있는 동안은 배출 금지 유지 - 재부팅으로 RAM의
+      // pcaDriverFailed가 지워졌어도 스냅샷의 fault를 보고 다시 잠금
+      if (strcmp(faultStr, "keycap_driver_failed") == 0 && !pcaDriverFailed) {
+        pcaDriverFailed = true;
+        Serial.println("[fault] keycap_driver_failed 감지 - 사람이 fault를 내릴 때까지 배출 금지");
+      }
     } else {
       if (faultActive[l][c] && faultOrderId[l][c] == orderId) {
+        bool wasDriverFault = (faultType[l][c] == "keycap_driver_failed");
         faultActive[l][c] = false;
         faultOrderId[l][c] = "";
+        faultType[l][c] = "";
+
+        // [11/01] PCA 드라이버 고장 fault가 사람에 의해 내려감 -> 이 주문 레일을 뺀 나머지
+        // disable 레일도 같이 원복하고 배출 금지 해제 (이 주문 레일은 아래 기존 흐름이 처리)
+        if (wasDriverFault) {
+          restoreRailsAfterDriverFault(l, c);
+        }
 
         // "아직 한 번도 시도 안 된 job인지"는 status가 아니라 alreadyProcessed로
         // 판단해야 정확함 - status=="assigned"이어도 이미 배출을 한 번 시도했다가
@@ -1291,7 +1479,10 @@ void handleOrderFaults(JsonObject orders) {
 
           if (rail[l][c].count > 0) {
             DispenseJob job{orderId, letter, color};
-            if (queuePush(job)) {
+            if (queueContains(orderId, letter, color)) {
+              // driver_failed 동안엔 배출이 멈춰서 원래 job이 아직 큐에 남아있음 - 또 넣으면 이중 배출
+              Serial.println("[fault] " + orderId + " 이미 큐에 대기 중 - 재적재 생략");
+            } else if (queuePush(job)) {
               enqueueToServer(job);
             } else {
               Serial.println("[fault] 재배출 큐 적재 실패 - 큐 가득 참");
@@ -1331,10 +1522,9 @@ void runDispenseStateMachine() {
 
       if (!pcaOk && !pcaDriverFailed) {
         pcaDriverFailed = true;
-        // 대기열 맨 앞 job이 있으면 그 주문과 관련된 레일에만 order_id, 나머지 7개는 null
-        // 이 관련 job은 고장이 풀려도(PCA 복구) 즉시 재배출하지 않고, 그 주문의
-        // fault가 플랫폼에서 실제로 풀릴 때까지 기다려야 하므로 전역 변수에
-        // 기억해둠 (아래 복구 분기 및 handleOrderFaults()에서 사용).
+        // 대기열 맨 앞 job이 있으면 그 주문과 관련된 레일에만 order_id, 나머지 7개는 null.
+        // 이후 PCA가 다시 응답해도 자동으로 풀지 않음 - 사람이 fault를 내릴 때까지
+        // 배출 금지 유지 (큐의 job은 꺼내지 않고 그대로 둠).
         pcaHasRelatedOrder = (jobHead != jobTail);
         if (pcaHasRelatedOrder) pcaRelatedJob = jobQueue[jobHead];
 
@@ -1346,28 +1536,11 @@ void runDispenseStateMachine() {
                               isRelated ? pcaRelatedJob.orderId : "", REASON_DRIVER_FAILED);
           }
         }
-        Serial.println("[PCA] 드라이버 응답 없음 - 8개 레일 전부 disable 보고");
-      } else if (pcaOk && pcaDriverFailed) {
-        pcaDriverFailed = false;
-        // fault도 다른 종류(카트리지 고장, stage_timeout)와 똑같이 "fault 필드가
-        // 실제로 풀릴 때만 재배출"해야 하므로, 관련 주문이 있던 레일 1개는
-        // 여기서 즉시 원복하지 않고 disable을 그대로 유지함 - 이 레일은
-        // handleOrderFaults()가 그 주문의 fault 해제를 감지했을 때만 원복+재배출됨.
-        // 나머지 7개 레일은 특정 주문에 안 걸려있어서(order_id null) 기다릴
-        // fault 자체가 없으므로 지금 바로 원복함.
-        for (int l = 0; l < 2; l++) {
-          for (int c = 0; c < 4; c++) {
-            bool isRelated = pcaHasRelatedOrder && letterSlot(pcaRelatedJob.letter) == l && colorSlot(pcaRelatedJob.color) == c;
-            if (isRelated) continue; // disable 유지, fault 해제 대기
-            rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
-            reportRailStatus(letterOf(l), colorOf(c), rail[l][c].status, "");
-          }
-        }
-        pcaHasRelatedOrder = false;
-        Serial.println("[PCA] 드라이버 복구됨 - 무관한 레일만 원복 보고, 관련 레일은 fault 해제될 때까지 disable 유지");
+        Serial.println("[PCA] 드라이버 응답 없음 - 8개 레일 전부 disable 보고 (fault 해제 전까지 배출 금지)");
       }
+      // [11/01] PCA가 다시 응답해도 여기서는 아무것도 풀지 않음 (사람이 fault를 내릴 때만 복구)
     }
-    if (pcaDriverFailed) return; // 드라이버 고장 중엔 새 배출 시작 안 함
+    if (pcaDriverFailed) return; // 드라이버 고장 중엔 새 배출 시작 안 함 (큐의 job은 그대로 대기)
 
     if (!gateOpen) return; // 직전 주문이 pickup_reached(이후) 되기 전까지 다음 배출 금지
 
@@ -1496,6 +1669,7 @@ void runDispenseStateMachine() {
       // [진단] 판정 직후 실측값 출력
       //  - 인터럽트 최대 끊김이 수천 us(=수 ms)인데 폴링 최대 끊김은 0 -> 폴링이 느려서 놓친 것
       //  - 인터럽트 최대 끊김도 0 -> 핀 자체가 안 변함(배선/레벨/핀 번호 재확인)
+      //    (단, 끊김샘플>0인데 인터럽트만 계속 0이면 그 핀은 인터럽트 미지원)
       Serial.print("[IR] "); Serial.print(letterColorKey(l, c));
       Serial.print(" 폴링: 횟수="); Serial.print(irPollCount);
       Serial.print(" 끊김샘플="); Serial.print(irBrokenSamples);
@@ -1577,18 +1751,19 @@ bool checkPcaHealthy() {
   return Wire.endTransmission() == 0;
 }
 
-// ============================== Flask HTTPS 공통 통신 (실패 시 1회 재시도) ==============================
+// ============================== Flask HTTP 공통 통신 (실패 시 1회 재시도) ==============================
+// [11/01] 로컬 평문 HTTP - httpClient(WiFiClient) 사용. 로그 접두어도 [HTTP]로 변경.
 // timeoutMs: 응답 대기 타임아웃. 기본 5000ms, Mobius를 거치는 report 계열
 // 호출(reportRailStatus/reportDispenseResult)에서만 FLASK_MOBIUS_TIMEOUT_MS로
 // 늘려서 호출함 (기본값은 함수 선언부에 지정, 정의부에는 반복 지정하지 않음).
 bool postJsonToFlask(const char* path, const char* payload, String& responseOut, unsigned long timeoutMs) {
   for (uint8_t attempt = 0; attempt < 2; attempt++) {
-    HttpClient http(httpSSLClient, FLASK_HOST, FLASK_PORT);
+    HttpClient http(httpClient, FLASK_HOST, FLASK_PORT);
     http.setTimeout(timeoutMs);
 
     int err = http.post(path, "application/json", payload);
     if (err != 0) {
-      Serial.print("[HTTPS] POST 연결/전송 실패, err=");
+      Serial.print("[HTTP] POST 연결/전송 실패, err=");
       Serial.print(err);
       Serial.println(attempt == 0 ? " (재시도)" : "");
       http.stop();
@@ -1600,7 +1775,7 @@ bool postJsonToFlask(const char* path, const char* payload, String& responseOut,
     responseOut = http.responseBody();
     http.stop();
 
-    Serial.print("[HTTPS] POST ");
+    Serial.print("[HTTP] POST ");
     Serial.print(path);
     Serial.print(" -> ");
     Serial.print(payload);
@@ -1609,7 +1784,7 @@ bool postJsonToFlask(const char* path, const char* payload, String& responseOut,
     Serial.println(")");
 
     if (statusCode < 200 || statusCode >= 300) {
-      Serial.print("[HTTPS] 응답 실패: ");
+      Serial.print("[HTTP] 응답 실패: ");
       Serial.println(responseOut);
       return false;
     }
@@ -1620,12 +1795,12 @@ bool postJsonToFlask(const char* path, const char* payload, String& responseOut,
 
 bool getJsonFromFlask(const char* path, String& responseOut) {
   for (uint8_t attempt = 0; attempt < 2; attempt++) {
-    HttpClient http(httpSSLClient, FLASK_HOST, FLASK_PORT);
+    HttpClient http(httpClient, FLASK_HOST, FLASK_PORT);
     http.setTimeout(5000);
 
     int err = http.get(path);
     if (err != 0) {
-      Serial.print("[HTTPS] GET 연결/전송 실패, err=");
+      Serial.print("[HTTP] GET 연결/전송 실패, err=");
       Serial.print(err);
       Serial.println(attempt == 0 ? " (재시도)" : "");
       http.stop();
@@ -1637,14 +1812,14 @@ bool getJsonFromFlask(const char* path, String& responseOut) {
     responseOut = http.responseBody();
     http.stop();
 
-    Serial.print("[HTTPS] GET ");
+    Serial.print("[HTTP] GET ");
     Serial.print(path);
     Serial.print("  (status=");
     Serial.print(statusCode);
     Serial.println(")");
 
     if (statusCode < 200 || statusCode >= 300) {
-      Serial.print("[HTTPS] 응답 실패: ");
+      Serial.print("[HTTP] 응답 실패: ");
       Serial.println(responseOut);
       return false;
     }
@@ -1706,7 +1881,7 @@ void fetchInitialStock() {
 }
 
 // ---- 부팅 시 미완료 큐 복원 ----
-// 가정하는 응답 형식: [{"order_id":"o1","letter":"E","color":"r"}, ...]
+// 가정하는 응답 형식: [{"order_id":"o1","letter":"P","color":"r"}, ...]
 void restoreQueueFromServer() {
   String path = String("/queue/") + BOARD_NAME + "/next";
   String resp;
@@ -1795,7 +1970,13 @@ void callRestock(int l, int c) {
 
   uint8_t filled = doc["filled"] | 0;
   rail[l][c].count = filled;
-  rail[l][c].status = (filled == 0) ? RAIL_EMPTY : RAIL_IDLE;
+  if (rail[l][c].status == RAIL_DISABLE) {
+    // [11/01] disable 레일은 restock으로 풀지 않음 - count만 갱신하고 disable 유지.
+    // 사람이 fault를 내리거나 REPAIR 해야만 풀림 (그때 이 count 기준으로 idle/empty 결정)
+    Serial.println("[restock] " + letterColorKey(l, c) + " disable 상태라 count만 갱신, disable 유지 (fault 해제/REPAIR 필요)");
+  } else {
+    rail[l][c].status = (filled == 0) ? RAIL_EMPTY : RAIL_IDLE;
+  }
   // Flask의 /restock/<letter>/<color> 엔드포인트가 이 호출 안에서 이미
   // 모비우스에 CIN을 올려줌(order_id: null) - 여기서 reportRailStatus를
   // 또 부르면 같은 restock 이벤트가 모비우스에 두 번 올라가는 중복 버그가
@@ -1904,8 +2085,10 @@ void reportDispenseResult(const String& orderId, char letter, char color) {
 }
 
 // ============================== 시리얼 테스트 명령 ==============================
-// SETEMPTY E_r  : 해당 레일을 강제로 count=0/empty로 만듦 (restock 흐름 테스트용)
-// REPAIR E_r    : disable 상태인 레일을 idle로 복구 (count는 그대로 유지)
+// SETEMPTY P_r  : 해당 레일을 강제로 count=0/empty로 만듦 (restock 흐름 테스트용)
+// REPAIR P_r    : disable 상태인 레일을 idle로 복구 (count는 그대로 유지)
+// REPAIR ALL    : disable 레일 전부 복구 + driver 고장 배출 금지 해제
+//                 (PCA 고장 당시 대기 주문이 없어 플랫폼에 내릴 fault가 없을 때 사용)
 void checkSerialCommand() {
   if (!Serial.available()) return;
   String line = Serial.readStringUntil('\n');
@@ -1917,9 +2100,23 @@ void checkSerialCommand() {
   String arg = (sp < 0) ? "" : line.substring(sp + 1);
   arg.trim();
 
+  if (cmd == "REPAIR" && (arg == "ALL" || arg == "all")) {
+    for (int l = 0; l < 2; l++) {
+      for (int c = 0; c < 4; c++) {
+        if (rail[l][c].status != RAIL_DISABLE) continue;
+        rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
+        reportRailStatus(letterOf(l), colorOf(c), rail[l][c].status, ""); // 시리얼 명령발 - order_id 없음(null)
+      }
+    }
+    pcaDriverFailed = false;
+    pcaHasRelatedOrder = false;
+    Serial.println("[명령] REPAIR ALL -> disable 레일 전부 복구, 배출 금지 해제, 서버에도 보고함");
+    return;
+  }
+
   if (cmd == "SETEMPTY" || cmd == "REPAIR") {
     if (arg.length() < 3 || arg.charAt(1) != '_') {
-      Serial.println("[명령] 형식: " + cmd + " E_r (글자_색상)");
+      Serial.println("[명령] 형식: " + cmd + " P_r (글자_색상)");
       return;
     }
     char letter = arg.charAt(0);
@@ -1940,6 +2137,9 @@ void checkSerialCommand() {
       rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
       reportRailStatus(letter, color, rail[l][c].status, ""); // 시리얼 명령발 - order_id 없음(null)
       Serial.println("[명령] " + arg + " -> " + (rail[l][c].status == RAIL_EMPTY ? "empty" : "idle") + "로 복구, 서버에도 보고함");
+      if (pcaDriverFailed) {
+        Serial.println("[명령] 참고: driver 고장으로 배출 금지 중 - fault를 내리거나 REPAIR ALL 해야 배출이 재개됨");
+      }
     }
     return;
   }
