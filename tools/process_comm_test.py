@@ -211,16 +211,16 @@ def choose(title, items, labels=None):
 # ============================== 메뉴 동작 ==============================
 def new_order(st):
     oid = ask("order_id", f"order_test_{datetime.now(KST).strftime('%m%d%H%M%S')}")
-    board = ask("board (red/yellow/green/blue)", "blue").lower()
+    board = ask("board (red/yellow/green/blue)", "green").lower()
     board = CODE_BOARD.get(board, board)
     if board not in BOARD_CODE:
         print("board 색이 잘못됨")
         return
-    keycap = ask("keycap (MBTI 4글자)", "ESFJ").upper()
+    keycap = ask("keycap (MBTI 4글자)", "ENTP").upper()
     if len(keycap) != 4 or any(keycap[i] not in KEYCAP_AXES[i] for i in range(4)):
         print("keycap은 EI/SN/TF/JP 순서 4글자 (예: ESFJ)")
         return
-    colors = [c.strip() for c in ask("colors (쉼표 4개, r/y/g/b)", "r,y,b,g").split(",")]
+    colors = [c.strip() for c in ask("colors (쉼표 4개, r/y/g/b)", "r,r,r,r").split(",")]
     if len(colors) != 4 or any(c not in CODE_BOARD for c in colors):
         print("colors는 r/y/g/b 4개")
         return
