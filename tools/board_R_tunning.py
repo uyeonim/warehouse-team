@@ -114,9 +114,15 @@ def move_to(x, y, z, r, label="", settle_sec=0.0):
 
 
 def suck(on):
+    # OFF = 배기 -> RELEASE_SETTLE_DELAY -> 펌프 정지(enable=False) - 메인 suck()과 동일 (배기만 두면 작동음 남음)
     res = loop.run_until_complete(safe_call(
         arm_api.SetEndEffectorSuctionCup(portName=DOBOT_PORT, enable=True, on=on, isQueued=False)
     ))
+    if not on:
+        time.sleep(RELEASE_SETTLE_DELAY)
+        stop = loop.run_until_complete(safe_call(
+            arm_api.SetEndEffectorSuctionCup(portName=DOBOT_PORT, enable=False, on=False, isQueued=False)))
+        res = f"배기={res}, 펌프 정지={stop}"
     print(f"흡착 {'ON' if on else 'OFF'} 결과:", res)
 
 
@@ -237,7 +243,6 @@ def main():
         current_r = new_r
 
     suck(False)
-    time.sleep(RELEASE_SETTLE_DELAY)
 
     new_offset = current_r - base_r
     print(f"\n최종 R={current_r:.4f} (기준 R {base_r:.4f}에서 {new_offset:+.2f}도)")

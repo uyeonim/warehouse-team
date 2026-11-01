@@ -124,8 +124,14 @@ def travel(from_xyz, to_xyz, wrist, label):
 
 
 def suck(on):
+    # OFF = 배기 -> RELEASE_SETTLE_DELAY -> 펌프 정지(enable=False) - 메인 suck()과 동일 (배기만 두면 작동음 남음)
     res = loop.run_until_complete(safe_call(
         arm_api.SetEndEffectorSuctionCup(portName=DOBOT_PORT, enable=True, on=on, isQueued=False)))
+    if not on:
+        time.sleep(RELEASE_SETTLE_DELAY)
+        stop = loop.run_until_complete(safe_call(
+            arm_api.SetEndEffectorSuctionCup(portName=DOBOT_PORT, enable=False, on=False, isQueued=False)))
+        res = f"배기={res}, 펌프 정지={stop}"
     print(f"  흡착 {'ON' if on else 'OFF'}: {res}", flush=True)
 
 
@@ -169,7 +175,6 @@ def pick_and_place_one(color, count, cur_xyz, cur_wrist):
         return {"r": "retry", "s": "skip", "q": "quit"}[a], (place_x, place_y, travel_z), HOME_WRIST_DEG
 
     suck(False)
-    time.sleep(RELEASE_SETTLE_DELAY)
     move_to(place_x, place_y, travel_z, place_r, label="상승")
     move_to(place_x, place_y, travel_z, r_for(place_x, place_y, HOME_WRIST_DEG), label="손목 0도")
     return "ok", (place_x, place_y, travel_z), HOME_WRIST_DEG

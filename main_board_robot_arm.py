@@ -128,6 +128,7 @@ import queue
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cv2
@@ -151,6 +152,7 @@ if not FLASK_BASE_URL:
     raise RuntimeError(".env에 FLASK_BASE_URL이 비어있음")
 FLASK_BASE_URL = FLASK_BASE_URL.rstrip("/")
 REPORT_TIMEOUT = 5
+CONVEYOR_REPORT_LOOKBACK_HOURS = 3   # 재시작 복구 때 컨베이어 보고 기록을 이 시간만큼 거슬러 확인
 
 # Mobius 직접 조회용 (시작 시 cnt_process 최신 스냅샷 + 재부팅 복구 때 cnt_board_robot_arm 최신 보고)
 # - COSS_BASE_URL/AE_NAME/ORIGIN이 없으면 조회만 건너뜀. API_KEY/LECTURE/CREATOR는 비어있으면 헤더에서 빠짐
@@ -516,15 +518,8 @@ def clear_gate_on_server():
 
 
 # ---- Mobius 직접 조회 ----
-def fetch_latest_cin(cnt_path, quiet=False):
-    """{AE}/{cnt_path} 최신 CIN의 con(dict). .env에 COSS 값이 없거나 조회 실패면 None.
-    quiet: 실패 로그 생략 (주기 조회용 - 실패 로그는 호출 쪽에서 상태가 바뀔 때만 남김)"""
-    if not all([COSS_BASE_URL, AE_NAME, COSS_ORIGIN]):
-        if not quiet:
-            log("MOBIUS", f".env에 COSS_BASE_URL/AE_NAME/ORIGIN이 없어 {cnt_path} 조회 생략")
-        return None
-    url = f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/{cnt_path}/la"
-    headers = {
+def _mobius_headers():
+    return {
         "X-API-KEY": COSS_API_KEY,
         "X-AUTH-CUSTOM-LECTURE": COSS_LECTURE,
         "X-AUTH-CUSTOM-CREATOR": COSS_CREATOR,
@@ -533,8 +528,43 @@ def fetch_latest_cin(cnt_path, quiet=False):
         "X-M2M-RVI": "3",
         "X-M2M-Origin": COSS_ORIGIN,
     }
+
+
+def fetch_conveyor_section_result(order_id, section):
+    """우리가 cnt_tray_conveyor에 보고한 최근 기록 중 이 주문·section의 마지막 결과("done"/"failed"),
+    기록이 없거나 조회 실패면 None.
+    la(최신 1건)만 보면 벨트 위에 주문이 여러 건일 때 다른 주문 보고에 가려져서 최근
+    CONVEYOR_REPORT_LOOKBACK_HOURS 시간 목록을 봄 (Mobius가 오래된 순으로 줌 -> 마지막 값이 최신)."""
+    if not all([COSS_BASE_URL, AE_NAME, COSS_ORIGIN]):
+        return None
+    cra = (datetime.now(timezone.utc) - timedelta(hours=CONVEYOR_REPORT_LOOKBACK_HOURS)).strftime("%Y%m%dT%H%M%S")
+    url = f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/cnt_conveyor/cnt_tray_conveyor?rcn=4&ty=4&cra={cra}&lim=500"
     try:
-        resp = requests.get(url, headers=headers, timeout=REPORT_TIMEOUT)
+        resp = requests.get(url, headers=_mobius_headers(), timeout=REPORT_TIMEOUT)
+        if resp.status_code != 200:
+            log("MOBIUS", f"cnt_tray_conveyor 보고 목록 조회 실패 ({resp.status_code})")
+            return None
+        result = None
+        for cin in resp.json().get("m2m:rsp", {}).get("m2m:cin", []):
+            con = parse_con(cin.get("con"))
+            if con and con.get("order_id") == order_id and f"section{section}" in con:
+                result = con[f"section{section}"]
+        return result
+    except Exception as e:
+        log("MOBIUS", f"cnt_tray_conveyor 보고 목록 조회 에러: {e}")
+        return None
+
+
+def fetch_latest_cin(cnt_path, quiet=False):
+    """{AE}/{cnt_path} 최신 CIN의 con(dict). .env에 COSS 값이 없거나 조회 실패면 None.
+    quiet: 실패 로그 생략 (주기 조회용 - 실패 로그는 호출 쪽에서 상태가 바뀔 때만 남김)"""
+    if not all([COSS_BASE_URL, AE_NAME, COSS_ORIGIN]):
+        if not quiet:
+            log("MOBIUS", f".env에 COSS_BASE_URL/AE_NAME/ORIGIN이 없어 {cnt_path} 조회 생략")
+        return None
+    url = f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/{cnt_path}/la"
+    try:
+        resp = requests.get(url, headers=_mobius_headers(), timeout=REPORT_TIMEOUT)
         if resp.status_code != 200:
             if not quiet:
                 log("MOBIUS", f"{cnt_path} 최신 CIN 조회 실패 ({resp.status_code})")
@@ -645,10 +675,21 @@ def _is_still(prev, cur):
 
 
 async def suck(arm_api, on):
+    """흡착 ON / OFF.
+    OFF는 2단계: enable=True,on=False(배기 - 밸브 열어 공기 빼서 보드가 확실히 떨어지게)
+    -> RELEASE_SETTLE_DELAY 대기 -> enable=False(펌프 완전 정지, DobotStudio "끄기"와 같음).
+    배기 상태로만 두면 펌프/밸브가 계속 일해서 대기 중에도 작동음이 남음(2026-11-01 확인)."""
     res = await safe_call(arm_api.SetEndEffectorSuctionCup(
         portName=DOBOT_PORT, enable=True, on=on, isQueued=False
     ))
-    log("ARM", f"흡착 {'ON' if on else 'OFF'} 결과: {res}")
+    if on:
+        log("ARM", f"흡착 ON 결과: {res}")
+        return res
+    await asyncio.sleep(RELEASE_SETTLE_DELAY)
+    stop = await safe_call(arm_api.SetEndEffectorSuctionCup(
+        portName=DOBOT_PORT, enable=False, on=False, isQueued=False
+    ))
+    log("ARM", f"흡착 OFF 결과: 배기={res}, 펌프 정지={stop}")
     return res
 
 
@@ -864,8 +905,7 @@ async def pick_and_place_board_async(arm_api, order_id, color, count):
             await travel(arm_api, (place_x, place_y, travel_z), HOME_XYZ, wrist, "초기위치로 복귀")
             return False, consumed
 
-        await suck(arm_api, False)
-        await asyncio.sleep(RELEASE_SETTLE_DELAY)
+        await suck(arm_api, False)   # 배기 + RELEASE_SETTLE_DELAY 대기 + 펌프 정지까지 포함
 
         await move_and_wait(arm_api, (place_x, place_y, travel_z, place_r),
                             label="다시 안전 높이로 들어올리기")
@@ -1005,9 +1045,16 @@ def process_board_job(loop, arm_api, box_api, order_id, color):
     complete_job(order_id, color)
 
 
-def handle_tray_conveyor(loop, box_api, order_id, section):
+def handle_tray_conveyor(loop, box_api, order_id, section, skip_if_done=False):
     """section: "0" (keycap_dispensed -> 키캡 로봇암 앞) / "1" (keycap_packed -> 보드 로봇암 앞)
-    / "2" (board_packed -> 픽업대)."""
+    / "2" (board_packed -> 픽업대).
+    skip_if_done: status 트리거용 - 이미 done 보고한 section이면 다시 안 돌림. 처리 기록(handled_status)이
+    메모리에만 있어서 재시작하면 같은 status를 처음 본 걸로 판단하는데, 이미 다음 위치에 간 트레이를
+    벨트가 또 밀면 끝을 넘어가거나 엉뚱한 곳에 멈춤. failed/기록 없음이면 그대로 돌림(꺼지기 전에 못 돌린 경우).
+    fault 해제 재시도는 skip_if_done=False - 실패 후 사람이 해결한 거라 무조건 다시 돌림."""
+    if skip_if_done and fetch_conveyor_section_result(order_id, section) == "done":
+        log("CONV", f"{order_id}: section{section} 이미 done 보고됨 (재시작 복구) - 구동 생략")
+        return
     run_time = {"0": TRAY_CONVEYOR_RUN_TIME_SECTION0, "1": TRAY_CONVEYOR_RUN_TIME_SECTION1,
                 "2": TRAY_CONVEYOR_RUN_TIME_SECTION2}[section]
     log("CONV", f"{order_id}: 컨베이어 section{section} 구동 시작")
@@ -1211,17 +1258,17 @@ def handle_snapshot(loop, arm_api, box_api, data):
 
         elif status == STATUS_CONVEYOR_0:
             if handled_status.get(order_id) != status:
-                handle_tray_conveyor(loop, box_api, order_id, "0")
+                handle_tray_conveyor(loop, box_api, order_id, "0", skip_if_done=True)
                 handled_status[order_id] = status
 
         elif status == STATUS_CONVEYOR_1:
             if handled_status.get(order_id) != status:
-                handle_tray_conveyor(loop, box_api, order_id, "1")
+                handle_tray_conveyor(loop, box_api, order_id, "1", skip_if_done=True)
                 handled_status[order_id] = status
 
         elif status == STATUS_CONVEYOR_2:
             if handled_status.get(order_id) != status:
-                handle_tray_conveyor(loop, box_api, order_id, "2")
+                handle_tray_conveyor(loop, box_api, order_id, "2", skip_if_done=True)
                 handled_status[order_id] = status
 
     for order_id in list(handled_status):
