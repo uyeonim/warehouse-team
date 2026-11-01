@@ -1,14 +1,17 @@
-﻿# 창고 PC 실행 스크립트 - Redis -> Flask -> DobotLink -> main 순서로 띄움 (start_all.bat 더블클릭)
+﻿# 창고 PC 실행 스크립트 - Redis -> 보드 Flask -> 키캡 Flask -> DobotLink -> main 순서로 띄움 (start_all.bat 더블클릭)
 # - 이미 켜진 건 건너뜀 (포트/프로세스로 판단)
+#   키캡 Flask(waitress)는 Windows에서 같은 포트에 두 개가 떠도 에러가 안 나서 특히 중복 확인 필요
 # - 앞 단계가 안 뜨면 거기서 멈춤 (Redis 없이 Flask를 띄우면 재고가 0으로 보임)
 # - main이 이미 떠 있으면(5001 사용 중) 또 띄우지 않음 - 두 개 뜨면 COM3 충돌
-# 끌 때는 각 창에서 Ctrl+C (main -> Flask -> Redis 순서)
+# 끌 때는 각 창에서 Ctrl+C (main -> 키캡 Flask -> 보드 Flask -> Redis 순서)
 $ErrorActionPreference = 'Stop'
 $Root      = $PSScriptRoot
 $Python    = Join-Path $Root 'venv-dobot\Scripts\python.exe'
 $RedisDir  = 'C:\Users\dusdn\redis'
 $RedisConf = Join-Path $RedisDir 'redis.warehouse.conf'
 $DobotLink = Join-Path $env:LOCALAPPDATA 'Programs\DobotLink\DobotLink.exe'
+$KeycapDir = 'C:\Users\dusdn\keycap-flask\backend\flask'   # 키캡 브랜치(leehyunjung)를 꺼내 둔 폴더
+$Waitress  = Join-Path $KeycapDir 'venv\Scripts\waitress-serve.exe'
 
 function Step($msg) { Write-Host "[start_all] $msg" }
 function Fail($msg) {
@@ -38,13 +41,24 @@ if (Test-Port 6379) {
     Step 'Redis 실행됨 (최소화 창)'
 }
 
-# 2) Flask
+# 2) 보드 Flask
 if (Test-Port 5000) {
-    Step 'Flask 이미 실행 중 - 건너뜀'
+    Step '보드 Flask 이미 실행 중 - 건너뜀'
 } else {
     Start-Window 'Flask' 'app.py'
-    if (-not (Wait-Port 5000 15)) { Fail 'Flask가 안 뜸 - Flask 창의 에러 확인' }
-    Step 'Flask 실행됨'
+    if (-not (Wait-Port 5000 15)) { Fail '보드 Flask가 안 뜸 - Flask 창의 에러 확인' }
+    Step '보드 Flask 실행됨'
+}
+
+# 2-1) 키캡 Flask (Mobius 알림 -> MQTT로 키캡 아두이노에 전달, 아두이노 보고 수신)
+if (Test-Port 5002) {
+    Step '키캡 Flask 이미 실행 중 - 건너뜀'
+} else {
+    if (-not (Test-Path $Waitress)) { Fail "키캡 Flask 실행 파일 없음: $Waitress" }
+    Start-Process powershell -WorkingDirectory $KeycapDir -ArgumentList '-NoExit', '-Command',
+        "`$host.UI.RawUI.WindowTitle = '키캡 Flask'; & '$Waitress' --listen=0.0.0.0:5002 app:app"
+    if (-not (Wait-Port 5002 15)) { Fail '키캡 Flask가 안 뜸 - 키캡 Flask 창의 에러 확인' }
+    Step '키캡 Flask 실행됨'
 }
 
 # 3) DobotLink
