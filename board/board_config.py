@@ -113,6 +113,10 @@ RELEASE_SETTLE_DELAY = 0.5      # 흡착 OFF 후 대기
 # Mobius cnt_process 주기 조회 - 알림(1회 전송, 재전송 없음)을 놓쳤을 때 이 간격 안에 따라잡음
 MOBIUS_POLL_INTERVAL_SEC = 5.0
 
+# 로봇 연결 감시 (USB 빠짐/전원 껐다 켜짐 -> main 재시작 없이 자동 재연결). 주문 처리 사이에만 동작
+LINK_CHECK_INTERVAL_SEC = 10.0   # 대기 중 연결 확인(GetPose) 간격
+LINK_RETRY_INTERVAL_SEC = 5.0    # 끊겼을 때 재연결 시도 간격
+
 # 도착 판정 허용오차 (모든 이동에 사용. 픽업 위치 / 트레이 하강은 도착 실패 시 failed 처리)
 POSITION_TOLERANCE_MM = 2.0
 POSITION_TOLERANCE_DEG = 2.0

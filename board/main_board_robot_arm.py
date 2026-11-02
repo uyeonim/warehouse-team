@@ -192,6 +192,7 @@ from board_config import (
     DOBOT_PORT,
     PICK_POSE_ROWS, PLACE_XYZ, PLACE_R_OFFSET_DEG_BY_COLOR, HOME_XYZ, HOME_WRIST_DEG, SAFE_LIFT_MM,
     MOVE_TIMEOUT_SEC, MOVE_POLL_INTERVAL_SEC, PRECISION_SETTLE_SEC, MOBIUS_POLL_INTERVAL_SEC,
+    LINK_CHECK_INTERVAL_SEC, LINK_RETRY_INTERVAL_SEC,
     MOVE_STABLE_MM, MOVE_STABLE_DEG, MOVE_RESEND_AFTER_SEC, MOVE_MAX_RESEND,
     SUCTION_SETTLE_DELAY, RELEASE_SETTLE_DELAY,
     POSITION_TOLERANCE_MM, POSITION_TOLERANCE_DEG,
@@ -215,6 +216,11 @@ last_seq = -1
 _seq_lock = threading.Lock()   # 수신 스레드와 시작 시 la 조회가 last_seq를 같이 건드림
 local_stock = {}
 handled_status = {}   # (order_id -> status) - 컨베이어(keycap_packed/board_packed) 트리거 전용 dedup
+
+# ---- 로봇 연결 감시 (link_watchdog / reconnect_robot) ----
+link_lost = False        # 명령 결과에 "not connected"가 나오면 True -> 주문 처리 사이에 재연결
+_last_link_check = 0.0   # 마지막 연결 확인 또는 재연결 시도 시각
+_arm_api = None          # main()에서 만든 팔 API - 컨베이어만 쓰는 함수에서도 재연결하려고 보관
 
 # ---- 픽업 job 중복방지 (키캡 alreadyProcessed 패턴) ----
 JOB_HISTORY_SIZE = 8
@@ -588,11 +594,81 @@ async def safe_call(coro, timeout_sec=CALL_TIMEOUT):
     except asyncio.TimeoutError:
         return "TIMEOUT"
     except Exception as e:
-        return f"ERROR: {e}"
+        res = f"ERROR: {e}"
+        if _is_disconnected(res):
+            _mark_link_lost(res)
+        return res
 
 
 def is_ok(res):
     return not (isinstance(res, str) and (res.startswith("TIMEOUT") or res.startswith("ERROR")))
+
+
+# ============================== 로봇 연결 감시 / 자동 재연결 ==============================
+# USB가 빠졌다 다시 꽂히거나 로봇 전원이 껐다 켜지면 DobotLink 연결이 끊겨서, 그 뒤 모든 명령이
+# ERROR: {'code': 141, 'message': 'device is not connected.'} 로 실패함(2026-11-02 section0 실측).
+# 예전엔 main을 재시작해야 했음 -> 노트북을 테이블 밑에 두면 원격으로 들어가야 해서, 주문 처리
+# 사이에 자동으로 다시 연결함. 작업 도중 끊긴 건 지금처럼 failed 보고(사람 확인 후 fault 해제 재시도)
+# - 보드를 흡착한 채 끊겼을 수도 있어서 작업 중간에 재연결해서 이어 하지 않음.
+# TIMEOUT 만으로는 끊김으로 안 봄 (바쁠 때도 남).
+def _is_disconnected(res):
+    return isinstance(res, str) and res.startswith("ERROR") and (
+        "not connected" in res or "'code': 141" in res)
+
+
+def _mark_link_lost(res):
+    global link_lost
+    if not link_lost:
+        link_lost = True
+        log("LINK", f"로봇 연결 끊김 감지 ({res}) - {LINK_RETRY_INTERVAL_SEC:g}초마다 재연결 시도")
+
+
+async def reconnect_robot(arm_api):
+    """연결 해제 -> 다시 연결 -> 알람 해제 -> HOME. 성공하면 True.
+    해제를 먼저 하는 이유: DobotLink가 끊긴 포트를 아직 열린 걸로 보고 연결을 거부할 수 있음."""
+    global link_lost
+    await safe_call(arm_api.DisconnectDobot(portName=DOBOT_PORT))
+    res = await safe_call(arm_api.ConnectDobot(portName=DOBOT_PORT))
+    if not is_ok(res):
+        return False
+    await safe_call(arm_api.ClearAllAlarmsState(portName=DOBOT_PORT))
+    link_lost = False   # 아래 이동에서 또 끊기면 safe_call이 다시 True로 만듦
+    hx, hy, hz = HOME_XYZ
+    ok, _ = await move_and_wait(arm_api, (hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG)),
+                                label="재연결 - 초기위치로 이동")
+    if link_lost or not ok:
+        return False
+    log("LINK", "재연결 성공 -> HOME 이동 완료, 주문 처리 재개")
+    return True
+
+
+def link_watchdog(loop):
+    """메인 루프에서 주문 처리 사이에만 호출. 끊겼으면 LINK_RETRY_INTERVAL_SEC마다 재연결,
+    정상이면 LINK_CHECK_INTERVAL_SEC마다 GetPose로 확인 (주문이 오기 전에 미리 알아채려고).
+    GetPose는 정상이면 에러가 날 일이 없어서, TIMEOUT 이 아닌 ERROR 면 끊김으로 봄
+    (DobotLink 자체가 꺼진 경우처럼 141 이 아닌 에러도 잡으려고)."""
+    global _last_link_check
+    now = time.time()
+    interval = LINK_RETRY_INTERVAL_SEC if link_lost else LINK_CHECK_INTERVAL_SEC
+    if now - _last_link_check < interval:
+        return
+    _last_link_check = now
+    if link_lost:
+        loop.run_until_complete(reconnect_robot(_arm_api))
+        return
+    res = loop.run_until_complete(safe_call(_arm_api.GetPose(portName=DOBOT_PORT, isQueued=False)))
+    if isinstance(res, str) and res.startswith("ERROR"):
+        _mark_link_lost(res)
+
+
+def ensure_link(loop):
+    """작업(픽업/컨베이어) 시작 직전: 끊김 표시가 있으면 재연결을 한 번 시도.
+    그래도 안 되면 그대로 진행 -> 명령이 실패해서 지금처럼 failed 보고."""
+    global _last_link_check
+    if link_lost:
+        log("LINK", "작업 시작 전 재연결 시도")
+        _last_link_check = time.time()
+        loop.run_until_complete(reconnect_robot(_arm_api))
 
 
 # ============================== 이동 - 도착 대기 방식 ==============================
@@ -1018,6 +1094,7 @@ def process_board_job(loop, arm_api, box_api, order_id, color):
         report_board_status(order_id, color, "empty", count=0)
         report_board_robot_arm(order_id, "failed")
     else:
+        ensure_link(loop)
         report_board_status(order_id, color, "busy", count=count_before)
         # board 필드 보고는 pick_and_place_board_async 내부에서 정확한 시점에
         # 이뤄짐 (위치검증 실패 시 즉시, 성공 시 카메라 확인 후)
@@ -1057,6 +1134,7 @@ def handle_tray_conveyor(loop, box_api, order_id, section, skip_if_done=False):
         return
     run_time = {"0": TRAY_CONVEYOR_RUN_TIME_SECTION0, "1": TRAY_CONVEYOR_RUN_TIME_SECTION1,
                 "2": TRAY_CONVEYOR_RUN_TIME_SECTION2}[section]
+    ensure_link(loop)
     log("CONV", f"{order_id}: 컨베이어 section{section} 구동 시작")
     success = loop.run_until_complete(run_tray_conveyor_async(box_api, run_time, f" (section{section})"))
     report_conveyor_tray(order_id, section, "done" if success else "failed")
@@ -1278,7 +1356,7 @@ def handle_snapshot(loop, arm_api, box_api, data):
 
 # ============================== 메인 ==============================
 def main():
-    global local_stock, job_queue, gate_open, gate_order_id
+    global local_stock, job_queue, gate_open, gate_order_id, _arm_api, link_lost
 
     log("INIT", f"로그 파일: {start_file_log('main')}")
     local_stock = fetch_initial_stock()
@@ -1302,17 +1380,21 @@ def main():
     dobotlink = DobotlinkAdapter(RPCClient(), is_sync=False)
     arm_api = getattr(dobotlink, NAMESPACE_ARM)
     box_api = getattr(dobotlink, NAMESPACE_BOX)
+    _arm_api = arm_api
 
     log("INIT", f"연결 시도: {DOBOT_PORT}")
     connect_res = loop.run_until_complete(safe_call(arm_api.ConnectDobot(portName=DOBOT_PORT)))
     log("INIT", f"연결 결과: {connect_res}")
     if not is_ok(connect_res):
-        log("INIT", "연결 실패 - DobotLab 연결 끊겨있는지, DobotLink.exe 켜져있는지 확인")
-
-    # 시작 시 HOME으로 이동 (픽업 전이라 손목 각도는 HOME_WRIST_DEG)
-    hx, hy, hz = HOME_XYZ
-    loop.run_until_complete(move_and_wait(arm_api, (hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG)),
-                                          label="시작 - 초기위치로 이동"))
+        # 끝내지 않고 대기 - 로봇 USB/전원/DobotLink가 나중에 준비되면 link_watchdog가 연결 + HOME
+        link_lost = True
+        log("INIT", f"연결 실패 - DobotLab 연결 끊겨있는지, DobotLink.exe 켜져있는지 확인 "
+                    f"({LINK_RETRY_INTERVAL_SEC:g}초마다 재연결 시도)")
+    else:
+        # 시작 시 HOME으로 이동 (픽업 전이라 손목 각도는 HOME_WRIST_DEG)
+        hx, hy, hz = HOME_XYZ
+        loop.run_until_complete(move_and_wait(arm_api, (hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG)),
+                                              label="시작 - 초기위치로 이동"))
 
     log("INIT", f"준비 완료 (픽업:{STATUS_PICK}/{STATUS_MISMATCH}, 컨베이어0:{STATUS_CONVEYOR_0}, 컨베이어1:{STATUS_CONVEYOR_1}, "
                 f"컨베이어2:{STATUS_CONVEYOR_2}, 큐 {len(job_queue)}건, "
@@ -1321,6 +1403,7 @@ def main():
     first_snapshot_handled = False
     try:
         while True:
+            link_watchdog(loop)   # 주문 처리 사이: 연결 확인 / 끊겼으면 재연결
             try:
                 data = snapshot_queue.get(timeout=1)
                 handle_snapshot(loop, arm_api, box_api, data)
