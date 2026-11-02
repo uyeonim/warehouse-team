@@ -26,16 +26,25 @@ ENV_FILES = {
                     ["WAREHOUSE_PROFILE", "MOBIUS_URL", "MOBIUS_CB", "MOBIUS_AE_RN", "MOBIUS_AEI", "BOARD_API_URL",
                      "NOTIFY_PORT", "NOTIFY_BASE_URL", "SET1_PORT", "SET2_PORT", "TRAY_PORT", "LAYOUT"]),
 }
+# 한 번 점검한 결과 - run_checks()가 매번 비우고 채움. 명령창(check_all.bat)과 상태판(status_page.py)이 같이 씀
 counts = {"OK": 0, "!!": 0, "XX": 0}
+sections = []     # [{"title": ..., "items": [{"level": "OK"|"!!"|"XX", "msg": ...}]}]
+workers = []      # heartbeat 요약 - 상태판 맨 위에 크게 표시
+_print = True
 
 
 def report(level, msg):
     counts[level] += 1
-    print(f"  [{level}] {msg}")
+    if sections:
+        sections[-1]["items"].append({"level": level, "msg": msg})
+    if _print:
+        print(f"  [{level}] {msg}")
 
 
 def section(title):
-    print(f"\n== {title}")
+    sections.append({"title": title, "items": []})
+    if _print:
+        print(f"\n== {title}")
 
 
 def ps(command):
@@ -106,7 +115,7 @@ def check_platform(envs):
         headers = {"Accept": "application/json", "X-M2M-RI": str(uuid.uuid4()), "X-M2M-RVI": "3",
                    "X-M2M-Origin": b.get("ORIGIN") or ""}
         try:
-            r = requests.get(url, headers=headers, timeout=5)
+            r = requests.get(url, headers=headers, timeout=3)
             con = r.json()["m2m:cin"]["con"] if r.status_code == 200 else None
             con = json.loads(con) if isinstance(con, str) else con
             mobius_ok = isinstance(con, dict)
@@ -123,7 +132,7 @@ def check_platform(envs):
         try:
             cid = b"check_all"
             body = b"\x00\x04MQTT\x04\x02\x00\x0a" + len(cid).to_bytes(2, "big") + cid
-            with socket.create_connection((host, port), timeout=5) as s:
+            with socket.create_connection((host, port), timeout=3) as s:
                 s.sendall(b"\x10" + bytes([len(body)]) + body)
                 ack = s.recv(4)
                 s.sendall(b"\xe0\x00")
@@ -149,7 +158,7 @@ def check_subscriptions(envs, mobius_ok):
     }
     for rn, want in expected.items():
         try:
-            r = requests.get(f"{base}/{rn}", headers={**headers, "X-M2M-RI": str(uuid.uuid4())}, timeout=5)
+            r = requests.get(f"{base}/{rn}", headers={**headers, "X-M2M-RI": str(uuid.uuid4())}, timeout=3)
         except Exception as e:
             report("XX", f"{rn} 조회 실패: {short_err(e)}")
             continue
@@ -164,14 +173,15 @@ def check_subscriptions(envs, mobius_ok):
 
 def check_local_services():
     section("창고 노트북 프로그램")
-    raw = ps("Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 6379,5000,5001,5002,5003 } | "
+    raw = ps("Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 6379,5000,5001,5002,5003,5080 } | "
              "Select-Object LocalPort, OwningProcess | ConvertTo-Json -Compress")
     rows = json.loads(raw) if raw else []
     rows = rows if isinstance(rows, list) else [rows]
     listeners = {}
     for row in rows:
         listeners.setdefault(row["LocalPort"], set()).add(row["OwningProcess"])
-    names = {6379: "Redis", 5000: "보드 Flask", 5002: "키캡 Flask", 5001: "보드 main", 5003: "키캡·트레이 게이트웨이"}
+    names = {6379: "Redis", 5000: "보드 Flask", 5002: "키캡 Flask", 5001: "보드 main", 5003: "키캡·트레이 게이트웨이",
+             5080: "상태판"}
     for port, name in names.items():
         n = len(listeners.get(port, ()))
         if n > 1:
@@ -206,6 +216,8 @@ def check_heartbeats(envs):
         raw = {name: r.get(f"hb:{name}") for name in ("board_main", "keycap_tray")}
     except Exception as e:
         report("XX", f"Redis 접속 실패 - 상태 확인 못 함: {short_err(e)}")
+        for label in ("보드 main", "키캡·트레이 게이트웨이"):
+            workers.append({"label": label, "level": "XX", "state": "확인 불가", "detail": "Redis 꺼짐 - 상태 기록을 못 읽음"})
         return
     labels = {"board_main": "보드 main", "keycap_tray": "키캡·트레이 게이트웨이"}
     states = {"starting": "시작 중", "waiting_mobius": "Mobius 대기 중", "idle": "대기 중",
@@ -214,6 +226,7 @@ def check_heartbeats(envs):
         label = labels[name]
         if not value:
             report("XX", f"{label}: 상태 기록 없음 - 꺼져 있거나 30초 넘게 멈춤")
+            workers.append({"label": label, "level": "XX", "state": "꺼짐 / 멈춤", "detail": "30초 넘게 상태 기록 없음"})
             continue
         hb = json.loads(value)
         age = (datetime.now() - datetime.strptime(hb["since"], "%Y-%m-%d %H:%M:%S")).total_seconds()
@@ -225,11 +238,16 @@ def check_heartbeats(envs):
         if state == "busy":
             text += f" - {hb.get('job')} ({age:.0f}초째)"
         if state in ("link_lost", "waiting_mobius"):
-            report("XX", text + f" ({age:.0f}초째)")
+            level, detail = "XX", f"{age:.0f}초째"
+            report(level, text + f" ({detail})")
         elif state == "busy" and age > BUSY_WARN_SEC:
-            report("!!", text + " - 너무 오래 걸림, 멈춘 것 같음 (창/로그 확인)")
+            level, detail = "!!", f"{hb.get('job')} - {age:.0f}초째, 멈춘 것 같음"
+            report(level, text + " - 너무 오래 걸림, 멈춘 것 같음 (창/로그 확인)")
         else:
-            report("OK", text + last)
+            level = "OK"
+            detail = f"{hb.get('job')} ({age:.0f}초째)" if state == "busy" else last.lstrip(" /")
+            report(level, text + last)
+        workers.append({"label": label + mode, "level": level, "state": states.get(state, state), "detail": detail})
         if hb.get("poll_ok") is False:
             report("!!", f"{label}: Mobius 5초 조회 실패 중 (알림만으로 받는 중)")
         if hb.get("pending_reports"):
@@ -256,16 +274,21 @@ def check_robots(envs):
     extra = present - set(used)
     if extra:
         report("!!", f"설정에 없는 COM 포트: {', '.join(sorted(extra))} (USB를 다른 구멍에 꽂아 번호가 바뀌었을 수 있음)")
-    print("     ※ 어느 팔이 어느 번호인지는 확인 못 함 - USB 구멍 라벨대로 꽂혀 있는지 눈으로 확인")
+    if _print:
+        print("     ※ 어느 팔이 어느 번호인지는 확인 못 함 - USB 구멍 라벨대로 꽂혀 있는지 눈으로 확인")
 
 
 def check_windows():
     section("노트북 설정")
-    raw = ps("Get-NetFirewallRule -Direction Inbound -Enabled True -Action Allow | Get-NetFirewallPortFilter | "
-             "Where-Object { $_.LocalPort -in '5001','5002','5003' } | ForEach-Object { $_.LocalPort }")
+    # 우리가 만든 규칙(warehouse-*)만 조회 - 전체 규칙을 훑으면 30초 걸림
+    raw = ps("Get-NetFirewallRule -DisplayName 'warehouse-*' -ErrorAction SilentlyContinue | "
+             "Where-Object { $_.Direction -eq 'Inbound' -and $_.Enabled -eq 'True' -and $_.Action -eq 'Allow' } | "
+             "Get-NetFirewallPortFilter | ForEach-Object { $_.LocalPort }")
     opened = set(raw.split())
     for port in ("5001", "5002", "5003"):
         report("OK" if port in opened else "XX", f"방화벽 인바운드 {port} " + ("허용" if port in opened else "안 열림 (알림이 안 들어옴)"))
+    report("OK" if "5080" in opened else "!!", "방화벽 인바운드 5080 " +
+           ("허용" if "5080" in opened else "안 열림 (상태판을 다른 기기에서 못 봄)"))
 
     def ac_value(sub, setting):
         # "현재 AC 전원 설정 색인: 0x..." 줄. 제조사 전원 구성표가 항목을 숨기면 None
@@ -282,8 +305,13 @@ def check_windows():
         report("!!", "충전기가 연결 안 된 것 같음 (배터리로 동작 중)")
 
 
-def main():
-    print("창고 노트북 시작 전 점검 (읽기 전용)")
+def run_checks(print_output=True):
+    """전체 점검 1회. 결과 dict 반환 (상태판이 그대로 씀). 아무것도 안 바꿈"""
+    global _print
+    _print = print_output
+    counts.update({"OK": 0, "!!": 0, "XX": 0})
+    sections.clear()
+    workers.clear()
     envs = check_env()
     check_network(envs)
     mobius_ok = check_platform(envs)
@@ -292,6 +320,14 @@ def main():
     check_heartbeats(envs)
     check_robots(envs)
     check_windows()
+    import time
+    return {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "counts": dict(counts),
+            "workers": list(workers), "sections": [dict(s, items=list(s["items"])) for s in sections]}
+
+
+def main():
+    print("창고 노트북 시작 전 점검 (읽기 전용)")
+    run_checks(print_output=True)
     print(f"\n결과: OK {counts['OK']} / 주의 {counts['!!']} / 문제 {counts['XX']}")
     if counts["XX"]:
         print("[XX] 항목부터 해결 (README '문제가 생겼을 때', 운영_매뉴얼.md 참고)")

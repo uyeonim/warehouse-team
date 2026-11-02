@@ -54,7 +54,7 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 2. 설정 파일: `board/.env.example` → `board/.env`, `keycap_flask/.env.example` → `keycap_flask/.env`,
    `keycap_tray/.env.local.example` → `keycap_tray/.env.local` 로 복사해 값 채우기 (AE 값은 팀 담당자). **절대 커밋·공유 금지**
 3. Redis: Windows용 Redis 5.0을 `C:\Users\dusdn\redis`에 두고 `redis.warehouse.conf` 사용 (127.0.0.1만, AOF 켬)
-4. 방화벽 인바운드 허용 (관리자): 5001 · 5002 · 5003
+4. 방화벽 인바운드 허용 (관리자): 5001 · 5002 · 5003 · 5080(상태판) — 규칙 이름은 `warehouse-`로 시작 (점검 스크립트가 이 이름으로 확인)
 5. 창고 노트북 IP 고정(공유기 주소 예약) — Mobius 구독과 아두이노 `config.h`가 이 주소를 가리킴
 6. Mobius 구독 등록 (각 프로그램을 켠 상태에서, 한 번만)
    ```powershell
@@ -68,6 +68,8 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 
 > 전시 당일 운영은 **`운영_매뉴얼.md`** (1장). 켜기 전/문제 생겼을 때 **`check_all.bat`**(읽기 전용 점검: 설정·네트워크·Mobius 구독·서버·로봇 USB·전원 설정,
 > 로봇 프로그램 상태 - 보드 main·게이트웨이가 5초마다 Redis `hb:*`에 남기는 heartbeat로 "떠 있는데 멈춤/로봇 끊김/보고 대기"까지 표시)
+> **상태판**: 같은 점검을 웹으로 - iPad·휴대폰에서 `http://192.168.0.12:5080` (읽기 전용, 10초마다 갱신, `start_all`이 같이 띄움).
+> 다른 기기에서 보려면 방화벽 5080 인바운드 허용 (관리자): `netsh advfirewall firewall add rule name="warehouse-status-5080" dir=in action=allow protocol=TCP localport=5080`
 
 - 실행: 충전기 연결(절전 방지) → 로봇·매직박스 전원/USB → DobotLab 연결 끊기 → **`start_all.bat` 더블클릭**
   - 서버 3개 확인(서비스가 없으면 창으로 띄움) → DobotLink → 보드 main → 키캡·트레이 게이트웨이

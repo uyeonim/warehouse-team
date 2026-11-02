@@ -1,7 +1,8 @@
-﻿# 창고 PC 서버 3개를 Windows 서비스로 등록 (관리자 PowerShell에서 실행)
+﻿# 창고 PC 서버 4개를 Windows 서비스로 등록 (관리자 PowerShell에서 실행)
 #   warehouse-redis         Redis (6379)
 #   warehouse-board-flask   보드 Flask (5000)
 #   warehouse-keycap-flask  키캡 Flask (5002, waitress)
+#   warehouse-status-page   상태판 (5080, 읽기 전용)
 # - PC 켜면 자동 시작, 죽으면 3초 뒤 자동 재시작 (로그인 안 해도 뜸)
 # - 로봇 프로그램(보드 main, 키캡·트레이 게이트웨이)은 서비스로 안 만듦 - 사람이 없을 때 팔이 움직이면 안 됨
 # - 이미 등록된 서비스는 건너뜀. 다시 등록하려면 uninstall_services.ps1 먼저
@@ -29,7 +30,10 @@ $services = @(
        Dir = Join-Path $Repo 'board' },
     @{ Name = 'warehouse-keycap-flask'; Display = '창고 키캡 Flask (5002)'; Port = 5002; Depends = 'warehouse-redis'
        App = $Waitress; Args = '--listen=0.0.0.0:5002 app:app'
-       Dir = Join-Path $Repo 'keycap_flask' }
+       Dir = Join-Path $Repo 'keycap_flask' },
+    @{ Name = 'warehouse-status-page'; Display = '창고 상태판 (5080)'; Port = 5080; Depends = $null
+       App = $Python; Args = 'status_page.py'
+       Dir = $Repo }
 )
 
 foreach ($s in $services) {

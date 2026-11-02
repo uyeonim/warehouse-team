@@ -72,6 +72,10 @@ Ensure-Server '키캡 Flask' 5002 'warehouse-keycap-flask' {
     if (-not (Test-Path $Waitress)) { Fail "키캡 Flask 실행 파일 없음: $Waitress" }
     Start-Window '키캡 Flask' $KeycapDir "& '$Waitress' --listen=0.0.0.0:5002 app:app"
 }
+# 상태판 (읽기 전용 웹, http://<노트북 IP>:5080) - 로봇 안 움직임
+Ensure-Server '상태판' 5080 'warehouse-status-page' {
+    Start-Window '상태판' $Root "& '$Python' status_page.py"
+}
 
 # ---------------- 로봇 ----------------
 if ($Rehearsal) {
