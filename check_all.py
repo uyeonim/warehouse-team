@@ -30,6 +30,7 @@ ENV_FILES = {
 counts = {"OK": 0, "!!": 0, "XX": 0}
 sections = []     # [{"title": ..., "items": [{"level": "OK"|"!!"|"XX", "msg": ...}]}]
 workers = []      # heartbeat 요약 - 상태판 맨 위에 크게 표시
+facts = {}        # 상태판이 장비별 램프를 정하는 데 쓰는 원자료 (프로그램 상태 코드, COM 인식, 포트, 접속 여부)
 _print = True
 
 
@@ -119,6 +120,7 @@ def check_platform(envs):
             con = r.json()["m2m:cin"]["con"] if r.status_code == 200 else None
             con = json.loads(con) if isinstance(con, str) else con
             mobius_ok = isinstance(con, dict)
+            facts["mobius"] = mobius_ok
             if mobius_ok:
                 orders = {oid: o.get("status") for oid, o in con.get("orders", {}).items()}
                 report("OK", f"Mobius 응답 - cnt_process seq={con.get('seq')}, 진행 중 주문 {orders or '없음'}")
@@ -136,6 +138,7 @@ def check_platform(envs):
                 s.sendall(b"\x10" + bytes([len(body)]) + body)
                 ack = s.recv(4)
                 s.sendall(b"\xe0\x00")
+            facts["mqtt"] = len(ack) == 4 and ack[3] == 0
             report("OK" if len(ack) == 4 and ack[3] == 0 else "XX",
                    f"Mosquitto {host}:{port} 익명 접속 {'허용' if len(ack) == 4 and ack[3] == 0 else '거부'}")
         except Exception as e:
@@ -180,6 +183,7 @@ def check_local_services():
     listeners = {}
     for row in rows:
         listeners.setdefault(row["LocalPort"], set()).add(row["OwningProcess"])
+    facts["ports"] = {str(p): len(listeners.get(p, ())) for p in (6379, 5000, 5001, 5002, 5003, 5080)}
     names = {6379: "Redis", 5000: "보드 Flask", 5002: "키캡 Flask", 5001: "보드 main", 5003: "키캡·트레이 게이트웨이",
              5080: "상태판"}
     for port, name in names.items():
@@ -218,10 +222,12 @@ def check_heartbeats(envs):
         report("XX", f"Redis 접속 실패 - 상태 확인 못 함: {short_err(e)}")
         for label in ("보드 main", "키캡·트레이 게이트웨이"):
             workers.append({"label": label, "level": "XX", "state": "확인 불가", "detail": "Redis 꺼짐 - 상태 기록을 못 읽음"})
+        facts["hb"] = None
         return
     labels = {"board_main": "보드 main", "keycap_tray": "키캡·트레이 게이트웨이"}
     states = {"starting": "시작 중", "waiting_mobius": "Mobius 대기 중", "idle": "대기 중",
               "busy": "작업 중", "link_lost": "로봇 연결 끊김 (재연결 시도 중)"}
+    facts["hb"] = {}
     for name, value in raw.items():
         label = labels[name]
         if not value:
@@ -234,6 +240,7 @@ def check_heartbeats(envs):
         snap = hb.get("last_snapshot") or {}
         last = f" / 마지막 스냅샷 seq={snap.get('seq')} {snap.get('time', '')[11:]}({snap.get('via')})" if snap else ""
         state = hb.get("state")
+        facts["hb"][name] = {"state": state, "job": hb.get("job"), "age": round(age), "mode": hb.get("mode")}
         text = f"{label}{mode}: {states.get(state, state)}"
         if state == "busy":
             text += f" - {hb.get('job')} ({age:.0f}초째)"
@@ -267,6 +274,8 @@ def check_robots(envs):
               "키캡 팔 세트2 TF·PJ(SET2_PORT)": t.get("SET2_PORT"),
               "트레이 팔(TRAY_PORT)": t.get("TRAY_PORT")}
     used = [p for p in wanted.values() if p]
+    facts["com"] = {"board": board_config.DOBOT_PORT in present, "set1": t.get("SET1_PORT") in present,
+                    "set2": t.get("SET2_PORT") in present, "tray": t.get("TRAY_PORT") in present}
     if len(used) != len(set(used)):
         report("XX", f"같은 COM 포트를 두 곳에서 씀: {used}")
     for name, port in wanted.items():
@@ -312,6 +321,7 @@ def run_checks(print_output=True):
     counts.update({"OK": 0, "!!": 0, "XX": 0})
     sections.clear()
     workers.clear()
+    facts.clear()
     envs = check_env()
     check_network(envs)
     mobius_ok = check_platform(envs)
@@ -322,7 +332,7 @@ def run_checks(print_output=True):
     check_windows()
     import time
     return {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "counts": dict(counts),
-            "workers": list(workers), "sections": [dict(s, items=list(s["items"])) for s in sections]}
+            "workers": list(workers), "facts": dict(facts), "sections": [dict(s, items=list(s["items"])) for s in sections]}
 
 
 def main():
