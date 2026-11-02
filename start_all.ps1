@@ -1,0 +1,101 @@
+﻿# 창고 PC 실행 스크립트 (start_all.bat 더블클릭)
+#   서버:  Redis(6379) -> 보드 Flask(5000) -> 키캡 Flask(5002)
+#   로봇:  DobotLink -> 보드 main -> 키캡·트레이 게이트웨이(고정현, 로봇 3대)
+# - 서버는 Windows 서비스(service\install_services.ps1)로 등록돼 있으면 서비스가 띄움 - 여기선 떠 있는지만 확인
+#   서비스가 없으면 예전처럼 창으로 띄움
+# - 이미 켜진 건 건너뜀 (포트/프로세스로 판단)
+#   키캡 Flask(waitress)는 Windows에서 같은 포트에 두 개가 떠도 에러가 안 나서 특히 중복 확인 필요
+# - 서버가 안 뜨면 거기서 멈춤 (Redis 없이 Flask를 띄우면 재고가 0으로 보임)
+# - 로봇 프로그램은 두 개 뜨면 같은 COM 포트를 두고 충돌 -> 떠 있으면 다시 안 띄움
+# 끌 때는 로봇 창에서 Ctrl+C (게이트웨이 -> main), 창으로 띄운 서버는 키캡 Flask -> 보드 Flask -> Redis 순서
+$ErrorActionPreference = 'Stop'
+$Root       = $PSScriptRoot                                  # 저장소 루트
+$Python     = Join-Path $Root 'venv\Scripts\python.exe'       # 공용 가상환경 (Python 3.9, requirements.txt)
+$Waitress   = Join-Path $Root 'venv\Scripts\waitress-serve.exe'
+$BoardDir   = Join-Path $Root 'board'                         # 보드 main + 보드 Flask
+$KeycapDir  = Join-Path $Root 'keycap_flask'
+$GatewayDir = Join-Path $Root 'keycap_tray'                   # 키캡 팔 2대 + 트레이 팔 + 키캡 벨트
+$GatewayEnv = Join-Path $GatewayDir '.env.local'
+$RedisDir   = 'C:\Users\dusdn\redis'                          # Windows용 Redis (저장소 밖)
+$RedisConf  = Join-Path $RedisDir 'redis.warehouse.conf'
+$DobotLink  = Join-Path $env:LOCALAPPDATA 'Programs\DobotLink\DobotLink.exe'
+
+function Step($msg) { Write-Host "[start_all] $msg" }
+function Fail($msg) {
+    Write-Host "[start_all] 실패: $msg" -ForegroundColor Red
+    Read-Host '엔터를 누르면 닫힘' | Out-Null
+    exit 1
+}
+function Test-Port($port) { [bool](Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) }
+function Wait-Port($port, $sec) {
+    for ($i = 0; $i -lt $sec * 2; $i++) { if (Test-Port $port) { return $true }; Start-Sleep -Milliseconds 500 }
+    return $false
+}
+function Start-Window($title, $dir, $command) {
+    # 새 PowerShell 창에서 실행 - 창 제목으로 구분, 에러가 나도 창이 안 닫혀서 로그를 볼 수 있음
+    Start-Process powershell -WorkingDirectory $dir -ArgumentList '-NoExit', '-Command',
+        "`$host.UI.RawUI.WindowTitle = '$title'; $command"
+}
+function Ensure-Server($label, $port, $service, [scriptblock]$startWindow) {
+    if (Test-Port $port) { Step "$label 실행 중 ($port)"; return }
+    $svc = Get-Service $service -ErrorAction SilentlyContinue
+    if ($svc) {
+        # 서비스는 죽어도 3초 뒤 자동 재시작 - 잠깐 기다려 봄. 서비스 시작/중지는 관리자 권한이라 여기선 안 함
+        Step "$label 서비스($service) 상태 $($svc.Status) - 응답 대기"
+        if (-not (Wait-Port $port 15)) {
+            Fail "$label 서비스가 응답 없음 - 관리자 PowerShell에서 'Start-Service $service' 후 logs\svc_$service.log 확인"
+        }
+        Step "$label 실행 중 ($port, 서비스)"
+        return
+    }
+    & $startWindow
+    if (-not (Wait-Port $port 15)) { Fail "$label 이(가) 안 뜸 - $label 창의 에러 확인" }
+    Step "$label 실행됨 ($port, 창)"
+}
+
+# ---------------- 서버 ----------------
+Ensure-Server 'Redis' 6379 'warehouse-redis' {
+    if (-not (Test-Path $RedisConf)) { Fail "Redis 설정 파일 없음: $RedisConf" }
+    Start-Process (Join-Path $RedisDir 'redis-server.exe') -ArgumentList "`"$RedisConf`"" `
+        -WorkingDirectory $RedisDir -WindowStyle Minimized
+}
+Ensure-Server '보드 Flask' 5000 'warehouse-board-flask' {
+    Start-Window 'Flask' $BoardDir "& '$Python' app.py"
+}
+Ensure-Server '키캡 Flask' 5002 'warehouse-keycap-flask' {
+    if (-not (Test-Path $Waitress)) { Fail "키캡 Flask 실행 파일 없음: $Waitress" }
+    Start-Window '키캡 Flask' $KeycapDir "& '$Waitress' --listen=0.0.0.0:5002 app:app"
+}
+
+# ---------------- 로봇 ----------------
+if (Get-Process DobotLink -ErrorAction SilentlyContinue) {
+    Step 'DobotLink 실행 중'
+} else {
+    if (-not (Test-Path $DobotLink)) { Fail "DobotLink 없음: $DobotLink" }
+    Start-Process $DobotLink
+    Step 'DobotLink 실행 - 8초 대기'
+    Start-Sleep -Seconds 8
+}
+Step '주의: DobotLab 창에서 로봇을 연결하지 말 것 (COM 포트 충돌)'
+
+# 보드 main (보드 팔 + 트레이 벨트)
+if (Test-Port 5001) {
+    Step '보드 main 이미 실행 중 (5001) - 건너뜀'
+} else {
+    Start-Window 'main' $BoardDir "& '$Python' main_board_robot_arm.py"
+    Step '보드 main 실행됨 - 팔이 HOME으로 이동함'
+}
+
+# 키캡·트레이 게이트웨이 (키캡 팔 2대 + 트레이 팔 + 키캡 벨트) - 준비 안 됐으면 건너뜀
+$gatewayRunning = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
+    Where-Object { $_.CommandLine -match 'local_gateway\.py' }
+if ($gatewayRunning) {
+    Step '키캡·트레이 게이트웨이 이미 실행 중 - 건너뜀'
+} elseif (-not (Test-Path $GatewayEnv)) {
+    Step "키캡·트레이 게이트웨이 준비 안 됨(.env.local 없음: $GatewayDir) - 건너뜀"
+} else {
+    Start-Window '키캡·트레이 게이트웨이' $GatewayDir "& '$Python' local_gateway.py --env .env.local"
+    Step '키캡·트레이 게이트웨이 실행됨'
+}
+Step '로그: 각 창 / board\logs 폴더 / logs 폴더(서비스)'
+Start-Sleep -Seconds 5

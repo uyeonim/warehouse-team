@@ -1,6 +1,16 @@
-# 비밀값
+# 비밀값 (예시 파일 *.example 만 올림)
 config.h
 .env
+.env.*
+!.env.example
+!.env.local.example
+
+# 가상환경 · 실행 중 생기는 파일
+venv/
+logs/
+runtime/
+board_camera_capture_log/
+DobotRPC_*.log
 
 # 빌드/캐시
 *.o
