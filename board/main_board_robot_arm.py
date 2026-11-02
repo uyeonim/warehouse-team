@@ -193,6 +193,7 @@ from board_config import (
     PICK_POSE_ROWS, PLACE_XYZ, PLACE_R_OFFSET_DEG_BY_COLOR, HOME_XYZ, HOME_WRIST_DEG, SAFE_LIFT_MM,
     MOVE_TIMEOUT_SEC, MOVE_POLL_INTERVAL_SEC, PRECISION_SETTLE_SEC, MOBIUS_POLL_INTERVAL_SEC,
     LINK_CHECK_INTERVAL_SEC, LINK_RETRY_INTERVAL_SEC,
+    REPORT_IMMEDIATE_TRIES, REPORT_RETRY_INTERVAL_SEC, REPORT_PENDING_MAX_AGE_SEC,
     MOVE_STABLE_MM, MOVE_STABLE_DEG, MOVE_RESEND_AFTER_SEC, MOVE_MAX_RESEND,
     SUCTION_SETTLE_DELAY, RELEASE_SETTLE_DELAY,
     POSITION_TOLERANCE_MM, POSITION_TOLERANCE_DEG,
@@ -365,74 +366,103 @@ def start_cnt_process_poller():
 
 # ============================== Flask 보고 헬퍼 ==============================
 def fetch_initial_stock():
+    """보드 Flask에서 현재 재고를 읽음. 응답할 때까지 기다림 - 예전엔 실패하면 전부 0으로 시작해서
+    Flask가 늦게 뜨면 모든 픽업이 "재고 0"으로 실패했음."""
+    waited = False
+    while True:
+        try:
+            resp = requests.get(f"{FLASK_BASE_URL}/stock/board", timeout=REPORT_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            log("STOCK", f"초기 재고 로드: {data}")
+            return {c: int(data.get(c, 0)) for c in BOARD_COLORS}
+        except Exception as e:
+            if not waited:
+                log("STOCK", f"초기 재고 로드 실패: {e} - 보드 Flask 응답 대기 ({REPORT_RETRY_INTERVAL_SEC:g}초마다)")
+                waited = True
+            time.sleep(REPORT_RETRY_INTERVAL_SEC)
+
+
+# ---- 보고 전송 + 실패 시 재시도 ----
+# 예전엔 보고를 한 번만 보내서, 그 순간 Flask/Mobius가 응답이 없으면 로봇은 일을 다 했는데
+# done이 플랫폼에 안 가서 stage_timeout으로 주문이 폐기됐음. 이제 바로 REPORT_IMMEDIATE_TRIES번
+# 시도하고, 그래도 실패하면 미전송 목록에 넣어 주문 처리 사이에 계속 다시 보냄 (장비는 다시 안 움직임).
+# 미전송이 남아 있으면 새 보고도 그 뒤에 줄 세움 - 보고 순서(픽업 done -> 컨베이어 등)를 지키려고.
+# REPORT_PENDING_MAX_AGE_SEC 지나도 못 보낸 건 버림 (그때쯤이면 플랫폼이 이미 stage_timeout 처리).
+# 재고보충(/restock)·큐·게이트 호출은 여기 안 넣음 - 다시 보내면 pool이 두 번 차감되는 등 안전하지 않음.
+_pending_reports = []   # [{"label", "path", "body", "since"}]
+_last_pending_try = 0.0
+
+
+def _try_post(path, body):
+    """보고 1회 전송. (성공 여부, 결과 설명)"""
     try:
-        resp = requests.get(f"{FLASK_BASE_URL}/stock/board", timeout=REPORT_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        log("STOCK", f"초기 재고 로드: {data}")
-        return {c: int(data.get(c, 0)) for c in BOARD_COLORS}
+        resp = requests.post(f"{FLASK_BASE_URL}{path}", json=body, timeout=REPORT_TIMEOUT)
+        return 200 <= resp.status_code < 300, f"HTTP {resp.status_code}"
     except Exception as e:
-        log("STOCK", f"초기 재고 로드 실패: {e} - 전부 0으로 시작")
-        return {c: 0 for c in BOARD_COLORS}
+        return False, str(e)
+
+
+def _send_report(label, path, body):
+    item = {"label": label, "path": path, "body": body, "since": time.time()}
+    if _pending_reports:
+        _pending_reports.append(item)
+        log("REPORT", f"{label} - 앞의 미전송 보고 뒤에 대기 (미전송 {len(_pending_reports)}건): {body}")
+        flush_pending_reports(force=True)
+        return
+    for attempt in range(1, REPORT_IMMEDIATE_TRIES + 1):
+        ok, detail = _try_post(path, body)
+        if ok:
+            log("REPORT", f"{label} 성공{'' if attempt == 1 else f' ({attempt}번째 시도)'}: {body}")
+            return
+        log("REPORT", f"{label} 실패 {attempt}/{REPORT_IMMEDIATE_TRIES} ({detail})")
+        if attempt < REPORT_IMMEDIATE_TRIES:
+            time.sleep(1)
+    _pending_reports.append(item)
+    log("REPORT", f"{label} 미전송 - 주문 처리 사이에 {REPORT_RETRY_INTERVAL_SEC:g}초마다 다시 보냄: {body}")
+
+
+def flush_pending_reports(force=False):
+    """미전송 보고를 순서대로 다시 보냄. 하나라도 실패하면 거기서 멈춤(순서 유지).
+    메인 루프에서 주문 처리 사이에 호출 - REPORT_RETRY_INTERVAL_SEC 간격 (force면 바로)."""
+    global _last_pending_try
+    if not _pending_reports:
+        return
+    now = time.time()
+    if not force and now - _last_pending_try < REPORT_RETRY_INTERVAL_SEC:
+        return
+    _last_pending_try = now
+    while _pending_reports:
+        item = _pending_reports[0]
+        if now - item["since"] > REPORT_PENDING_MAX_AGE_SEC:
+            _pending_reports.pop(0)
+            log("REPORT", f"!! {item['label']} {REPORT_PENDING_MAX_AGE_SEC / 60:g}분 넘게 못 보내서 버림: {item['body']}")
+            continue
+        ok, detail = _try_post(item["path"], item["body"])
+        if not ok:
+            return
+        _pending_reports.pop(0)
+        log("REPORT", f"{item['label']} 재전송 성공 (남은 미전송 {len(_pending_reports)}건): {item['body']}")
 
 
 def report_board_status(order_id, color, status, count=None):
     body = {"order_id": order_id, "board": color, "status": status}
     if count is not None:
         body["count"] = count
-    try:
-        resp = requests.post(f"{FLASK_BASE_URL}/report/board-status", json=body, timeout=REPORT_TIMEOUT)
-        ok = 200 <= resp.status_code < 300
-        log("REPORT", f"board-status {'성공' if ok else '실패'} ({resp.status_code}): {body}")
-        return ok
-    except Exception as e:
-        log("REPORT", f"board-status 요청 실패: {e}")
-        return False
+    _send_report("board-status", "/report/board-status", body)
 
 
 def report_board_robot_arm(order_id, board_result):
-    try:
-        resp = requests.post(
-            f"{FLASK_BASE_URL}/report/board-robot-arm",
-            json={"order_id": order_id, "board": board_result},
-            timeout=REPORT_TIMEOUT,
-        )
-        ok = 200 <= resp.status_code < 300
-        log("REPORT", f"board-robot-arm {'성공' if ok else '실패'} ({resp.status_code}): {board_result}")
-        return ok
-    except Exception as e:
-        log("REPORT", f"board-robot-arm 요청 실패: {e}")
-        return False
+    _send_report("board-robot-arm", "/report/board-robot-arm", {"order_id": order_id, "board": board_result})
 
 
 def report_board_dispense(order_id, color):
-    try:
-        resp = requests.post(
-            f"{FLASK_BASE_URL}/report/board-dispense",
-            json={"order_id": order_id, "board": color},
-            timeout=REPORT_TIMEOUT,
-        )
-        ok = 200 <= resp.status_code < 300
-        log("REPORT", f"board-dispense {'성공' if ok else '실패'} ({resp.status_code}): {color}")
-        return ok
-    except Exception as e:
-        log("REPORT", f"board-dispense 요청 실패: {e}")
-        return False
+    _send_report("board-dispense", "/report/board-dispense", {"order_id": order_id, "board": color})
 
 
 def report_conveyor_tray(order_id, section, status):
-    try:
-        resp = requests.post(
-            f"{FLASK_BASE_URL}/report/conveyor/tray",
-            json={"order_id": order_id, "section": section, "status": status},
-            timeout=REPORT_TIMEOUT,
-        )
-        ok = 200 <= resp.status_code < 300
-        log("REPORT", f"conveyor/tray(section{section}) {'성공' if ok else '실패'} ({resp.status_code}): {status}")
-        return ok
-    except Exception as e:
-        log("REPORT", f"conveyor/tray 요청 실패: {e}")
-        return False
+    _send_report(f"conveyor/tray(section{section})", "/report/conveyor/tray",
+                 {"order_id": order_id, "section": section, "status": status})
 
 
 def call_restock(color):
@@ -1404,6 +1434,7 @@ def main():
     try:
         while True:
             link_watchdog(loop)   # 주문 처리 사이: 연결 확인 / 끊겼으면 재연결
+            flush_pending_reports()   # 못 보낸 보고 재전송
             try:
                 data = snapshot_queue.get(timeout=1)
                 handle_snapshot(loop, arm_api, box_api, data)
@@ -1421,6 +1452,9 @@ def main():
         log("SHUTDOWN", "Ctrl+C로 종료")
     finally:
         log("SHUTDOWN", "정리 중")
+        flush_pending_reports(force=True)
+        for item in _pending_reports:
+            log("SHUTDOWN", f"!! 못 보낸 보고 (플랫폼에 수동 확인 필요): {item['label']} {item['body']}")
         try:
             loop.run_until_complete(suck(arm_api, False))
         except Exception as e:

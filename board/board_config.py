@@ -117,6 +117,11 @@ MOBIUS_POLL_INTERVAL_SEC = 5.0
 LINK_CHECK_INTERVAL_SEC = 10.0   # 대기 중 연결 확인(GetPose) 간격
 LINK_RETRY_INTERVAL_SEC = 5.0    # 끊겼을 때 재연결 시도 간격
 
+# 보고(보드 Flask -> Mobius) 실패 시 재시도. 장비는 다시 안 움직이고 보고만 다시 보냄
+REPORT_IMMEDIATE_TRIES = 2         # 바로 시도하는 횟수 (1초 간격)
+REPORT_RETRY_INTERVAL_SEC = 5.0    # 그래도 실패하면 주문 처리 사이에 이 간격으로 재전송
+REPORT_PENDING_MAX_AGE_SEC = 600   # 10분 넘게 못 보낸 보고는 버림 (플랫폼이 이미 stage_timeout 처리했을 시점)
+
 # 도착 판정 허용오차 (모든 이동에 사용. 픽업 위치 / 트레이 하강은 도착 실패 시 failed 처리)
 POSITION_TOLERANCE_MM = 2.0
 POSITION_TOLERANCE_DEG = 2.0
