@@ -8,6 +8,9 @@
 # - 서버가 안 뜨면 거기서 멈춤 (Redis 없이 Flask를 띄우면 재고가 0으로 보임)
 # - 로봇 프로그램은 두 개 뜨면 같은 COM 포트를 두고 충돌 -> 떠 있으면 다시 안 띄움
 # 끌 때는 로봇 창에서 Ctrl+C (게이트웨이 -> main), 창으로 띄운 서버는 키캡 Flask -> 보드 Flask -> Redis 순서
+# -Rehearsal (start_rehearsal.bat): 로봇 프로그램 2개를 리허설 모드로 - 로봇·컨베이어·카메라는 움직인 척,
+#   보고는 실제로 나감. 실물 없이 전시장 통신 전체 시험용. DobotLink 안 켬
+param([switch]$Rehearsal)
 $ErrorActionPreference = 'Stop'
 $Root       = $PSScriptRoot                                  # 저장소 루트
 $Python     = Join-Path $Root 'venv\Scripts\python.exe'       # 공용 가상환경 (Python 3.9, requirements.txt)
@@ -19,6 +22,9 @@ $GatewayEnv = Join-Path $GatewayDir '.env.local'
 $RedisDir   = 'C:\Users\dusdn\redis'                          # Windows용 Redis (저장소 밖)
 $RedisConf  = Join-Path $RedisDir 'redis.warehouse.conf'
 $DobotLink  = Join-Path $env:LOCALAPPDATA 'Programs\DobotLink\DobotLink.exe'
+# 리허설 스위치는 환경 변수로 로봇 프로그램 창에 물려줌 (새 창은 이 창의 환경 변수를 이어받음)
+if ($Rehearsal) { $env:WAREHOUSE_REHEARSAL = '1'; $Tag = '[리허설] ' }
+else { Remove-Item Env:WAREHOUSE_REHEARSAL -ErrorAction SilentlyContinue; $Tag = '' }
 
 function Step($msg) { Write-Host "[start_all] $msg" }
 function Fail($msg) {
@@ -68,7 +74,10 @@ Ensure-Server '키캡 Flask' 5002 'warehouse-keycap-flask' {
 }
 
 # ---------------- 로봇 ----------------
-if (Get-Process DobotLink -ErrorAction SilentlyContinue) {
+if ($Rehearsal) {
+    Write-Host '[start_all] 리허설 모드 - 로봇은 안 움직이지만 Mobius 보고·보드 재고 차감은 실제로 일어남. 끝나면 재고 원복' -ForegroundColor Yellow
+    Write-Host '[start_all] 키캡 아두이노는 리허설과 무관하게 실제로 배출함 - 원치 않으면 아두이노 전원을 끌 것' -ForegroundColor Yellow
+} elseif (Get-Process DobotLink -ErrorAction SilentlyContinue) {
     Step 'DobotLink 실행 중'
 } else {
     if (-not (Test-Path $DobotLink)) { Fail "DobotLink 없음: $DobotLink" }
@@ -76,14 +85,14 @@ if (Get-Process DobotLink -ErrorAction SilentlyContinue) {
     Step 'DobotLink 실행 - 8초 대기'
     Start-Sleep -Seconds 8
 }
-Step '주의: DobotLab 창에서 로봇을 연결하지 말 것 (COM 포트 충돌)'
+if (-not $Rehearsal) { Step '주의: DobotLab 창에서 로봇을 연결하지 말 것 (COM 포트 충돌)' }
 
 # 보드 main (보드 팔 + 트레이 벨트)
 if (Test-Port 5001) {
-    Step '보드 main 이미 실행 중 (5001) - 건너뜀'
+    Step '보드 main 이미 실행 중 (5001) - 건너뜀 (리허설/실제 모드는 그 창 제목으로 확인)'
 } else {
-    Start-Window 'main' $BoardDir "& '$Python' main_board_robot_arm.py"
-    Step '보드 main 실행됨 - 팔이 HOME으로 이동함'
+    Start-Window "${Tag}main" $BoardDir "& '$Python' main_board_robot_arm.py"
+    if ($Rehearsal) { Step "${Tag}보드 main 실행됨" } else { Step '보드 main 실행됨 - 팔이 HOME으로 이동함' }
 }
 
 # 키캡·트레이 게이트웨이 (키캡 팔 2대 + 트레이 팔 + 키캡 벨트) - 준비 안 됐으면 건너뜀
@@ -94,8 +103,8 @@ if ($gatewayRunning) {
 } elseif (-not (Test-Path $GatewayEnv)) {
     Step "키캡·트레이 게이트웨이 준비 안 됨(.env.local 없음: $GatewayDir) - 건너뜀"
 } else {
-    Start-Window '키캡·트레이 게이트웨이' $GatewayDir "& '$Python' local_gateway.py --env .env.local"
-    Step '키캡·트레이 게이트웨이 실행됨'
+    Start-Window "${Tag}키캡·트레이 게이트웨이" $GatewayDir "& '$Python' local_gateway.py --env .env.local"
+    Step "${Tag}키캡·트레이 게이트웨이 실행됨"
 }
 Step '로그: 각 창 / board\logs, keycap_tray\logs 폴더 / logs 폴더(서비스)'
 Start-Sleep -Seconds 5

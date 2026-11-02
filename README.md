@@ -71,6 +71,9 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 - 실행: 충전기 연결(절전 방지) → 로봇·매직박스 전원/USB → DobotLab 연결 끊기 → **`start_all.bat` 더블클릭**
   - 서버 3개 확인(서비스가 없으면 창으로 띄움) → DobotLink → 보드 main → 키캡·트레이 게이트웨이
   - 보드 main은 켜자마자 팔이 HOME으로 감. 키캡 팔은 전원을 새로 켰으면 `keycap_tray`에서 `demo.py home` 먼저
+- **리허설 (로봇 없이 통신 전체 시험)**: `start_rehearsal.bat` — 보드 main·게이트웨이가 로봇·컨베이어·카메라를 "움직인 척"하고
+  보고는 실제로 보냄(Mobius·보드 Flask·Redis까지 실전과 같음). 창 제목에 `[리허설]`. 주의: 보드 재고가 실제로 차감되고
+  관리자 페이지에도 보고가 보임 → 끝나면 재고 원복. 키캡 아두이노는 리허설과 무관하게 실제 배출(원치 않으면 아두이노 전원 끄기)
 - 종료: 로봇 창 Ctrl+C (게이트웨이 → 보드 main). 창으로 띄운 서버는 키캡 Flask → 보드 Flask → Redis 순서
 - 로그: 각 창, `board/logs/`(보드 main·Flask 날짜별), `keycap_tray/logs/`(게이트웨이 날짜별), `logs/`(서비스)
 

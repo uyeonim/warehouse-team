@@ -26,8 +26,10 @@ def validate_local_options(environ):
         raise RuntimeError('이 폴더의 집기/색 센서 함수는 아직 미구현입니다.')
     if flag('DRY_RUN') or environ.get('FORCE_FAIL', '').strip():
         raise RuntimeError('로컬 실전 작업자는 모의 보고/강제 실패 설정을 허용하지 않습니다.')
-    if environ.get('HARDWARE', '').strip().lower() != 'dobot':
-        raise RuntimeError('로컬 실전 작업자는 HARDWARE=dobot을 명시해야 합니다.')
+    hardware = environ.get('HARDWARE', '').strip().lower()
+    rehearsal = environ.get('WAREHOUSE_REHEARSAL') == '1'
+    if hardware != 'dobot' and not (rehearsal and hardware == 'fake'):
+        raise RuntimeError('로컬 실전 작업자는 HARDWARE=dobot을 명시해야 합니다 (리허설만 fake).')
     if environ.get('ARMS_TAKE_TURNS', '1').strip() != '1':
         raise RuntimeError('실전 모드는 두 팔이 트레이 자리를 번갈아 써야 합니다 (ARMS_TAKE_TURNS=1).')
     if not flag('REACT_ASSIGNED'):
@@ -57,6 +59,11 @@ def run():
     from runtime_config import PROFILE
     if PROFILE != 'local':
         raise RuntimeError('로컬 실행 설정에 WAREHOUSE_PROFILE=local이 필요합니다.')
+    if os.environ.get('WAREHOUSE_REHEARSAL') == '1':
+        # 리허설 (start_rehearsal.bat): .env.local 의 HARDWARE=dobot 보다 우선. warehouse_server 의 가짜 장비로
+        # "움직인 척"만 하고 보고는 실제로 보냄. warehouse_server import 전에 바꿔야 적용됨
+        os.environ['HARDWARE'] = 'fake'
+        print('!! 리허설 모드 - 키캡 팔·트레이 팔·키캡 벨트는 움직인 척만 함. 보고는 실제로 보냄')
     import local_transport
     cfg = local_transport.settings()
     period, notify_port = validate_local_options(os.environ)

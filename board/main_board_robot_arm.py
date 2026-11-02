@@ -141,6 +141,11 @@ from log_tee import start_file_log
 
 load_dotenv()
 
+# 리허설 모드 (start_rehearsal.bat 이 WAREHOUSE_REHEARSAL=1 로 켬): 로봇·컨베이어·카메라 없이
+# "움직인 척"만 하고 보고는 실제로 보냄 -> 실물 없이 전시장 통신 전체(Mobius·보드 Flask·Redis) 시험용.
+# 재고 차감·Mobius 보고가 실제로 일어나니 끝나면 재고 원복할 것
+REHEARSAL = os.getenv("WAREHOUSE_REHEARSAL") == "1"
+
 # ---------------------------------------------------------------
 # Mobius 알림 수신 (cnt_process 구독 nu = http://<이 PC IP>:NOTIFY_PORT/notify/process)
 # ---------------------------------------------------------------
@@ -691,6 +696,40 @@ def link_watchdog(loop):
         _mark_link_lost(res)
 
 
+class RehearsalDobot:
+    """리허설 모드용 가짜 팔 + 매직박스 (DobotRPC 대신). 이동 명령을 받으면 바로 그 위치에 있다고 답함
+    -> move_and_wait의 도착/멈춤 판정이 그대로 통과. 흡착·컨베이어는 성공만 돌려줌."""
+
+    def __init__(self):
+        hx, hy, hz = HOME_XYZ
+        self.pose = {"x": hx, "y": hy, "z": hz, "r": 0.0}
+
+    async def _ok(self, value=True):
+        return value
+
+    def ConnectDobot(self, **kw):
+        return self._ok({"firmwareName": "Rehearsal"})
+
+    def DisconnectDobot(self, **kw):
+        return self._ok()
+
+    def ClearAllAlarmsState(self, **kw):
+        return self._ok()
+
+    def GetPose(self, **kw):
+        return self._ok(dict(self.pose))
+
+    def SetPTPCmd(self, x, y, z, r, **kw):
+        self.pose = {"x": x, "y": y, "z": z, "r": r}
+        return self._ok()
+
+    def SetEndEffectorSuctionCup(self, **kw):
+        return self._ok()
+
+    def SetEMotor(self, **kw):
+        return self._ok()
+
+
 def ensure_link(loop):
     """작업(픽업/컨베이어) 시작 직전: 끊김 표시가 있으면 재연결을 한 번 시도.
     그래도 안 되면 그대로 진행 -> 명령이 실패해서 지금처럼 failed 보고."""
@@ -909,6 +948,8 @@ def _show_camera_window(frame):
 
 
 def verify_board_on_tray(expected_color):
+    if REHEARSAL:
+        return True, expected_color, "리허설 - 카메라 확인 생략"
     frame = _capture_frame()
     if frame is None:
         return False, None, "카메라 프레임 획득 실패"
@@ -1407,9 +1448,13 @@ def main():
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    dobotlink = DobotlinkAdapter(RPCClient(), is_sync=False)
-    arm_api = getattr(dobotlink, NAMESPACE_ARM)
-    box_api = getattr(dobotlink, NAMESPACE_BOX)
+    if REHEARSAL:
+        log("INIT", "!! 리허설 모드 - 로봇·컨베이어·카메라는 움직인 척만 함. 보고·재고 차감은 실제로 일어남")
+        arm_api = box_api = RehearsalDobot()
+    else:
+        dobotlink = DobotlinkAdapter(RPCClient(), is_sync=False)
+        arm_api = getattr(dobotlink, NAMESPACE_ARM)
+        box_api = getattr(dobotlink, NAMESPACE_BOX)
     _arm_api = arm_api
 
     log("INIT", f"연결 시도: {DOBOT_PORT}")
