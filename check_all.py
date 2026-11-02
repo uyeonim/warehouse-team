@@ -75,15 +75,15 @@ def check_env():
     envs = {}
     for name, (path, keys) in ENV_FILES.items():
         if not path.is_file():
-            report("XX", f"{path.relative_to(ROOT)} 없음 - .example 복사해서 채우기")
+            report("XX", f"{path.relative_to(ROOT).as_posix()} 없음 - .example 복사해서 채우기")
             envs[name] = {}
             continue
         values = dotenv_values(path)
         missing = [k for k in keys if not values.get(k)]
         if missing:
-            report("XX", f"{path.relative_to(ROOT)} 빈 값: {', '.join(missing)}")
+            report("XX", f"{path.relative_to(ROOT).as_posix()} 빈 값: {', '.join(missing)}")
         else:
-            report("OK", f"{path.relative_to(ROOT)}")
+            report("OK", f"{path.relative_to(ROOT).as_posix()}")
         envs[name] = values
     return envs
 
