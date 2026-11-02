@@ -138,6 +138,7 @@ from dotenv import load_dotenv
 from DobotRPC import RPCClient, DobotlinkAdapter
 
 from log_tee import start_file_log
+from heartbeat import Heartbeat
 
 load_dotenv()
 
@@ -228,6 +229,15 @@ link_lost = False        # 명령 결과에 "not connected"가 나오면 True ->
 _last_link_check = 0.0   # 마지막 연결 확인 또는 재연결 시도 시각
 _arm_api = None          # main()에서 만든 팔 API - 컨베이어만 쓰는 함수에서도 재연결하려고 보관
 
+# ---- heartbeat (Redis hb:board_main, check_all.py가 읽음) - main()에서 시작 ----
+hb = None
+
+
+def _hb(state, job=None):
+    """상태 기록. 작업이 끝나 대기로 돌아갈 때 로봇이 끊겨 있으면 idle 대신 link_lost"""
+    if hb is not None:
+        hb.set_state("link_lost" if state == "idle" and link_lost else state, job)
+
 # ---- 픽업 job 중복방지 (키캡 alreadyProcessed 패턴) ----
 JOB_HISTORY_SIZE = 8
 processed_job_keys = []
@@ -300,6 +310,8 @@ def accept_snapshot(data, source, from_poll=False):
         orders = data.get("orders", {})
         log("RECV", f"새 스냅샷({source}) seq={seq}, 진행 중 주문={list(orders.keys())}")
         snapshot_queue.put(data)
+        if hb is not None:
+            hb.snapshot_received(seq, "조회" if from_poll else "알림")
 
 
 class NotifyHandler(BaseHTTPRequestHandler):
@@ -351,6 +363,8 @@ def _poll_cnt_process():
     first, failing = True, False
     while True:
         latest = fetch_latest_cin("cnt_process", quiet=True)
+        if hb is not None:
+            hb.update(poll_ok=latest is not None)
         if latest is None:
             if not failing:
                 log("RECV", f"cnt_process 주기 조회 실패 - {MOBIUS_POLL_INTERVAL_SEC:g}초마다 재시도 (알림 수신은 계속)")
@@ -656,6 +670,8 @@ def _mark_link_lost(res):
     if not link_lost:
         link_lost = True
         log("LINK", f"로봇 연결 끊김 감지 ({res}) - {LINK_RETRY_INTERVAL_SEC:g}초마다 재연결 시도")
+        if hb is not None and hb.data.get("state") != "busy":   # 작업 중이면 끝날 때 _hb("idle")이 link_lost로 바꿈
+            hb.set_state("link_lost")
 
 
 async def reconnect_robot(arm_api):
@@ -674,6 +690,8 @@ async def reconnect_robot(arm_api):
     if link_lost or not ok:
         return False
     log("LINK", "재연결 성공 -> HOME 이동 완료, 주문 처리 재개")
+    if hb is not None and hb.data.get("state") == "link_lost":
+        _hb("idle")
     return True
 
 
@@ -1165,12 +1183,16 @@ def process_board_job(loop, arm_api, box_api, order_id, color):
         report_board_status(order_id, color, "empty", count=0)
         report_board_robot_arm(order_id, "failed")
     else:
+        _hb("busy", f"{order_id} 보드 픽업 {color}")
         ensure_link(loop)
         report_board_status(order_id, color, "busy", count=count_before)
         # board 필드 보고는 pick_and_place_board_async 내부에서 정확한 시점에
         # 이뤄짐 (위치검증 실패 시 즉시, 성공 시 카메라 확인 후)
-        success, consumed = loop.run_until_complete(
-            pick_and_place_board_async(arm_api, order_id, color, count_before))
+        try:
+            success, consumed = loop.run_until_complete(
+                pick_and_place_board_async(arm_api, order_id, color, count_before))
+        finally:
+            _hb("idle")
 
         if success:
             report_board_dispense(order_id, color)
@@ -1205,9 +1227,13 @@ def handle_tray_conveyor(loop, box_api, order_id, section, skip_if_done=False):
         return
     run_time = {"0": TRAY_CONVEYOR_RUN_TIME_SECTION0, "1": TRAY_CONVEYOR_RUN_TIME_SECTION1,
                 "2": TRAY_CONVEYOR_RUN_TIME_SECTION2}[section]
-    ensure_link(loop)
-    log("CONV", f"{order_id}: 컨베이어 section{section} 구동 시작")
-    success = loop.run_until_complete(run_tray_conveyor_async(box_api, run_time, f" (section{section})"))
+    _hb("busy", f"{order_id} 컨베이어 section{section}")
+    try:
+        ensure_link(loop)
+        log("CONV", f"{order_id}: 컨베이어 section{section} 구동 시작")
+        success = loop.run_until_complete(run_tray_conveyor_async(box_api, run_time, f" (section{section})"))
+    finally:
+        _hb("idle")
     report_conveyor_tray(order_id, section, "done" if success else "failed")
 
 
@@ -1427,9 +1453,12 @@ def handle_snapshot(loop, arm_api, box_api, data):
 
 # ============================== 메인 ==============================
 def main():
-    global local_stock, job_queue, gate_open, gate_order_id, _arm_api, link_lost
+    global local_stock, job_queue, gate_open, gate_order_id, _arm_api, link_lost, hb
 
     log("INIT", f"로그 파일: {start_file_log('main')}")
+    hb = Heartbeat("board_main", os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
+                   "rehearsal" if REHEARSAL else "real", log=lambda m: log("HB", m),
+                   extra=lambda: {"pending_reports": len(_pending_reports)}).start()
     local_stock = fetch_initial_stock()
 
     # 복원분 중복 적재 방지는 handle_snapshot()에서 job_queue 존재 여부로 처리
@@ -1474,6 +1503,7 @@ def main():
     log("INIT", f"준비 완료 (픽업:{STATUS_PICK}/{STATUS_MISMATCH}, 컨베이어0:{STATUS_CONVEYOR_0}, 컨베이어1:{STATUS_CONVEYOR_1}, "
                 f"컨베이어2:{STATUS_CONVEYOR_2}, 큐 {len(job_queue)}건, "
                 f"게이트 {'닫힘' if not gate_open else '열림'}) - 대기 시작. Ctrl+C로 종료")
+    _hb("idle")
 
     first_snapshot_handled = False
     try:
@@ -1497,6 +1527,8 @@ def main():
         log("SHUTDOWN", "Ctrl+C로 종료")
     finally:
         log("SHUTDOWN", "정리 중")
+        if hb is not None:
+            hb.stop()
         flush_pending_reports(force=True)
         for item in _pending_reports:
             log("SHUTDOWN", f"!! 못 보낸 보고 (플랫폼에 수동 확인 필요): {item['label']} {item['body']}")

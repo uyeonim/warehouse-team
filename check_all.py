@@ -192,6 +192,50 @@ def check_local_services():
         report("!!", "DobotLab 실행 중 - 거기서 로봇을 연결하면 COM 포트 충돌")
 
 
+BUSY_WARN_SEC = 90   # 한 작업이 이보다 오래 busy면 멈춘 것으로 의심 (가장 긴 단계: 키캡 적재 약 33초)
+
+
+def check_heartbeats(envs):
+    """로봇 프로그램이 Redis hb:* 에 5초마다 남기는 상태 (heartbeat.py). 30초 넘게 안 남기면 키가 사라짐"""
+    section("로봇 프로그램 상태 (heartbeat)")
+    from datetime import datetime
+    from redis import Redis
+    try:
+        r = Redis.from_url(envs["board"].get("REDIS_URL") or "redis://127.0.0.1:6379/0",
+                           decode_responses=True, socket_timeout=2, socket_connect_timeout=2)
+        raw = {name: r.get(f"hb:{name}") for name in ("board_main", "keycap_tray")}
+    except Exception as e:
+        report("XX", f"Redis 접속 실패 - 상태 확인 못 함: {short_err(e)}")
+        return
+    labels = {"board_main": "보드 main", "keycap_tray": "키캡·트레이 게이트웨이"}
+    states = {"starting": "시작 중", "waiting_mobius": "Mobius 대기 중", "idle": "대기 중",
+              "busy": "작업 중", "link_lost": "로봇 연결 끊김 (재연결 시도 중)"}
+    for name, value in raw.items():
+        label = labels[name]
+        if not value:
+            report("XX", f"{label}: 상태 기록 없음 - 꺼져 있거나 30초 넘게 멈춤")
+            continue
+        hb = json.loads(value)
+        age = (datetime.now() - datetime.strptime(hb["since"], "%Y-%m-%d %H:%M:%S")).total_seconds()
+        mode = " [리허설]" if hb.get("mode") == "rehearsal" else ""
+        snap = hb.get("last_snapshot") or {}
+        last = f" / 마지막 스냅샷 seq={snap.get('seq')} {snap.get('time', '')[11:]}({snap.get('via')})" if snap else ""
+        state = hb.get("state")
+        text = f"{label}{mode}: {states.get(state, state)}"
+        if state == "busy":
+            text += f" - {hb.get('job')} ({age:.0f}초째)"
+        if state in ("link_lost", "waiting_mobius"):
+            report("XX", text + f" ({age:.0f}초째)")
+        elif state == "busy" and age > BUSY_WARN_SEC:
+            report("!!", text + " - 너무 오래 걸림, 멈춘 것 같음 (창/로그 확인)")
+        else:
+            report("OK", text + last)
+        if hb.get("poll_ok") is False:
+            report("!!", f"{label}: Mobius 5초 조회 실패 중 (알림만으로 받는 중)")
+        if hb.get("pending_reports"):
+            report("!!", f"{label}: 못 보낸 보고 {hb['pending_reports']}건 재전송 대기 중")
+
+
 def check_robots(envs):
     section("로봇 USB (COM 포트)")
     present = set(re.findall(r"\((COM\d+)\)", ps("Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match '\\(COM\\d+\\)' } "
@@ -245,6 +289,7 @@ def main():
     mobius_ok = check_platform(envs)
     check_subscriptions(envs, mobius_ok)
     check_local_services()
+    check_heartbeats(envs)
     check_robots(envs)
     check_windows()
     print(f"\n결과: OK {counts['OK']} / 주의 {counts['!!']} / 문제 {counts['XX']}")

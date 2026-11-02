@@ -15,6 +15,7 @@ class SnapshotInbox:
         self.latest_orders = {}
         self.fault_latches = set()
         self.received_snapshot = False
+        self.on_accept = None   # (seq, via) -> None. heartbeat 기록용 (local_gateway 가 연결)
 
     def submit(self, value, from_poll=False):
         """스냅샷을 큐에 넣음. 넣었으면 True.
@@ -40,6 +41,8 @@ class SnapshotInbox:
             self.received_snapshot = True
             self.fault_latches.update(oid for oid, order in value['orders'].items() if order.get('fault'))
             self.queue.put(value)
+        if self.on_accept:
+            self.on_accept(seq, '조회' if from_poll else '알림')
         return True
 
     def begin_order(self, order_id):

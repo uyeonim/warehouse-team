@@ -76,7 +76,22 @@ def run():
     with WorkerLock():
         import warehouse_server as ws
         from local_feed import SnapshotInbox, notify_server
+        from heartbeat import Heartbeat
         inbox = SnapshotInbox()
+        # 상태 기록 (Redis hb:keycap_tray, check_all.py가 읽음). Redis가 꺼져 있어도 동작엔 영향 없음
+        hb = Heartbeat('keycap_tray', os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/0'),
+                       'rehearsal' if os.environ.get('WAREHOUSE_REHEARSAL') == '1' else 'real').start()
+        inbox.on_accept = hb.snapshot_received
+
+        def process(snap):
+            """스냅샷 처리 동안 busy + 주문 상태를 기록 - 한 단계에서 오래 멈추면 점검 화면에 보이게"""
+            job = ', '.join(f"{oid} {o.get('status')}" for oid, o in snap.get('orders', {}).items())[:120]
+            hb.set_state('busy', job or None)
+            try:
+                return ws.process_snapshot(snap)
+            finally:
+                hb.set_state('idle')
+
         process_path = os.environ.get('PROCESS_PATH', 'cnt_process').strip('/')
         print(f"로컬 R1/R2/R4 작업자: {cfg['MOBIUS_URL']} 읽기 → {cfg['BOARD_API_URL']} 보고")
         print('5000/5001/5002 서버 및 Redis는 기존 담당 프로그램이 운영합니다.')
@@ -97,6 +112,7 @@ def run():
                     if not waited:
                         print(f'[시작 대기] Mobius 읽기 실패 - {period:g}초마다 다시 시도: {error}')
                         waited = True
+                        hb.set_state('waiting_mobius')
                     time.sleep(period)
             if waited:
                 print('[시작 대기] Mobius 연결됨 - 시작')
@@ -107,6 +123,7 @@ def run():
             server = notify_server(inbox, notify_port)
             if ws.hw:
                 ws.hw.connect()
+            hb.set_state('idle')
             while True:
                 now = time.monotonic()
                 if now >= next_read:
@@ -115,20 +132,22 @@ def run():
                         snapshot = local_transport.get_latest(process_path)
                     except Exception as error:
                         print(f'[읽기 실패] {error}')
+                        hb.update(poll_ok=False)
                     else:
+                        hb.update(poll_ok=True)
                         if (isinstance(snapshot, dict) and isinstance(snapshot.get('orders', {}), dict)
                                 and all(isinstance(o, dict) for o in snapshot.get('orders', {}).values())):
                             inbox.submit(snapshot, from_poll=True)
                     if pending is not None:
                         # 새 상태가 있으면 아래 큐에서 먼저 처리한다.
                         if inbox.queue.empty():
-                            pending = pending if ws.process_snapshot(pending) == 'retry' else None
+                            pending = pending if process(pending) == 'retry' else None
                 try:
                     snapshot = inbox.queue.get_nowait()
                 except queue.Empty:
                     pass
                 else:
-                    pending = snapshot if ws.process_snapshot(snapshot) == 'retry' else None
+                    pending = snapshot if process(snapshot) == 'retry' else None
                 if ws.hw:
                     ws.hw.keepalive()
                 time.sleep(0.1)
@@ -139,6 +158,7 @@ def run():
                 if ws.hw:
                     ws.hw.disconnect()
             finally:
+                hb.stop()
                 if server is not None:
                     server.shutdown()
                     server.server_close()
