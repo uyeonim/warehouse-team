@@ -66,6 +66,8 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 
 ## 실행 · 종료
 
+> 전시 당일 운영은 **`운영_매뉴얼.md`** (1장). 켜기 전/문제 생겼을 때 **`check_all.bat`**(읽기 전용 점검: 설정·네트워크·Mobius 구독·서버·로봇 USB·전원 설정)
+
 - 실행: 충전기 연결(절전 방지) → 로봇·매직박스 전원/USB → DobotLab 연결 끊기 → **`start_all.bat` 더블클릭**
   - 서버 3개 확인(서비스가 없으면 창으로 띄움) → DobotLink → 보드 main → 키캡·트레이 게이트웨이
   - 보드 main은 켜자마자 팔이 HOME으로 감. 키캡 팔은 전원을 새로 켰으면 `keycap_tray`에서 `demo.py home` 먼저
