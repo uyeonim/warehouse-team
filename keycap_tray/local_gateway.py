@@ -76,8 +76,21 @@ def run():
         pending = None
         server = None
         try:
-            # 먼저 현재 상태를 읽어 시작 기준으로 삼는다. 실패하면 로봇 연결도 하지 않는다.
-            initial = local_transport.get_latest(process_path)
+            # 먼저 현재 상태를 읽어 시작 기준으로 삼는다. 읽힐 때까지 로봇 연결도 하지 않는다.
+            # 실패해도 끝내지 않고 PROCESS_POLL_SEC마다 다시 시도 - 플랫폼 서버보다 먼저 켜지거나
+            # 네트워크가 늦게 붙어도 사람이 다시 켜지 않아도 되게 (노트북을 테이블 밑에 두는 운영)
+            waited = False
+            while True:
+                try:
+                    initial = local_transport.get_latest(process_path)
+                    break
+                except Exception as error:
+                    if not waited:
+                        print(f'[시작 대기] Mobius 읽기 실패 - {period:g}초마다 다시 시도: {error}')
+                        waited = True
+                    time.sleep(period)
+            if waited:
+                print('[시작 대기] Mobius 연결됨 - 시작')
             if initial is not None:
                 inbox.submit(initial, from_poll=True)
                 ws.mark_as_handled(initial)  # 켤 때 이미 진행 중이던 주문은 기준으로만 (새 status 부터 반응)
