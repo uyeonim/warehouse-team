@@ -97,5 +97,5 @@ if ($gatewayRunning) {
     Start-Window '키캡·트레이 게이트웨이' $GatewayDir "& '$Python' local_gateway.py --env .env.local"
     Step '키캡·트레이 게이트웨이 실행됨'
 }
-Step '로그: 각 창 / board\logs 폴더 / logs 폴더(서비스)'
+Step '로그: 각 창 / board\logs, keycap_tray\logs 폴더 / logs 폴더(서비스)'
 Start-Sleep -Seconds 5

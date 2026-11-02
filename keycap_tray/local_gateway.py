@@ -63,6 +63,8 @@ def run():
     if args.check:
         print('로컬 설정 형식 확인 완료. 서버 API 호환성과 실물 좌표는 별도 검증이 필요합니다.')
         return
+    from log_tee import start_file_log
+    print(f'로그 파일: {start_file_log("gateway")}')   # 창을 닫거나 재부팅돼도 기록이 남게
     from worker_lock import WorkerLock
     with WorkerLock():
         import warehouse_server as ws

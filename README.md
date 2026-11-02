@@ -70,7 +70,7 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
   - 서버 3개 확인(서비스가 없으면 창으로 띄움) → DobotLink → 보드 main → 키캡·트레이 게이트웨이
   - 보드 main은 켜자마자 팔이 HOME으로 감. 키캡 팔은 전원을 새로 켰으면 `keycap_tray`에서 `demo.py home` 먼저
 - 종료: 로봇 창 Ctrl+C (게이트웨이 → 보드 main). 창으로 띄운 서버는 키캡 Flask → 보드 Flask → Redis 순서
-- 로그: 각 창, `board/logs/`(보드 main·Flask 날짜별), `logs/`(서비스)
+- 로그: 각 창, `board/logs/`(보드 main·Flask 날짜별), `keycap_tray/logs/`(게이트웨이 날짜별), `logs/`(서비스)
 
 ## 문제가 생겼을 때
 
