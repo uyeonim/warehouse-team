@@ -6,14 +6,14 @@
 # - PC 켜면 자동 시작, 죽으면 3초 뒤 자동 재시작 (로그인 안 해도 뜸)
 # - 로봇 프로그램(보드 main, 키캡·트레이 게이트웨이)은 서비스로 안 만듦 - 사람이 없을 때 팔이 움직이면 안 됨
 # - 이미 등록된 서비스는 건너뜀. 다시 등록하려면 uninstall_services.ps1 먼저
-# 준비: NSSM(https://nssm.cc/download) zip에서 win64\nssm.exe를 아래 $Nssm 경로에 둘 것
+# 준비: NSSM(https://nssm.cc/download) zip에서 win64\nssm.exe를 저장소 폴더 옆 nssm\ 에 둘 것 (예: C:\warehouse\nssm\nssm.exe)
 $ErrorActionPreference = 'Stop'
-$Nssm      = 'C:\Users\dusdn\nssm\nssm.exe'
 $Repo      = Split-Path $PSScriptRoot -Parent                 # 저장소 루트
+$Nssm      = Join-Path (Split-Path $Repo -Parent) 'nssm\nssm.exe'   # 저장소 폴더 옆 (예: C:\warehouse\nssm)
 $LogDir    = Join-Path $Repo 'logs'
 $Python    = Join-Path $Repo 'venv\Scripts\python.exe'        # 공용 가상환경
 $Waitress  = Join-Path $Repo 'venv\Scripts\waitress-serve.exe'
-$RedisDir  = 'C:\Users\dusdn\redis'                           # Windows용 Redis (저장소 밖)
+$RedisDir  = Join-Path (Split-Path $Repo -Parent) 'redis'    # Windows용 Redis - 저장소 폴더 옆 (예: C:\warehouse\redis)
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)

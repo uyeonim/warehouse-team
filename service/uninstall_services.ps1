@@ -1,7 +1,7 @@
 ﻿# 창고 서버 서비스 4개를 멈추고 등록 해제 (관리자 PowerShell에서 실행)
 # 해제 후에는 start_all이 예전처럼 창으로 띄움 - 서비스 방식에 문제가 있을 때 되돌리는 용도
 $ErrorActionPreference = 'Stop'
-$Nssm = 'C:\Users\dusdn\nssm\nssm.exe'
+$Nssm = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'nssm\nssm.exe'   # 저장소 폴더 옆
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)

@@ -20,7 +20,7 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 
 | 프로그램 | 폴더 | 포트 | 종류 | 맡는 일 |
 |---|---|---|---|---|
-| Redis | 저장소 밖 `C:\Users\dusdn\redis` | 6379 (노트북 내부만) | 서버 | 재고 · 대기열 · 게이트 (키캡+보드) |
+| Redis | 저장소 옆 `redis\` (예: `C:\warehouse\redis`) | 6379 (노트북 내부만) | 서버 | 재고 · 대기열 · 게이트 (키캡+보드) |
 | 보드 Flask | `board/app.py` | 5000 (노트북 내부만) | 서버 | 보드 main·게이트웨이 보고 → Mobius CIN, 보드 재고 |
 | 키캡 Flask | `keycap_flask/app.py` | 5002 | 서버 | Mobius 알림 → MQTT로 아두이노 전달, 아두이노 보고 → Mobius CIN |
 | 보드 main | `board/main_board_robot_arm.py` | 5001 (알림 수신) | 로봇 | `tray_reached`/`board_mismatched` 보드 픽업, 트레이 벨트 section0/1/2 |
@@ -36,6 +36,8 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 
 ```
 ├─ start_all.bat / start_all.ps1   실행 스크립트 (서버 확인 → DobotLink → 로봇 프로그램 2개)
+├─ status.bat                      상태판을 브라우저로 (바탕화면 '창고 점검')
+├─ setup_laptop.bat / setup/      새 노트북 한 번 설정 (관리자) + Redis 설정 원본 - 노트북_이전_가이드.md
 ├─ service/                        서버 3개 Windows 서비스 등록/해제 (NSSM, 관리자)
 ├─ requirements.txt                공용 가상환경 (Python 3.9)
 ├─ board/                          보드 팔 + 트레이 벨트 + 보드 Flask   (.env.example)
@@ -47,6 +49,9 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 
 ## 처음 설치 (창고 노트북 한 번)
 
+> **새 노트북으로 옮길 때는 `노트북_이전_가이드.md`** — 챙길 파일 3종 + `setup_laptop.bat`(아래 1·3·4번과 전원·바로가기를 자동으로) + 확인 순서.
+> 폴더는 저장소 옆에 `redis\`(필수)·`nssm\`(선택)을 두는 구조 — 사용자 이름과 무관.
+
 1. Python 3.9 가상환경
    ```powershell
    py -3.9 -m venv venv
@@ -54,7 +59,7 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
    ```
 2. 설정 파일: `board/.env.example` → `board/.env`, `keycap_flask/.env.example` → `keycap_flask/.env`,
    `keycap_tray/.env.local.example` → `keycap_tray/.env.local` 로 복사해 값 채우기 (AE 값은 팀 담당자). **절대 커밋·공유 금지**
-3. Redis: Windows용 Redis 5.0을 `C:\Users\dusdn\redis`에 두고 `redis.warehouse.conf` 사용 (127.0.0.1만, AOF 켬)
+3. Redis: Windows용 Redis 5.0을 저장소 옆 `redis\`에 두고 `setup\redis.warehouse.conf`를 그 폴더로 복사 (127.0.0.1만, AOF 켬, 데이터는 `redis\data\`)
 4. 방화벽 인바운드 허용 (관리자): 5001 · 5002 · 5003 · 5080(상태판) — 규칙 이름은 `warehouse-`로 시작 (점검 스크립트가 이 이름으로 확인)
 5. 창고 노트북 IP 고정(공유기 주소 예약) — Mobius 구독과 아두이노 `config.h`가 이 주소를 가리킴
 6. Mobius 구독 등록 (각 프로그램을 켠 상태에서, 한 번만)
@@ -63,7 +68,7 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
    cd keycap_flask; ..\venv\Scripts\python.exe make_sub.py
    cd keycap_tray;  ..\venv\Scripts\python.exe make_sub.py
    ```
-7. (선택) 서버 3개를 서비스로: NSSM `nssm.exe`를 `C:\Users\dusdn\nssm\`에 두고 관리자 PowerShell에서 `service\install_services.ps1`
+7. (선택) 서버 3개를 서비스로: NSSM `nssm.exe`를 저장소 옆 `nssm\`에 두고 관리자 PowerShell에서 `service\install_services.ps1`
 
 ## 실행 · 종료
 

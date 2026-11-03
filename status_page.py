@@ -4,22 +4,29 @@
 iPad·휴대폰·리눅스 PC 브라우저로 같은 공유기 안에서 봄. 노트북이 테이블 밑에 있을 때용.
 - 맨 위: 판정 한 문장 (가장 먼저 볼 문제)
 - 라인: 주문이 지나가는 순서대로 장비를 놓고 공장 안전 표지색 램프로 표시. 작업 중인 장비엔 고리 + 주문번호
-- 아래: 문제·주의 목록, 정상 항목은 접어 둠
+- 아래: 문제·주의 목록, 최근 작업(오늘 로그의 보고·카메라 판정 + 마지막 카메라 사진), 정상 항목은 접어 둠
 - check_all.py 점검을 REFRESH_SEC마다 돌림. 버튼 없음, 아무것도 안 바꿈 (조작은 원격 데스크톱으로)
 - 전시장엔 인터넷이 없어서 외부 글꼴·라이브러리 안 씀 (기기 기본 한글 글꼴)
 실행: start_all 이 같이 띄움 / 또는 venv\\Scripts\\python.exe status_page.py
 """
+import ast
 import html
 import json
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import check_all
 
 PORT = 5080
 REFRESH_SEC = 10       # 점검 간격 (한 번 점검에 수 초 걸림 - 끝난 뒤 이만큼 쉬고 다시)
 PAGE_REFRESH_SEC = 10  # 브라우저 자동 새로고침
+ROOT = Path(__file__).resolve().parent
+RECENT_MAX = 12        # "최근 작업"에 보여줄 개수
+LOG_TAIL_BYTES = 300_000   # 로그는 끝부분만 읽음 (하루치가 커져도 가볍게)
+CAMERA_DIR = ROOT / "board" / "board_camera_capture_log"   # board_config.CAMERA_IMAGE_DIR와 같은 곳
 
 _lock = threading.Lock()
 _latest = None         # check_all.run_checks() 결과
@@ -101,10 +108,104 @@ def _station_states(facts):
     return out
 
 
+# ============================== 최근 작업 (오늘 로그에서) ==============================
+# 로봇 프로그램 두 개의 오늘 로그 끝부분에서 "결과"만 뽑음 - 보고(done/failed), 카메라 판정, 도착 실패, 연결 끊김.
+# 로그 문구가 바뀌면 여기도 같이 고칠 것: board/main_board_robot_arm.py log(), keycap_tray/warehouse_server.py "→ 보고"
+_TS = re.compile(r"^\[(\d\d:\d\d:\d\d)\]")
+_BOARD_REPORT = re.compile(r"\] (board-robot-arm|conveyor/tray\(section(\d)\)) (재전송 성공|성공|실패)")
+_GW_REPORT = re.compile(r"→ 보고 (\S+): (\{.*\})")
+
+
+def _tail_lines(path):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - LOG_TAIL_BYTES))
+            return f.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+
+def _dict_after(line):
+    """줄 끝의 {...} (보드 main은 파이썬 dict, 게이트웨이는 JSON) -> dict, 실패하면 {}"""
+    i = line.find("{")
+    if i < 0:
+        return {}
+    for parse in (json.loads, ast.literal_eval):
+        try:
+            v = parse(line[i:])
+            return v if isinstance(v, dict) else {}
+        except (ValueError, SyntaxError):
+            pass
+    return {}
+
+
+def _ok(v):
+    return v == "done"
+
+
+def _recent_events():
+    """[(시각, 장비, 내용, 성공여부, 주문)] 최신순. 성공여부 None = 정보"""
+    today = time.strftime("%Y-%m-%d")
+    ev = []
+    for line in _tail_lines(ROOT / "board" / "logs" / f"main_{today}.log"):
+        m = _TS.match(line)
+        if not m:
+            continue
+        t = m.group(1)
+        r = _BOARD_REPORT.search(line)
+        if r:
+            what, sec, res = r.groups()
+            body = _dict_after(line)
+            oid = body.get("order_id")
+            if res == "실패":
+                ev.append((t, "보드 Flask", f"{what} 보고 실패 - 재시도 중", False, oid))
+            elif what == "board-robot-arm":
+                ev.append((t, "보드 팔", "보드 놓기 " + ("성공" if _ok(body.get("board")) else "실패"),
+                           _ok(body.get("board")), oid))
+            else:
+                ev.append((t, f"트레이 벨트 {sec}", f"section{sec} 이동", _ok(body.get("status")), oid))
+        elif "카메라 확인 결과:" in line:
+            reason = line.split("카메라 확인 결과:", 1)[1].strip()
+            ev.append((t, "카메라", reason, not ("미감지" in reason or "불일치" in reason), None))
+        elif "도달 실패" in line or "도착 실패" in line:
+            ev.append((t, "보드 팔", line.split("] ", 2)[-1][:80], False, None))
+        elif "[LINK" in line and ("끊김" in line or "재연결 성공" in line):
+            ev.append((t, "보드 팔", "USB 연결 끊김" if "끊김" in line else "재연결 성공", "재연결 성공" in line, None))
+    t = "--:--:--"
+    for line in _tail_lines(ROOT / "keycap_tray" / "logs" / f"gateway_{today}.log"):
+        m = _TS.match(line)
+        if m:
+            t = m.group(1)   # 게이트웨이 보고 줄엔 시각이 없어서 바로 앞 줄 시각을 씀
+            continue
+        r = _GW_REPORT.search(line)
+        if not r:
+            continue
+        path, body = r.group(1), _dict_after(line)
+        oid = body.get("order_id")
+        if path.endswith("cnt_tray_robot_arm"):
+            ev.append((t, "트레이 팔", "빈 트레이 투입", _ok(body.get("status")), oid))
+        elif path.endswith("cnt_keycap_conveyor"):
+            vals = [v for k, v in body.items() if k.startswith("keycap")]
+            ev.append((t, "키캡 벨트", "키캡 벨트 이동", bool(vals) and all(_ok(v) for v in vals), oid))
+        elif path.endswith("cnt_keycap_robot_arm"):
+            for k, v in body.items():
+                if k.startswith("keycap"):
+                    ev.append((t, "키캡 팔", f"{k[6:]}번 키캡 놓기", _ok(v), oid))
+    ev.sort(key=lambda e: e[0], reverse=True)   # 같은 날 HH:MM:SS 라 문자열 정렬 = 시간순
+    return ev[:RECENT_MAX]
+
+
+def _latest_camera_image():
+    """오늘 찍힌 마지막 카메라 확인 사진 (파일 이름 = YYYYMMDD_HHMMSS_<색>.jpg)"""
+    files = sorted(CAMERA_DIR.glob(time.strftime("%Y%m%d") + "_*.jpg"))
+    return files[-1] if files else None
+
+
 # ============================== 판정 / 목록 ==============================
 # 원인에 가까운 영역부터 - 네트워크가 끊기면 뒤의 항목이 줄줄이 빨갛게 되므로 맨 앞 원인을 판정으로
 SECTION_ORDER = ["설정 파일", "네트워크", "플랫폼 서버", "창고 노트북 프로그램", "로봇 프로그램 상태 (heartbeat)",
-                 "로봇 USB (COM 포트)", "Mobius 구독", "노트북 설정"]
+                 "로봇 USB (시리얼 -> COM)", "Mobius 구독", "노트북 설정"]
 
 
 def _issues(result):
@@ -198,6 +299,32 @@ body {
 .issue .msg { min-width:0; overflow-wrap:anywhere; }
 h2 { font-size:15px; margin:0 0 8px; color:var(--soft); font-weight:700; }
 
+/* 최근 작업 + 카메라 */
+.recent { display:grid; grid-template-columns:minmax(0, 1fr) 280px; gap:20px; align-items:start; }
+.events { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px; }
+.ev { display:grid; grid-template-columns:auto 7.5em minmax(0, 1fr) auto; gap:12px; align-items:baseline;
+      padding:8px 12px; background:var(--panel); border-radius:4px; font-size:14px; }
+.ev .t { color:var(--soft); }
+.ev .dev { font-weight:700; }
+.ev .what { min-width:0; overflow-wrap:anywhere; }
+.ev .oid { color:var(--soft); font-size:12px; margin-left:6px; }
+.ev .res { font-size:13px; font-weight:700; color:var(--go); white-space:nowrap; }
+.ev.fail { background:var(--stop-wash); }
+.ev.fail .res { color:var(--stop); }
+.ev .res.info { color:var(--soft); }
+.cam { margin:0; background:var(--panel); border-radius:6px; padding:10px; }
+.cam img { display:block; width:100%; height:auto; border-radius:3px; }
+.cam figcaption { font-size:13px; color:var(--soft); margin-top:6px; overflow-wrap:anywhere; }
+.cam figcaption b { color:var(--ink); }
+.cam.fail figcaption b { color:var(--stop); }
+.empty { color:var(--soft); font-size:14px; margin:0; }
+@media (max-width:760px) {
+  .recent { grid-template-columns:1fr; }
+  .ev { grid-template-columns:auto minmax(0, 1fr) auto; }
+  .ev .dev { grid-column:2; }
+  .ev .what { grid-column:1 / -1; grid-row:2; }
+}
+
 details { border-top:1px solid var(--rule); padding-top:10px; }
 summary { cursor:pointer; color:var(--soft); font-weight:700; font-size:15px; }
 summary:focus-visible { outline:3px solid var(--go); outline-offset:3px; border-radius:2px; }
@@ -214,6 +341,34 @@ JS = """
   d.addEventListener('toggle', function(){ try { sessionStorage.setItem('okOpen', d.open ? '1' : '0'); } catch(e) {} });
 })();
 """
+
+
+def _render_recent():
+    e = html.escape
+    events = _recent_events()
+    rows = []
+    for t, dev, what, ok, oid in events:
+        res = '<span class="res info">-</span>' if ok is None else \
+            f'<span class="res">{"성공" if ok else "실패"}</span>'
+        oid_html = f'<span class="oid">{e(oid)}</span>' if oid else ""
+        rows.append(f'<li class="ev{"" if ok is not False else " fail"}"><span class="t num">{e(t)}</span>'
+                    f'<span class="dev">{e(dev)}</span><span class="what">{e(what)}{oid_html}</span>{res}</li>')
+    listing = (f'<ol class="events">{"".join(rows)}</ol>' if rows
+               else '<p class="empty">오늘 기록된 작업이 없습니다.</p>')
+
+    img = _latest_camera_image()
+    if img:
+        cam_ev = next((ev for ev in events if ev[1] == "카메라"), None)
+        shot = f"{img.stem[9:11]}:{img.stem[11:13]}:{img.stem[13:15]}"   # YYYYMMDD_HHMMSS_색
+        verdict = (("판정 성공" if cam_ev[3] else "판정 실패") + f" - {cam_ev[2]}") if cam_ev else "판정 기록 없음"
+        fail = cam_ev is not None and not cam_ev[3]
+        cam = (f'<figure class="cam{" fail" if fail else ""}"><img src="/camera/latest.jpg?f={e(img.name)}" '
+               f'alt="마지막 카메라 확인 사진 ({e(shot)})" width="640" height="480">'
+               f'<figcaption><b>{e(verdict)}</b><br>마지막 카메라 확인 <span class="num">{e(shot)}</span>'
+               f' · 초록 네모 안의 보드 색 비율로 판정</figcaption></figure>')
+    else:
+        cam = '<p class="empty">오늘 찍은 카메라 사진이 없습니다.</p>'
+    return (f'<section><h2>최근 작업 (오늘, 최신순)</h2><div class="recent">{listing}{cam}</div></section>')
 
 
 def _render(result, error):
@@ -260,6 +415,8 @@ def _render(result, error):
                          f'<span class="where">{e(_section_short(where))}</span>{e(msg)}</span></div>')
         parts.append('</div></section>')
 
+    parts.append(_render_recent())
+
     parts.append(f'<details id="okbox"><summary>정상 항목 {len(ok)}개</summary><ul class="oklist">')
     for _, _, where, msg in ok:
         parts.append(f'<li><span class="where">{e(_section_short(where))}</span>{e(msg)}</li>')
@@ -281,6 +438,14 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/status.json":
             body = json.dumps({"result": result, "error": error}, ensure_ascii=False).encode("utf-8")
             ctype = "application/json; charset=utf-8"
+        elif self.path.split("?")[0] == "/camera/latest.jpg":
+            # 카메라 폴더의 오늘 마지막 사진만 내보냄 (경로를 요청에서 받지 않음)
+            img = _latest_camera_image()
+            if not img:
+                self.send_response(404)
+                self.end_headers()
+                return
+            body, ctype = img.read_bytes(), "image/jpeg"
         else:
             self.send_response(404)
             self.end_headers()

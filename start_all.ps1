@@ -20,7 +20,7 @@ $BoardDir   = Join-Path $Root 'board'                         # 보드 main + �
 $KeycapDir  = Join-Path $Root 'keycap_flask'
 $GatewayDir = Join-Path $Root 'keycap_tray'                   # 키캡 팔 2대 + 트레이 팔 + 키캡 벨트
 $GatewayEnv = Join-Path $GatewayDir '.env.local'
-$RedisDir   = 'C:\Users\dusdn\redis'                          # Windows용 Redis (저장소 밖)
+$RedisDir   = Join-Path (Split-Path $Root -Parent) 'redis'     # Windows용 Redis - 저장소 폴더 옆 (예: C:\warehouse\redis)
 $RedisConf  = Join-Path $RedisDir 'redis.warehouse.conf'
 $DobotLink  = Join-Path $env:LOCALAPPDATA 'Programs\DobotLink\DobotLink.exe'
 # 리허설 스위치는 환경 변수로 로봇 프로그램 창에 물려줌 (새 창은 이 창의 환경 변수를 이어받음)
