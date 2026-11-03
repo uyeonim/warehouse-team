@@ -10,7 +10,8 @@
 # 끌 때는 로봇 창에서 Ctrl+C (게이트웨이 -> main), 창으로 띄운 서버는 키캡 Flask -> 보드 Flask -> Redis 순서
 # -Rehearsal (start_rehearsal.bat): 로봇 프로그램 2개를 리허설 모드로 - 로봇·컨베이어·카메라는 움직인 척,
 #   보고는 실제로 나감. 실물 없이 전시장 통신 전체 시험용. DobotLink 안 켬
-param([switch]$Rehearsal)
+# -StatusOnly (status.bat, 바탕화면 '창고 점검'): 상태판만 띄우고 브라우저로 열기
+param([switch]$Rehearsal, [switch]$StatusOnly)
 $ErrorActionPreference = 'Stop'
 $Root       = $PSScriptRoot                                  # 저장소 루트
 $Python     = Join-Path $Root 'venv\Scripts\python.exe'       # 공용 가상환경 (Python 3.9, requirements.txt)
@@ -37,10 +38,19 @@ function Wait-Port($port, $sec) {
     for ($i = 0; $i -lt $sec * 2; $i++) { if (Test-Port $port) { return $true }; Start-Sleep -Milliseconds 500 }
     return $false
 }
+$UseWt = [bool](Get-Command wt.exe -ErrorAction SilentlyContinue)
 function Start-Window($title, $dir, $command) {
-    # 새 PowerShell 창에서 실행 - 창 제목으로 구분, 에러가 나도 창이 안 닫혀서 로그를 볼 수 있음
-    Start-Process powershell -WorkingDirectory $dir -ArgumentList '-NoExit', '-Command',
-        "`$host.UI.RawUI.WindowTitle = '$title'; $command"
+    # Windows Terminal 창 하나("warehouse")에 탭으로 - 탭 이름으로 구분, 에러가 나도 탭이 안 닫혀서 로그를 볼 수 있음
+    # (wt가 없으면 예전처럼 PowerShell 창 하나씩). 명령은 인코딩해서 넘김 - wt가 ';'를 자기 명령 구분자로 먹어서
+    $script = "`$host.UI.RawUI.WindowTitle = '$title'; $command"
+    if ($UseWt) {
+        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+        Start-Process wt.exe -ArgumentList ("-w warehouse new-tab --title `"$title`" --suppressApplicationTitle " +
+            "-d `"$dir`" powershell -NoExit -EncodedCommand $enc")
+        Start-Sleep -Milliseconds 800   # 연달아 띄우면 창이 따로 생길 수 있어서 앞 탭이 뜰 때까지
+    } else {
+        Start-Process powershell -WorkingDirectory $dir -ArgumentList '-NoExit', '-Command', $script
+    }
 }
 function Ensure-Server($label, $port, $service, [scriptblock]$startWindow) {
     if (Test-Port $port) { Step "$label 실행 중 ($port)"; return }
@@ -59,11 +69,20 @@ function Ensure-Server($label, $port, $service, [scriptblock]$startWindow) {
     Step "$label 실행됨 ($port, 창)"
 }
 
+$StatusUrl = 'http://127.0.0.1:5080'
+if ($StatusOnly) {
+    # 창고 점검(status.bat): 상태판만 띄우고(없으면) 브라우저로 열기 - 로봇·서버는 안 건드림
+    Ensure-Server '상태판' 5080 'warehouse-status-page' {
+        Start-Window '상태판' $Root "& '$Python' status_page.py"
+    }
+    Start-Process $StatusUrl
+    exit 0
+}
+
 # ---------------- 서버 ----------------
 Ensure-Server 'Redis' 6379 'warehouse-redis' {
     if (-not (Test-Path $RedisConf)) { Fail "Redis 설정 파일 없음: $RedisConf" }
-    Start-Process (Join-Path $RedisDir 'redis-server.exe') -ArgumentList "`"$RedisConf`"" `
-        -WorkingDirectory $RedisDir -WindowStyle Minimized
+    Start-Window 'Redis' $RedisDir "& '$(Join-Path $RedisDir 'redis-server.exe')' '$RedisConf'"
 }
 Ensure-Server '보드 Flask' 5000 'warehouse-board-flask' {
     Start-Window 'Flask' $BoardDir "& '$Python' app.py"
@@ -110,5 +129,6 @@ if ($gatewayRunning) {
     Start-Window "${Tag}키캡·트레이 게이트웨이" $GatewayDir "& '$Python' local_gateway.py --env .env.local"
     Step "${Tag}키캡·트레이 게이트웨이 실행됨"
 }
-Step '로그: 각 창 / board\logs, keycap_tray\logs 폴더 / logs 폴더(서비스)'
+Step '로그: warehouse 터미널 창의 각 탭 / board\logs, keycap_tray\logs 폴더 / logs 폴더(서비스)'
+Start-Process $StatusUrl   # 상태판을 브라우저로
 Start-Sleep -Seconds 5
