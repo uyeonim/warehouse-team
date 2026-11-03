@@ -310,8 +310,8 @@ def check_windows():
            ("허용" if "5080" in opened else "안 열림 (상태판을 다른 기기에서 못 봄)"))
 
     def ac_value(sub, setting):
-        # "현재 AC 전원 설정 색인: 0x..." 줄. 제조사 전원 구성표가 항목을 숨기면 None
-        m = re.search(r"AC.*?0x([0-9a-fA-F]{8})", run(["powercfg", "/q", "scheme_current", sub, setting]))
+        # "현재 AC 전원 설정 색인: 0x..." 줄. /qh = 제조사 구성표(ASUS Silent 등)가 숨긴 항목(덮개)까지. 못 읽으면 None
+        m = re.search(r"AC.*?0x([0-9a-fA-F]{8})", run(["powercfg", "/qh", "scheme_current", sub, setting]))
         return int(m.group(1), 16) if m else None
     sleep = ac_value("SUB_SLEEP", "STANDBYIDLE")
     lid = ac_value("4f971e89-eebd-4455-a8de-9e59040e7347", "5ca83367-6e45-459f-a27b-476b1d01c936")  # 덮개 닫기 동작
