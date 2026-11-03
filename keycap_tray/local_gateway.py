@@ -34,10 +34,11 @@ def validate_local_options(environ):
         raise RuntimeError('실전 모드는 두 팔이 트레이 자리를 번갈아 써야 합니다 (ARMS_TAKE_TURNS=1).')
     if not flag('REACT_ASSIGNED'):
         raise RuntimeError('이 작업자는 R4 투입을 담당하므로 REACT_ASSIGNED=1이 필요합니다.')
-    ports = [environ.get(name, default).strip().upper() for name, default in
-             (('SET1_PORT', 'COM6'), ('SET2_PORT', 'COM7'), ('TRAY_PORT', 'COM8'))]
+    # 팔마다 USB 시리얼(있으면) 또는 COM 포트 - 세 팔이 서로 달라야 함
+    ports = [(environ.get(f'{name}_SERIAL', '').strip() or environ.get(f'{name}_PORT', default).strip()).upper()
+             for name, default in (('SET1', 'COM6'), ('SET2', 'COM7'), ('TRAY', 'COM8'))]
     if any(not p for p in ports) or len(set(ports)) != len(ports):
-        raise RuntimeError('SET1_PORT / SET2_PORT / TRAY_PORT는 서로 다른 포트여야 합니다.')
+        raise RuntimeError('SET1 / SET2 / TRAY 의 _SERIAL(또는 _PORT)은 서로 달라야 합니다.')
     period = float(environ.get('PROCESS_POLL_SEC', '5'))
     if not math.isfinite(period) or period <= 0:
         raise RuntimeError('PROCESS_POLL_SEC는 유한한 양수여야 합니다.')

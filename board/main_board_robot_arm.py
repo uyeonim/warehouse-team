@@ -194,8 +194,9 @@ NAMESPACE_BOX = "MagicBox"
 CALL_TIMEOUT = 5
 
 # 튜닝값(좌표/컨베이어/타이밍/카메라/HSV)은 전부 board_config.py에 있음
+from usb_serial import resolve_port
 from board_config import (
-    DOBOT_PORT,
+    DOBOT_PORT, DOBOT_SERIAL, DOBOT_PORT_FALLBACK,
     PICK_POSE_ROWS, PLACE_XYZ, PLACE_R_OFFSET_DEG_BY_COLOR, HOME_XYZ, HOME_WRIST_DEG, SAFE_LIFT_MM,
     MOVE_TIMEOUT_SEC, MOVE_POLL_INTERVAL_SEC, PRECISION_SETTLE_SEC, MOBIUS_POLL_INTERVAL_SEC,
     LINK_CHECK_INTERVAL_SEC, LINK_RETRY_INTERVAL_SEC,
@@ -677,7 +678,15 @@ def _mark_link_lost(res):
 async def reconnect_robot(arm_api):
     """연결 해제 -> 다시 연결 -> 알람 해제 -> HOME. 성공하면 True.
     해제를 먼저 하는 이유: DobotLink가 끊긴 포트를 아직 열린 걸로 보고 연결을 거부할 수 있음."""
-    global link_lost
+    global link_lost, DOBOT_PORT
+    if not REHEARSAL:
+        # USB를 다시 꽂았으면 COM 번호가 바뀌었을 수 있음 -> 시리얼로 다시 찾음 (못 찾으면 다음 주기에 다시)
+        port = resolve_port(DOBOT_SERIAL, DOBOT_PORT_FALLBACK)
+        if port is None:
+            return False
+        if port != DOBOT_PORT:
+            log("LINK", f"보드 팔 COM 번호: {DOBOT_PORT} -> {port}")
+            DOBOT_PORT = port
     await safe_call(arm_api.DisconnectDobot(portName=DOBOT_PORT))
     res = await safe_call(arm_api.ConnectDobot(portName=DOBOT_PORT))
     if not is_ok(res):
@@ -1486,10 +1495,19 @@ def main():
         box_api = getattr(dobotlink, NAMESPACE_BOX)
     _arm_api = arm_api
 
-    log("INIT", f"연결 시도: {DOBOT_PORT}")
-    connect_res = loop.run_until_complete(safe_call(arm_api.ConnectDobot(portName=DOBOT_PORT)))
-    log("INIT", f"연결 결과: {connect_res}")
-    if not is_ok(connect_res):
+    if DOBOT_PORT is None and not REHEARSAL:
+        # 다른 팔 COM으로 대신 연결하면 엉뚱한 팔이 보드 좌표로 움직임 -> 연결 안 하고 시리얼이 보일 때까지 대기
+        link_lost = True
+        log("INIT", f"!! 보드 팔(USB 시리얼 {DOBOT_SERIAL})이 안 보임 - USB/전원 확인 "
+                    f"({LINK_RETRY_INTERVAL_SEC:g}초마다 다시 찾음)")
+        connect_res = None
+    else:
+        log("INIT", f"연결 시도: {DOBOT_PORT} (USB 시리얼 {DOBOT_SERIAL or '안 씀'})")
+        connect_res = loop.run_until_complete(safe_call(arm_api.ConnectDobot(portName=DOBOT_PORT)))
+        log("INIT", f"연결 결과: {connect_res}")
+    if connect_res is None:
+        pass
+    elif not is_ok(connect_res):
         # 끝내지 않고 대기 - 로봇 USB/전원/DobotLink가 나중에 준비되면 link_watchdog가 연결 + HOME
         link_lost = True
         log("INIT", f"연결 실패 - DobotLab 연결 끊겨있는지, DobotLink.exe 켜져있는지 확인 "

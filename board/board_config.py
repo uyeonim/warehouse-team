@@ -21,7 +21,12 @@ import os
 # =================================================================
 # 연결
 # =================================================================
-DOBOT_PORT = "COM3"   # 팔 + 컨베이어(Magic Box) 공유 포트 - 장치관리자에서 확인
+# COM 번호는 USB를 다시 꽂으면 바뀔 수 있어서 USB 시리얼로 찾음 (check_all.bat이 시리얼별 COM을 보여줌).
+# 시리얼을 못 찾으면 None -> main이 연결하지 않고 재연결 대기. 시리얼을 ""로 비우면 DOBOT_PORT_FALLBACK 그대로 씀
+from usb_serial import resolve_port
+DOBOT_SERIAL = "479631BC1433"   # 보드 팔 (팔 + 컨베이어 Magic Box 공유 포트)
+DOBOT_PORT_FALLBACK = "COM3"
+DOBOT_PORT = resolve_port(DOBOT_SERIAL, DOBOT_PORT_FALLBACK)
 
 # =================================================================
 # 좌표 - 픽업 (x, y, floor_z, r)

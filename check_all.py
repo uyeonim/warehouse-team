@@ -10,6 +10,7 @@ import locale
 import re
 import socket
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -262,29 +263,38 @@ def check_heartbeats(envs):
 
 
 def check_robots(envs):
-    section("로봇 USB (COM 포트)")
-    present = set(re.findall(r"\((COM\d+)\)", ps("Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match '\\(COM\\d+\\)' } "
-                                                  "| ForEach-Object { $_.Name }")))
+    section("로봇 USB (시리얼 -> COM)")
+    if str(ROOT / "board") not in sys.path:
+        sys.path.insert(0, str(ROOT / "board"))   # board_config가 usb_serial을 import
+    import usb_serial
+    usb = usb_serial.list_ports()                  # {시리얼: COM} 지금 꽂힌 Dobot
+    present = usb_serial._present_coms()
     spec = importlib.util.spec_from_file_location("board_config", ROOT / "board" / "board_config.py")
     board_config = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(board_config)
     t = envs["keycap_tray"]
-    wanted = {"보드 팔(board_config.DOBOT_PORT)": board_config.DOBOT_PORT,
-              "키캡 팔 세트1 EI·NS(SET1_PORT)": t.get("SET1_PORT"),
-              "키캡 팔 세트2 TF·PJ(SET2_PORT)": t.get("SET2_PORT"),
-              "트레이 팔(TRAY_PORT)": t.get("TRAY_PORT")}
-    used = [p for p in wanted.values() if p]
-    facts["com"] = {"board": board_config.DOBOT_PORT in present, "set1": t.get("SET1_PORT") in present,
-                    "set2": t.get("SET2_PORT") in present, "tray": t.get("TRAY_PORT") in present}
-    if len(used) != len(set(used)):
-        report("XX", f"같은 COM 포트를 두 곳에서 씀: {used}")
-    for name, port in wanted.items():
-        report("OK" if port in present else "XX", f"{name} = {port} - {'연결됨' if port in present else '안 보임 (USB/전원 확인)'}")
-    extra = present - set(used)
+    arms = {"board": ("보드 팔", board_config.DOBOT_SERIAL, board_config.DOBOT_PORT_FALLBACK),
+            "set1": ("키캡 팔 세트1 EI·NS", t.get("SET1_SERIAL"), t.get("SET1_PORT")),
+            "set2": ("키캡 팔 세트2 TF·PJ", t.get("SET2_SERIAL"), t.get("SET2_PORT")),
+            "tray": ("트레이 팔", t.get("TRAY_SERIAL"), t.get("TRAY_PORT"))}
+    used, facts["com"] = [], {}
+    for key, (name, serial, port) in arms.items():
+        serial = (serial or "").strip().upper()
+        com = usb_serial.resolve_port(serial, port, usb)
+        ok = com is not None and com in present
+        facts["com"][key] = ok
+        used.append(com)
+        how = f"시리얼 {serial}" if serial else "시리얼 미설정 - COM 번호 고정 (USB 다시 꽂으면 바뀔 수 있음)"
+        if ok:
+            report("OK" if serial else "!!", f"{name} = {com} ({how})")
+        else:
+            report("XX", f"{name} 안 보임 ({how}) - USB/전원 확인")
+    found = [c for c in used if c]
+    if len(found) != len(set(found)):
+        report("XX", f"같은 COM 포트를 두 팔이 씀: {found}")
+    extra = {s: c for s, c in usb.items() if c not in found}
     if extra:
-        report("!!", f"설정에 없는 COM 포트: {', '.join(sorted(extra))} (USB를 다른 구멍에 꽂아 번호가 바뀌었을 수 있음)")
-    if _print:
-        print("     ※ 어느 팔이 어느 번호인지는 확인 못 함 - USB 구멍 라벨대로 꽂혀 있는지 눈으로 확인")
+        report("!!", "설정에 없는 Dobot: " + ", ".join(f"{c}(시리얼 {s})" for s, c in sorted(extra.items(), key=lambda x: x[1])))
 
 
 def check_windows():

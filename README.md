@@ -29,7 +29,8 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 
 - 주문 받기: 로봇 프로그램 둘 다 **Mobius 알림 직접 수신 + 5초마다 `cnt_process/la` 조회**(알림 누락 보충). 알림은 "직전 seq와 다르면", 조회는 "클 때만" 받음.
 - Mobius 구독 (로컬 Mobius `cnt_process`): `sub_warehouse_robotarm`(→5001) · `sub_warehouse_keycap_robotarm`(→5003) · `sub_warehouse_keycap_cartridge`(→5002)
-- 로봇 프로그램은 서로 다른 COM 포트를 씀 — **USB 꽂는 구멍을 고정하고 라벨**을 붙일 것 (바뀌면 다른 팔 좌표로 움직여 충돌).
+- 로봇 팔은 **USB 시리얼로 찾음** (보드: `board_config.DOBOT_SERIAL`, 키캡·트레이: `.env.local`의 `SET1_SERIAL`·`SET2_SERIAL`·`TRAY_SERIAL`) —
+  USB를 다른 구멍에 꽂아 COM 번호가 바뀌어도 팔이 뒤바뀌지 않음. 시리얼이 안 보이면 그 팔은 연결하지 않음 (보드 main은 5초마다 다시 찾음, 게이트웨이는 켜지지 않음).
 
 ## 폴더
 
@@ -85,7 +86,7 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 | 증상 | 조치 |
 |---|---|
 | 팔이 안 움직임 / 도착 실패 | 관절 한계 알람 — 팔을 손으로 가운데로 옮기고 해당 로봇 프로그램 재시작 (`keycap_tray/참고사항.md` 1·7장) |
-| `device is not connected` | USB 확인 → 장치 관리자에서 COM 번호 확인 → 해당 로봇 프로그램 재시작 |
+| `device is not connected` / `USB 시리얼 … 안 보임` | USB·전원 확인 → `check_all.bat`의 "로봇 USB" 확인 → 해당 로봇 프로그램 재시작 |
 | 보드 main 로그 `주기 조회 실패` | 노트북 ↔ 플랫폼 서버 네트워크 확인 (Wi-Fi 자동 전환 주의, 유선 권장) |
 | 노트북 IP가 192.168.0.12가 아님 | 각 `.env`의 `NOTIFY_BASE_URL` 수정 → 구독 3개 재등록 → 아두이노 `config.h`의 `FLASK_HOST` 수정 |
 | 같은 프로그램이 두 개 뜸 | 하나 끄기. 키캡 Flask(waitress)는 같은 포트에 두 개 떠도 에러가 안 남 |

@@ -41,6 +41,7 @@ import math
 from DobotRPC import RPCClient, DobotlinkAdapter
 from DobotRPC.Utils import loggers as _dobot_loggers
 from runtime_config import PROFILE  # .env (기본) 또는 .env.local (WAREHOUSE_ENV_FILE) 을 읽음
+from usb_serial import list_ports, resolve_port
 
 _dobot_loggers.set_use_file(False)  # 실행할 때마다 폴더에 DobotRPC_날짜.log 가 쌓이지 않게 (화면 출력은 그대로)
 
@@ -86,15 +87,23 @@ ARMS_TAKE_TURNS = os.environ.get("ARMS_TAKE_TURNS", "1").strip() != "0"
 # 세트별 설정 — keycaps: (이름, 슬롯 번호, 통신 CNT 의 keycap 번호)
 # 아래 좌표는 10/8 시험 배치 값 (기본값). 실제로는 pose_set1.json / pose_set2.json 이 덮어씀
 # ---------------------------------------------------------------
+_usb_ports = list_ports()
+
+
 def _port(name, default):
-    """포트는 .env 로 바꿀 수 있음 (SET1_PORT / SET2_PORT / TRAY_PORT).
-    멀티포트 허브로 옮기거나 USB 를 다시 꽂아 번호가 바뀌어도 코드는 그대로."""
-    return (os.environ.get(name) or default).strip()
+    """.env 의 <이름>_SERIAL(USB 시리얼)이 있으면 그 팔이 지금 꽂힌 COM 을 찾아 씀 (USB 를 다시 꽂아
+    COM 번호가 바뀌어도 팔이 뒤바뀌지 않음). 시리얼을 못 찾으면 켜지 않음 — 다른 팔 COM 으로 움직이면 충돌.
+    시리얼이 없으면 예전처럼 <이름>_PORT (SET1_PORT / SET2_PORT / TRAY_PORT)."""
+    serial = os.environ.get(f"{name}_SERIAL", "")
+    port = resolve_port(serial, (os.environ.get(f"{name}_PORT") or default).strip(), _usb_ports)
+    if port is None:
+        raise RuntimeError(f"{name} 팔(USB 시리얼 {serial.strip()})이 안 보임 — USB/전원 확인 후 다시 켜기")
+    return port
 
 
 SETS = {
     "set1": {
-        "port": _port("SET1_PORT", "COM6"),
+        "port": _port("SET1", "COM6"),
         "conveyor_index": 1,
         # 2026-10-08 가림막(끝막이) 설치 후 다시 찍음
         "pickup_slots": {
@@ -108,7 +117,7 @@ SETS = {
         "keycaps": [("1번 키캡(EI)", 1, 1), ("2번 키캡(NS)", 2, 2)],
     },
     "set2": {
-        "port": _port("SET2_PORT", "COM7"),
+        "port": _port("SET2", "COM7"),
         "conveyor_index": 1,
         "conveyor_reverse": True,  # 세트2 벨트는 반대 방향 (속도·시간은 같음). 2026-11-02 도면 배치에서도 정상
         # 2026-10-08 가림막(끝막이) 설치 후 찍은 시험 배치 좌표
@@ -129,7 +138,7 @@ SETS = {
 # 좌표는 파일에서 읽음: 지금은 LAYOUT=design 의 도면 추정값. 실물 트레이가 오면 read_pose.py tray 로 찍을 것
 # (둘 다 없으면 None → 트레이 팔은 움직이지 않고 실패 보고). 여러 개 쌓였을 때 높이 변화는 아직 없음
 TRAY = {
-    "port": _port("TRAY_PORT", "COM8"),
+    "port": _port("TRAY", "COM8"),
     "pickup_slots": {1: None},   # 빈 트레이 쌓아둔 곳
     "place_slots": {1: None},    # 벨트 위 놓는 곳
     "keycaps": [("빈 트레이", 1, 1)],  # arm_set 가 쓰는 형식 (이름, 슬롯, 번호)
