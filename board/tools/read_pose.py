@@ -28,9 +28,9 @@ from board_config import DOBOT_PORT, DOBOT_SERIAL, BOARD_COLORS, NUM_ROWS, ROW_C
 
 PLACE_DROP_MM = 10.0   # board_config PLACE_XYZ 주석: 트레이에 닿는 높이 + 10mm
 # 손으로는 갈 수 있어도 명령으로는 못 가는 자리 (keycap_tray/참고사항.md 1장 실측):
-#   관절1 135°에서 한계 알람 -> 120° 여유. 반경 330mm 넘으면 명령 무시·재전송이 잦음
+#   관절1 135°에서 한계 알람 -> 참고사항 기준 ±125°. 반경 330mm 넘으면 명령 무시·재전송이 잦음
 #   2026-11-03 PLACE를 관절1 -136.6°, 반경 362mm에 찍었다가 HOME 명령이 전부 무시됨
-J1_LIMIT_DEG = 120.0
+J1_LIMIT_DEG = 125.0
 REACH_MAX_MM = 330.0
 
 
