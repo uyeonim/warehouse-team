@@ -3,10 +3,14 @@
 트레이 컨베이어 단독 구동 테스트 - 로봇암은 안 움직임.
 메인과 같은 방식으로 STP1 + STP2(벨트 2개)를 동시에 켜고, 지정 시간 뒤 정지.
 
-사용: python tools/board_conveyor_test.py [초] [속도mm/s]
-  python tools/board_conveyor_test.py          -> section1 시간(TRAY_CONVEYOR_RUN_TIME_SECTION1)만큼
+사용: python tools/board_conveyor_test.py [초|sw] [속도mm/s]
+  python tools/board_conveyor_test.py          -> 스톱워치: Enter로 출발, 트레이가 자리에 오면 Enter로 정지 -> 걸린 시간 출력
+                                                  (여러 구간 연달아 재고 q로 끝내면 전부 다시 출력)
   python tools/board_conveyor_test.py 5        -> 5초
   python tools/board_conveyor_test.py 5 30     -> 5초, 30mm/s
+  python tools/board_conveyor_test.py sw 30    -> 스톱워치, 30mm/s
+스톱워치 시간 = 메인과 같은 기준(구동 명령 응답 후 ~ 정지 명령 전) -> board_config의
+TRAY_CONVEYOR_RUN_TIME_SECTION* 에 그대로 넣으면 됨 (Enter 누르는 반응만큼 0.2~0.3초 길게 나올 수 있음)
 
 !! 메인(main_board_robot_arm.py) 끄고 실행할 것 - 같은 포트(Magic Box)를 씀
 """
@@ -14,6 +18,7 @@
 import asyncio
 import math
 import sys
+import time
 
 from DobotRPC import RPCClient, DobotlinkAdapter
 
@@ -21,7 +26,8 @@ import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # 루트의 board_config.py
 from board_config import (
     DOBOT_PORT, TRAY_CONVEYOR_STP_1, TRAY_CONVEYOR_STP_2,
-    TRAY_CONVEYOR_SPEED_MM_S, TRAY_CONVEYOR_RUN_TIME_SECTION1,
+    TRAY_CONVEYOR_SPEED_MM_S, TRAY_CONVEYOR_RUN_TIME_SECTION0,
+    TRAY_CONVEYOR_RUN_TIME_SECTION1, TRAY_CONVEYOR_RUN_TIME_SECTION2,
 )
 
 _MM_TO_PULSE = (360.0 / 1.8 * 5.0 * 16.0) / (3.1415926535898 * 32)
@@ -51,17 +57,47 @@ async def stop_both(box_api):
     )
 
 
+async def start_both(box_api, speed_mm_s):
+    return await asyncio.gather(
+        set_conveyor(box_api, TRAY_CONVEYOR_STP_1, True, speed_mm_s),
+        set_conveyor(box_api, TRAY_CONVEYOR_STP_2, True, speed_mm_s),
+    )
+
+
+async def stopwatch(box_api, speed_mm_s):
+    """Enter로 출발 -> Enter로 정지, 구간마다 걸린 시간 기록. input()이 막고 있는 동안에도 벨트는 계속 돎"""
+    print(f"[SW] 스톱워치 ({speed_mm_s}mm/s). 지금 설정: section0 {TRAY_CONVEYOR_RUN_TIME_SECTION0}초 / "
+          f"section1 {TRAY_CONVEYOR_RUN_TIME_SECTION1}초 / section2 {TRAY_CONVEYOR_RUN_TIME_SECTION2}초")
+    laps = []
+    while True:
+        name = input("\n트레이를 출발 자리에 놓고 Enter (구간 이름 적어도 됨, 예: section1 / q=끝): ").strip()
+        if name.lower() == "q":
+            break
+        r1, r2 = await start_both(box_api, speed_mm_s)
+        t0 = time.monotonic()
+        print(f"[SW] 출발 (STP1={r1}, STP2={r2}) - 트레이가 자리에 오면 Enter")
+        input()
+        elapsed = time.monotonic() - t0
+        s1, s2 = await stop_both(box_api)
+        laps.append((name or f"#{len(laps) + 1}", elapsed))
+        print(f"[SW] 정지 (STP1={s1}, STP2={s2}) - 걸린 시간 {elapsed:.2f}초")
+    if laps:
+        print("\n=== 잰 시간 ===")
+        for name, sec in laps:
+            print(f"  {name}: {sec:.2f}초")
+
+
 async def main(arm_api, box_api, run_time, speed_mm_s):
     print(f"[INIT] 연결 시도: {DOBOT_PORT}")
     print(f"[INIT] 연결 결과: {await safe_call(arm_api.ConnectDobot(portName=DOBOT_PORT))}")
 
     try:
+        if run_time is None:
+            await stopwatch(box_api, speed_mm_s)
+            return
         print(f"[CONV] 구동 시작 (STP{TRAY_CONVEYOR_STP_1 + 1}+STP{TRAY_CONVEYOR_STP_2 + 1}, "
               f"{speed_mm_s}mm/s, {run_time}초)")
-        r1, r2 = await asyncio.gather(
-            set_conveyor(box_api, TRAY_CONVEYOR_STP_1, True, speed_mm_s),
-            set_conveyor(box_api, TRAY_CONVEYOR_STP_2, True, speed_mm_s),
-        )
+        r1, r2 = await start_both(box_api, speed_mm_s)
         print(f"[CONV] 시작 결과: STP1={r1}, STP2={r2}")
         await asyncio.sleep(run_time)
     finally:
@@ -71,7 +107,7 @@ async def main(arm_api, box_api, run_time, speed_mm_s):
 
 
 if __name__ == "__main__":
-    run_time = float(sys.argv[1]) if len(sys.argv) > 1 else TRAY_CONVEYOR_RUN_TIME_SECTION1
+    run_time = None if len(sys.argv) < 2 or sys.argv[1].lower() == "sw" else float(sys.argv[1])  # None = 스톱워치
     speed = float(sys.argv[2]) if len(sys.argv) > 2 else TRAY_CONVEYOR_SPEED_MM_S
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
