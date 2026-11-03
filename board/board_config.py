@@ -142,9 +142,10 @@ POSITION_TOLERANCE_DEG = 2.0
 TRAY_CONVEYOR_STP_1 = 0
 TRAY_CONVEYOR_STP_2 = 1
 TRAY_CONVEYOR_SPEED_MM_S = 50
-TRAY_CONVEYOR_RUN_TIME_SECTION0 = 3.2    # keycap_dispensed -> 키캡 로봇암 앞까지 (초)
-TRAY_CONVEYOR_RUN_TIME_SECTION1 = 12.5   # keycap_packed -> 보드 로봇암 앞까지 (초)
-TRAY_CONVEYOR_RUN_TIME_SECTION2 = 6.5    # board_packed  -> 픽업대까지 (초)
+TRAY_CONVEYOR_RUN_TIME_SECTION0 = 2.6    # keycap_dispensed -> 키캡 로봇암 앞까지 (초)
+TRAY_CONVEYOR_RUN_TIME_SECTION1 = 14.3   # keycap_packed -> 보드 로봇암 앞까지 (초)
+TRAY_CONVEYOR_RUN_TIME_SECTION2 = 4.3    # board_packed  -> 픽업대까지 (초)
+# 2026-11-03 전시장 실측 (board_conveyor_test.py 스톱워치 2.84 / 14.55 / 4.53초 - Enter 반응 0.2초 뺌). 예전 3.2 / 12.5 / 6.5
 
 # =================================================================
 # 카메라 (트레이 위 고정 카메라 - 2026-10-07 로봇암에서 분리. 팔이 HOME으로 돌아간 뒤 촬영)
