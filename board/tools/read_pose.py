@@ -16,6 +16,7 @@
 """
 
 import asyncio
+import math
 import time
 
 from DobotRPC import RPCClient, DobotlinkAdapter
@@ -26,6 +27,22 @@ _sys.path.insert(0, _BOARD)  # 루트의 board_config.py
 from board_config import DOBOT_PORT, DOBOT_SERIAL, BOARD_COLORS, NUM_ROWS, ROW_CAPACITY, BOARD_THICKNESS_MM
 
 PLACE_DROP_MM = 10.0   # board_config PLACE_XYZ 주석: 트레이에 닿는 높이 + 10mm
+# 손으로는 갈 수 있어도 명령으로는 못 가는 자리 (keycap_tray/참고사항.md 1장 실측):
+#   관절1 135°에서 한계 알람 -> 120° 여유. 반경 330mm 넘으면 명령 무시·재전송이 잦음
+#   2026-11-03 PLACE를 관절1 -136.6°, 반경 362mm에 찍었다가 HOME 명령이 전부 무시됨
+J1_LIMIT_DEG = 120.0
+REACH_MAX_MM = 330.0
+
+
+def reach_warning(x, y):
+    """명령으로 못 갈 수 있는 자리면 이유, 괜찮으면 빈 문자열 (관절1 = 베이스 각도 atan2(y, x))"""
+    j1, radius = math.degrees(math.atan2(y, x)), math.hypot(x, y)
+    bad = []
+    if abs(j1) > J1_LIMIT_DEG:
+        bad.append(f"관절1 {j1:.1f}° (±{J1_LIMIT_DEG:g}° 넘음)")
+    if radius > REACH_MAX_MM:
+        bad.append(f"반경 {radius:.0f}mm ({REACH_MAX_MM:g}mm 넘음)")
+    return ", ".join(bad)
 
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
@@ -79,11 +96,15 @@ def main():
             if not cmd and memo:
                 record(lines, log_path, f"# {memo}")
                 continue
-            note = f", {memo}" if memo else ""
             pose = get_pose()
             if pose is None:
                 continue
             x, y, z, r = pose["x"], pose["y"], pose["z"], pose["r"]
+            warn = reach_warning(x, y)
+            if warn:
+                print(f"!! 명령으로 못 갈 수 있는 자리: {warn} - 자리를 팔 쪽/앞쪽으로 옮길 것")
+                memo = f"{memo} / !! {warn}" if memo else f"!! {warn}"
+            note = f", {memo}" if memo else ""
             if not cmd:
                 print(f"지금: x={x:.1f} y={y:.1f} z={z:.1f} r={r:.1f}")
                 if memo:
