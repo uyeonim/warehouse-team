@@ -1417,7 +1417,8 @@ def check_board_restock(data):
             handled_restock.discard(color)
 
 
-# ---- 플랫폼 하드리셋 (cnt_process에 "reset": true. orders가 빈 것만으론 아님 - restock 스냅샷도 비어서 옴) ----
+# ---- 플랫폼 하드리셋: orders가 비었고 keycap_restock·board_restock도 없음 (또는 "reset": true) ----
+# restock 스냅샷도 주문이 없으면 orders: {} 로 오므로 restock 목록이 있으면 하드리셋 아님. 키캡 Flask _is_platform_reset()과 같은 기준
 # 재고 초기화는 키캡 Flask가 한 곳에서 함(같은 Redis) -> 여기선 주문 기억을 비우고, 초기화가 끝났을
 # 즈음 재고를 다시 읽음. 큐·게이트·컨베이어 기억은 "목록에서 사라진 주문" 정리로 이미 비워짐
 HARD_RESET_STOCK_RELOAD_SEC = (5, 15)   # 키캡 Flask가 알림을 놓쳐 5초 조회로 늦게 리셋해도 따라가게 두 번
@@ -1425,12 +1426,14 @@ _stock_reload_at = []
 
 
 def check_hard_reset(data):
-    if data.get("reset") is not True:
+    is_reset = data.get("reset") is True or (
+        data.get("orders") == {} and not data.get("keycap_restock") and not data.get("board_restock"))
+    if not is_reset:
         return
     processed_job_keys.clear()
     now = time.time()
     _stock_reload_at[:] = [now + s for s in HARD_RESET_STOCK_RELOAD_SEC]
-    log("RESET", "플랫폼 하드리셋(reset 표시) - 픽업 기록 비움, 재고는 키캡 Flask 초기화 뒤 다시 읽음")
+    log("RESET", "플랫폼 하드리셋(빈 주문 목록) - 픽업 기록 비움, 재고는 키캡 Flask 초기화 뒤 다시 읽음")
 
 
 STOCK_RESYNC_SEC = 30   # 쉬는 동안 이 간격으로 보드 Flask 재고를 다시 읽음 (reset_stock.bat·숫자 정정을 재시작 없이 반영)

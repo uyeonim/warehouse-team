@@ -675,10 +675,11 @@ def clear_gate(board):
 # [11/04] 키캡 pool:{letter}_{color}도 하드리셋 때 KEYCAP_TOTAL_PER_COLOR - RAIL_CAPACITY로 되돌림
 #   (예전엔 키캡 pool은 안 건드려서 redis-cli로 직접 넣어야 했음)
 #
-# [11/04] 자동 하드리셋: 플랫폼이 cnt_process에 "reset": true 를 실어 보내면 _relay()가 위 하드리셋을
+# [11/04] 자동 하드리셋: 플랫폼 하드리셋 스냅샷(_is_platform_reset)이 오면 _relay()가 위 하드리셋을
 #   한 번 실행하고, 아두이노 4대가 자기 RAM의 수량을 맞추도록
-#   ※ "orders가 빈 스냅샷"으로 판단하면 안 됨 - 플랫폼은 주문이 없을 때 restock 스냅샷도 orders: {} 로 보냄
-#     (2026-11-04 22:16:18 seq 152 {"orders": {}, "keycap_restock": ["E_r"]}). reset 표시는 플랫폼팀과 합의 필요
+#   하드리셋 = orders가 비었고 keycap_restock·board_restock도 없음 (11/04 22:57:19 seq 177 {"orders": {}}).
+#   restock 스냅샷도 주문이 없으면 orders: {} 로 오므로(22:16:18 seq 152 {"orders": {}, "keycap_restock": ["E_r"]})
+#   restock 목록이 있으면 하드리셋이 아님. "reset": true 를 실어 보내도 하드리셋
 #   그 스냅샷에 keycap_restock(32칸 전부)을 실어 보냄. 아두이노는 기존 재보충 기능으로 /restock/<글자>/<색>을
 #   부르는데, 리셋 직후(RESET_RESTOCK_WINDOW_SEC)엔 pool을 빼지 않고 지금 stock만 돌려줌.
 #   disable 칸은 수량만 바뀌고 disable 유지 (아두이노 펌웨어가 restock으로 disable을 안 풂).
@@ -716,9 +717,18 @@ def _upload_reset_to_mobius():
     return [k for k, ok in results.items() if not ok]
 
 
+def _is_platform_reset(con):
+    """플랫폼 하드리셋 스냅샷인지 - 보드 main check_hard_reset()과 같은 기준"""
+    if not isinstance(con, dict):
+        return False
+    if con.get("reset") is True:
+        return True
+    return con.get("orders") == {} and not con.get("keycap_restock") and not con.get("board_restock")
+
+
 def _auto_hard_reset(con):
-    """"reset": true 스냅샷이면 한 번만 하드리셋. 했으면 아두이노에 보낼 스냅샷(keycap_restock 32칸 포함)을 반환"""
-    if not isinstance(con, dict) or con.get("reset") is not True:
+    """하드리셋 스냅샷이면 한 번만 하드리셋. 했으면 아두이노에 보낼 스냅샷(keycap_restock 32칸 포함)을 반환"""
+    if not _is_platform_reset(con):
         return None
     reset_id = f"{con.get('seq')}|{con.get('updated_at')}"
     with _reset_lock:
@@ -727,7 +737,7 @@ def _auto_hard_reset(con):
         _do_hard_reset()
         redis.set("reset:last_id", reset_id)
         redis.set("reset:restock_window", 1, ex=RESET_RESTOCK_WINDOW_SEC)
-    logger.info(f"[reset] 플랫폼 하드리셋 감지 (reset 표시, seq={con.get('seq')}) -> 재고·pool·큐·게이트 초기화")
+    logger.info(f"[reset] 플랫폼 하드리셋 감지 (빈 주문 목록, seq={con.get('seq')}) -> 재고·pool·큐·게이트 초기화")
     return dict(con, keycap_restock=_all_keycap_letter_colors())
 # ============================================================
 def _all_keycap_letter_colors():
