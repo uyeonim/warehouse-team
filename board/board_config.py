@@ -143,10 +143,10 @@ TRAY_CONVEYOR_STP_1 = 0
 TRAY_CONVEYOR_STP_2 = 1
 TRAY_CONVEYOR_SPEED_MM_S = 50
 TRAY_CONVEYOR_RUN_TIME_SECTION0 = 2.6    # keycap_dispensed -> 키캡 로봇암 앞까지 (초)
-TRAY_CONVEYOR_RUN_TIME_SECTION1 = 3.8    # keycap_packed -> 보드 로봇암 앞까지 (초)
-TRAY_CONVEYOR_RUN_TIME_SECTION2 = 13.2   # board_packed  -> 픽업대까지 (초)
+TRAY_CONVEYOR_RUN_TIME_SECTION1 = 4.0    # keycap_packed -> 보드 로봇암 앞까지 (초)
+TRAY_CONVEYOR_RUN_TIME_SECTION2 = 13.5   # board_packed  -> 픽업대까지 (초)
 # 2026-11-03 실측 2.84 / 14.55 / 4.53초 (예전 3.2 / 12.5 / 6.5)
-# 2026-11-04 배치 변경 후 section1·2 재실측 3.92·3.99 / 13.38초 (스톱워치, Enter 반응 0.2초 뺌). section0은 11-03 값
+# 2026-11-04 배치 변경 후 section1·2 재실측 3.92·3.99 / 13.38초 (스톱워치) -> 4.0 / 13.5초로 지정. section0은 11-03 값
 
 # =================================================================
 # 카메라 (트레이 위 고정 카메라 - 2026-10-07 로봇암에서 분리. 팔이 HOME으로 돌아간 뒤 촬영)
