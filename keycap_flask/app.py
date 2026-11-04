@@ -201,14 +201,14 @@ def hello():
 # ============================================================
 @app.route("/notify/<kind>", methods=["POST"])
 def notify(kind):
-    logger.info(f"[notify/{kind}] 요청 수신됨 (여기 찍히면 최소한 도달은 한 것)")
+    logger.debug(f"[notify/{kind}] 요청 수신됨")   # 원본 덤프는 DEBUG로 (11/05 - 한 줄에 스냅샷이 4번씩 찍혀서 못 읽었음)
 
     if kind not in TOPICS:
         logger.warning(f"[notify/{kind}] 등록 안 된 kind, 404 리턴")
         abort(404)
 
     raw_body = request.get_data(as_text=True)
-    logger.info(f"[notify/{kind}] raw body: {raw_body}")
+    logger.debug(f"[notify/{kind}] raw body: {raw_body}")
 
     data = request.get_json(force=True, silent=True) or {}
     if not data:
@@ -228,17 +228,36 @@ def notify(kind):
         return "", 200
 
     con = cin.get("con")
-    logger.info(f"[notify/{kind}] cin 찾음. con(raw): {con}")
+    logger.debug(f"[notify/{kind}] cin 찾음. con(raw): {con}")
 
     if isinstance(con, str):
         try:
             con = json.loads(con)
-            logger.info(f"[notify/{kind}] con JSON 파싱 성공: {con}")
         except ValueError as e:
             logger.error(f"[notify/{kind}] con JSON 파싱 실패: {e}, con 원본: {con}")
 
     _relay(kind, con, "알림")
     return "", 200
+
+
+def _summary(con):
+    """스냅샷을 사람이 읽기 좋게: 주문 하나에 한 줄 + 보충 신호 (로그용)"""
+    if not isinstance(con, dict):
+        return f"    {con}"
+    lines = []
+    for oid, o in (con.get("orders") or {}).items():
+        o = o if isinstance(o, dict) else {}
+        colors = ",".join(o.get("colors") or [])
+        fault = f"  fault={o.get('fault')}" if o.get("fault") else ""
+        lines.append(f"    {oid:<24} {str(o.get('status')):<16} {o.get('board')} {o.get('keycap')} [{colors}]{fault}")
+    if not lines:
+        lines.append("    (주문 없음)")
+    for key in ("keycap_restock", "board_restock"):
+        if con.get(key):
+            lines.append(f"    {key}: {', '.join(map(str, con[key]))}")
+    if con.get("reset"):
+        lines.append("    reset: true")
+    return "\n".join(lines)
 
 
 def _relay(kind, con, via):
@@ -252,9 +271,11 @@ def _relay(kind, con, via):
     if ok:
         with _relay_lock:
             _last_relayed = payload
-        logger.info(f"[{kind}] → MQTT 전송 완료(retain, {via}): {payload}")
+        seq = (reset_con or con).get("seq") if isinstance(con, dict) else "?"
+        logger.info(f"[{kind}] seq {seq} → MQTT 전송 완료 ({via})\n{_summary(reset_con or con)}")
     else:
-        logger.error(f"[{kind}] → MQTT 전송 실패({via}): {payload}")
+        logger.error(f"[{kind}] → MQTT 전송 실패 ({via})\n{_summary(reset_con or con)}")
+    logger.debug(f"[{kind}] payload: {payload}")
     if reset_con is not None:
         failed = _upload_reset_to_mobius()
         logger.info(f"[reset] 하드리셋 모비우스 업로드 실패: {failed if failed else '없음'}")

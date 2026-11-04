@@ -41,13 +41,16 @@ function Wait-Port($port, $sec) {
 }
 $UseWt = [bool](Get-Command wt.exe -ErrorAction SilentlyContinue)
 function Start-Window($title, $dir, $command) {
-    # Windows Terminal 창 하나("warehouse")에 탭으로 - 탭 이름으로 구분, 에러가 나도 탭이 안 닫혀서 로그를 볼 수 있음
-    # (wt가 없으면 예전처럼 PowerShell 창 하나씩). 명령은 인코딩해서 넘김 - wt가 ';'를 자기 명령 구분자로 먹어서
+    # Windows Terminal 창 하나("warehouse")에 탭으로 - 탭 이름으로 구분 (wt가 없으면 예전처럼 PowerShell 창 하나씩)
+    # 프로그램이 끝나면(Ctrl+C·에러) 'exit 1'로 끝내서 탭이 남음 -> 로그를 볼 수 있고, 그 탭에서 Enter = 같은 명령으로
+    # 다시 시작, Ctrl+D = 탭 닫기 (wt 1.18+ 기능). 코드 고친 뒤 창고 시작을 다시 눌러 탭이 쌓이지 않게 (11/05)
+    # 명령은 인코딩해서 넘김 - wt가 ';'를 자기 명령 구분자로 먹어서
     $script = "`$host.UI.RawUI.WindowTitle = '$title'; $command"
     if ($UseWt) {
-        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(
+            "$script; Write-Host ''; Write-Host '[$title] 꺼짐 - Enter = 다시 시작, Ctrl+D = 탭 닫기' -ForegroundColor Yellow; exit 1"))
         Start-Process wt.exe -ArgumentList ("-w warehouse new-tab --title `"$title`" --suppressApplicationTitle " +
-            "-d `"$dir`" powershell -NoExit -EncodedCommand $enc")
+            "-d `"$dir`" powershell -EncodedCommand $enc")
         Start-Sleep -Milliseconds 800   # 연달아 띄우면 창이 따로 생길 수 있어서 앞 탭이 뜰 때까지
     } else {
         Start-Process powershell -WorkingDirectory $dir -ArgumentList '-NoExit', '-Command', $script
