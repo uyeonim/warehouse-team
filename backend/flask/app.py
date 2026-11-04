@@ -25,6 +25,18 @@ load_dotenv()
 #  - 실행(Windows): gunicorn은 Windows에서 안 돌아감 -> waitress 사용
 #      pip install waitress
 #      waitress-serve --listen=0.0.0.0:5002 app:app
+#
+# [2026-11-04] cnt_process MQTT 발행을 retain=True로 변경
+#  - 브로커가 마지막 스냅샷을 들고 있다가, 아두이노가 (재)접속해서 구독하는 순간 바로 보내줌.
+#    cnt_process는 "진행 중인 주문 전체" 스냅샷이라, 끊긴 사이에 놓친 주문도 다 들어 있음.
+#  - 11/03 테스트에서 아두이노가 "연결됨 + 수신 불가" 상태로 굳은 문제 대응의 일부.
+#    아두이노 쪽은 구독 실패 시 재연결 + 자기 에코(핑) 확인으로 재접속하고, 재접속 직후
+#    이 retained 스냅샷으로 최신 주문 목록을 다시 받음.
+#  - 같은 토픽을 구독하는 다른 클라이언트(로봇팔 main.py 등)도 접속할 때마다 마지막
+#    스냅샷을 받으므로, 같은 스냅샷을 다시 받아도 중복 동작하지 않는지 확인할 것.
+#  - 아두이노 수정본(11/04: wasHandled/복원 재시도)을 4대 모두 올린 뒤에 이 Flask를
+#    적용할 것. 구버전 아두이노는 재부팅 직후 retained 스냅샷을 받아 이미 배출한 주문을
+#    다시 큐에 넣을 수 있음.
 # ============================================================
 _redis_url = os.getenv("REDIS_URL")
 if _redis_url:
@@ -111,7 +123,10 @@ def publish(topic: str, payload: str) -> bool:
     try:
         c.connect(MQTT_HOST, MQTT_PORT, keepalive=10)
         c.loop_start()
-        info = c.publish(topic, payload, qos=1)
+        # [11/04] retain=True: 브로커가 마지막 스냅샷을 보관했다가 새로 구독하는
+        # 클라이언트(재접속/재부팅한 아두이노)에게 바로 보내줌. 지금 이 함수는
+        # cnt_process 스냅샷 발행에만 쓰이므로 여기서 일괄 적용함.
+        info = c.publish(topic, payload, qos=1, retain=True)
         info.wait_for_publish(timeout=5)
         return info.is_published()
     except Exception as e:
@@ -177,6 +192,7 @@ def hello():
 # ============================================================
 # 인바운드: Mobius --웹훅--> Flask --publish--> MQTT
 # con 내용은 파싱하지 않고 그대로 relay만 함 (orders/restock 처리는 아두이노 담당)
+# [11/04] publish()가 retain=True로 보내므로, 마지막 스냅샷이 브로커에 보관됨
 # ============================================================
 @app.route("/notify/<kind>", methods=["POST"])
 def notify(kind):
@@ -219,7 +235,7 @@ def notify(kind):
     payload = json.dumps(con, ensure_ascii=False)
     ok = publish(TOPICS[kind], payload)
     if ok:
-        logger.info(f"[{kind}] → MQTT 전송 완료: {payload}")
+        logger.info(f"[{kind}] → MQTT 전송 완료(retain): {payload}")
     else:
         logger.error(f"[{kind}] → MQTT 전송 실패: {payload}")
 
@@ -506,6 +522,7 @@ def restock_letter_color(letter, color):
 # 대기하는 상태를 Redis에 영속화. 아두이노 재부팅 시 로컬 RAM(gateOpen/gateOrderId)이
 # 유실되므로, 부팅 시 이걸 조회해서 복원함.
 # Redis 키: gate:{board}  (값 = 대기 중인 order_id, 키 자체가 없으면 "열림" 상태)
+# [11/04] 아두이노는 이 게이트 order_id를 "이미 배출한 주문"으로도 씀 (재부팅 후 중복 적재 방지)
 # ============================================================
 def _gate_key(board: str) -> str:
     return f"gate:{board}"
