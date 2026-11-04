@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import redis as redis_lib
+import requests
 
 import check_all
 
@@ -30,6 +31,7 @@ RECENT_MAX = 12        # "최근 작업"에 보여줄 개수
 LOG_TAIL_BYTES = 300_000   # 로그는 끝부분만 읽음 (하루치가 커져도 가볍게)
 CAMERA_DIR = ROOT / "board" / "board_camera_capture_log"   # board_config.CAMERA_IMAGE_DIR와 같은 곳
 REDIS_URL = "redis://127.0.0.1:6379/0"   # 보드·키캡 Flask와 같은 Redis (.env REDIS_URL)
+KEYCAP_FLASK_URL = "http://127.0.0.1:5002"   # 고장 칸 복구 버튼이 부름
 
 # ============================== 카트리지 칸 (키캡 32칸 + 보드 4색) ==============================
 # 키캡 Flask가 아두이노 보고(/report/keycap-status)를 받을 때마다 쓰는 Redis status:/stock: 값을 그대로 보여줌
@@ -367,6 +369,10 @@ h2 { font-size:15px; margin:0 0 8px; color:var(--soft); font-weight:700; }
 .boardrow th, .boardrow td { border-top:2px solid var(--rule); }
 .legend { font-size:12px; color:var(--soft); margin:6px 0 0; }
 .rail .of { font-size:12px; font-weight:400; color:var(--soft); margin-left:1px; }
+.rail .fix { display:block; margin:5px auto 0; font:inherit; font-size:12px; font-weight:700; color:#fff; background:var(--stop);
+             border:0; border-radius:4px; padding:4px 10px; min-height:28px; cursor:pointer; }
+.rail .fix:focus-visible { outline:3px solid var(--ink); outline-offset:2px; }
+.rail .fix:disabled { opacity:.5; cursor:default; }
 .rail .bar { display:block; height:4px; margin:4px 6px 2px; background:var(--rule); border-radius:2px; overflow:hidden; }
 .rail .bar i { display:block; height:100%; background:var(--go); }
 .rail.warn .bar i { background:var(--caution); }
@@ -436,6 +442,25 @@ JS = """
   var saved = 0; try { saved = parseInt(sessionStorage.getItem('stockPane') || '0', 10) || 0; } catch(e) {}
   if (saved) go(saved);
 })();
+(function(){
+  // 고장 칸 "복구": 칸 이름을 직접 입력해야 보냄 (관람객 폰에서 잘못 눌러도 안 나가게)
+  document.querySelectorAll('.rail .fix').forEach(function(b){
+    b.addEventListener('click', function(){
+      var rail = b.getAttribute('data-rail');
+      var typed = window.prompt(rail + ' 칸의 고장 표시를 풉니다 (아두이노에 복구 명령).\\n' +
+        '실패했던 주문을 다시 배출하지는 않습니다 - 다시 배출하려면 플랫폼에서 fault 해제.\\n' +
+        '진행하려면 ' + rail + ' 를 입력하세요.');
+      if (typed === null) return;
+      if (typed.trim() !== rail) { window.alert('칸 이름이 달라서 취소했습니다.'); return; }
+      b.disabled = true; b.textContent = '보내는 중';
+      fetch('/repair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rail: rail }) })
+        .then(function(r){ return r.json().then(function(j){ return { ok: r.ok, j: j }; }); })
+        .then(function(x){ window.alert(x.ok ? rail + ' 복구 명령을 보냈습니다. 몇 초 뒤 대기로 바뀌면 됩니다 (배출 중이면 끝난 뒤 다시).'
+                                             : '복구 명령 실패: ' + (x.j.error || JSON.stringify(x.j))); location.reload(); })
+        .catch(function(err){ window.alert('복구 명령 실패: ' + err); b.disabled = false; b.textContent = '복구'; });
+    });
+  });
+})();
 """
 
 
@@ -453,7 +478,9 @@ def _render_rails(rails):
         status, count, _ = rails[key]
         cls, word = RAIL_STATE.get(status, ("warn", status))
         num = "-" if count is None else str(count)
-        return f'<td class="rail {cls}"><span class="n num">{e(num)}</span><span class="s">{e(word)}</span></td>'
+        fix = (f'<button type="button" class="fix" data-rail="{e(key)}">복구</button>'
+               if status == "disable" and not key.startswith("board_") else "")
+        return f'<td class="rail {cls}"><span class="n num">{e(num)}</span><span class="s">{e(word)}</span>{fix}</td>'
 
     def total_cell(key, original):
         _, count, pool = rails[key]
@@ -580,7 +607,7 @@ def _render(result, error):
 
     err = f" 마지막 점검에서 오류가 났습니다: {e(error)}" if error else ""
     parts.append(f'<footer>마지막 점검 <span class="num">{e(result["time"])}</span>, {PAGE_REFRESH_SEC}초마다 새로 고칩니다.'
-                 f' 이 화면은 보기 전용입니다. 조작은 원격 데스크톱으로, 위험하면 로봇 전원 스위치를 끕니다.{err}</footer>')
+                 f' 이 화면은 보기 전용입니다 (고장 칸 복구 버튼만 예외). 조작은 원격 데스크톱으로, 위험하면 로봇 전원 스위치를 끕니다.{err}</footer>')
     parts.append(f'</main><script>{JS}</script></body></html>')
     return "".join(parts)
 
@@ -612,6 +639,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):
+        # 이 화면에서 유일한 조작: 고장 칸 복구 -> 키캡 Flask /repair/<칸> (아두이노에 MQTT 복구 명령, 칸 상태만 되돌림)
+        if self.path != "/repair":
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            length = min(int(self.headers.get("Content-Length") or 0), 1024)
+            rail = json.loads(self.rfile.read(length) or b"{}").get("rail")
+        except (ValueError, AttributeError):
+            rail = None
+        valid = {f"{letter}_{c}" for _, letter in KEYCAP_ROWS for c, _ in RAIL_COLORS}
+        if rail not in valid:
+            code, body = 400, {"error": "없는 칸"}
+        else:
+            try:
+                r = requests.post(f"{KEYCAP_FLASK_URL}/repair/{rail}", timeout=8)
+                code, body = r.status_code, r.json()
+            except Exception as e:
+                code, body = 502, {"error": f"키캡 Flask 응답 없음 ({type(e).__name__})"}
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def log_message(self, fmt, *args):
         pass   # 요청마다 찍히는 접속 로그 끔

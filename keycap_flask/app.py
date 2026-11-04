@@ -120,7 +120,7 @@ def _new_mqtt_client():
         return mqtt.Client()
 
 
-def publish(topic: str, payload: str) -> bool:
+def publish(topic: str, payload: str, retain: bool = True) -> bool:
     c = _new_mqtt_client()
     if MQTT_USER:  # 계정이 설정된 경우에만 인증 (비어있으면 익명 접속)
         c.username_pw_set(MQTT_USER, MQTT_PASS)
@@ -129,9 +129,9 @@ def publish(topic: str, payload: str) -> bool:
         c.connect(MQTT_HOST, MQTT_PORT, keepalive=10)
         c.loop_start()
         # [11/04] retain=True: 브로커가 마지막 스냅샷을 보관했다가 새로 구독하는
-        # 클라이언트(재접속/재부팅한 아두이노)에게 바로 보내줌. 지금 이 함수는
-        # cnt_process 스냅샷 발행에만 쓰이므로 여기서 일괄 적용함.
-        info = c.publish(topic, payload, qos=1, retain=True)
+        # 클라이언트(재접속/재부팅한 아두이노)에게 바로 보내줌 (cnt_process 스냅샷).
+        # 복구 명령(REPAIR_TOPIC)은 retain=False - retain이면 재접속할 때마다 복구가 또 실행됨 (키캡팀 11/04)
+        info = c.publish(topic, payload, qos=1, retain=retain)
         info.wait_for_publish(timeout=5)
         return info.is_published()
     except Exception as e:
@@ -333,6 +333,11 @@ def report_keycap_status():
         redis.set(f"stock:{letter_color}", count)
     # status(정상/고장 등)도 같이 저장해둠 — restock/모비우스 리셋 시 이 값을 그대로 씀
     redis.set(f"status:{letter_color}", status)
+    # [11/04] 고장 사유도 보관 - 재보충·리셋 뒤 Mobius에 올릴 때 disable과 사유를 그대로 유지 (키캡팀 요청)
+    if status == "disable":
+        redis.set(f"reason:{letter_color}", reason)
+    else:
+        redis.delete(f"reason:{letter_color}")
 
     content = {"order_id": order_id, "count": count, "status": status}
     if status == "disable" and reason:
@@ -586,13 +591,20 @@ def restock_letter_color(letter, color):
     filled, moved, pool_left = _fill_from_pool(f"stock:{letter_color}", pool_key, RAIL_CAPACITY)
 
     if status is None:
-        status = "empty" if filled == 0 else "idle"
+        # [11/04] 고장(disable)이면 유지 - 펌웨어도 재보충으로는 고장 칸을 안 풂 (키캡팀 확인). 예전엔 idle로 덮어써서
+        # 서버·Mobius는 idle인데 아두이노는 그 칸을 건너뛰는 어긋남이 있었음
+        if get_last_status(status_key) == "disable":
+            status = "disable"
+        else:
+            status = "empty" if filled == 0 else "idle"
     redis.set(status_key, status)
 
     # 채운 결과를 order_id=null로 모비우스에 업로드 (여기서 한 번만 올림 -
     # 아두이노 쪽에서 이 호출 이후 또 보고하면 같은 restock이 중복으로
     # 올라가므로 절대 여기 말고 다른 곳에서 또 올리지 않도록 유지할 것)
     content = {"order_id": None, "count": filled, "status": status}
+    if status == "disable":
+        content["reason"] = redis.get(f"reason:{letter_color}") or ""
     ok = post_cin_to_mobius(f"cnt_warehouse/cnt_keycap_status/cnt_{letter_color}", content)
 
     print(f"[restock] {letter_color}: {filled}개 (pool에서 {moved}개, pool 남음 {pool_left}, status={status}, 모비우스 업로드 {'성공' if ok else '실패'})")
@@ -707,9 +719,12 @@ def _do_hard_reset():
 def _upload_reset_to_mobius():
     # status 캐시는 지우지 않음 — 재고 초기화가 고장 상태를 고쳐주는 게 아니라서,
     # 지워버리면 다음 restock 때 실제로는 disable인데 idle로 잘못 올라갈 수 있음
+    # [11/04] 고장 칸은 status=null 대신 disable + 사유로 올려서 플랫폼에서도 고장으로 남게 함 (키캡팀 요청)
     results = {}
     for lc in _all_keycap_letter_colors():
         content = {"order_id": None, "count": RAIL_CAPACITY, "status": None}
+        if get_last_status(f"status:{lc}") == "disable":
+            content.update(status="disable", reason=redis.get(f"reason:{lc}") or "")
         results[lc] = post_cin_to_mobius(f"cnt_warehouse/cnt_keycap_status/cnt_{lc}", content)
     for color in BOARD_COLORS:
         content = {"order_id": None, "count": BOARD_CARTRIDGE_CAPACITY, "status": None}
@@ -803,6 +818,29 @@ def sync_keycap():
         return jsonify({"error": f"없는 칸: {bad}"}), 400
     ok = _sync_arduinos(rails)
     return jsonify({"result": "ok" if ok else "mqtt_fail", "rails": rails}), (200 if ok else 502)
+
+
+REPAIR_TOPIC = "sjuiot/warehouse/command"   # 키캡팀 11/04 펌웨어 - 4대가 같이 구독, 자기 칸만 처리
+
+
+@app.route("/repair/<rail>", methods=["POST"])
+def repair_rail(rail):
+    """고장(disable) 칸 원격 복구 - 시리얼 REPAIR와 같음 (펌웨어 11/04~). 상태판 "복구" 버튼이 부름.
+    rail = "E_r" 등 한 칸, 또는 "ALL" + ?board=EI (board 없이 ALL이면 4대 전부라 막음).
+    retain 없이 보냄 (retain이면 재접속할 때마다 또 복구됨). 칸 상태만 되돌리고 실패 주문 재배출·플랫폼 fault는 그대로.
+    복구 결과는 아두이노가 /report/keycap-status 로 보고 -> Redis·Mobius 갱신. 배출 중인 칸은 아두이노가 무시"""
+    if rail == "ALL":
+        board = request.args.get("board") or (request.get_json(force=True, silent=True) or {}).get("board")
+        if board not in BOARD_LETTERS:
+            return jsonify({"error": f"ALL은 board({'/'.join(BOARD_LETTERS)})가 필요함"}), 400
+        cmd = {"cmd": "REPAIR", "rail": "ALL", "board": board}
+    elif rail in _all_keycap_letter_colors():
+        cmd = {"cmd": "REPAIR", "rail": rail}
+    else:
+        return jsonify({"error": f"없는 칸: {rail}"}), 400
+    ok = publish(REPAIR_TOPIC, json.dumps(cmd), retain=False)
+    logger.info(f"[repair] 복구 명령 {'전송' if ok else '실패'}: {cmd}")
+    return jsonify({"result": "sent" if ok else "mqtt_fail", "cmd": cmd}), (200 if ok else 502)
 
 
 def _sync_arduinos(rails):
