@@ -11,7 +11,8 @@
 # -Rehearsal (start_rehearsal.bat): 로봇 프로그램 2개를 리허설 모드로 - 로봇·컨베이어·카메라는 움직인 척,
 #   보고는 실제로 나감. 실물 없이 전시장 통신 전체 시험용. DobotLink 안 켬
 # -StatusOnly (status.bat, 바탕화면 '창고 점검'): 상태판만 띄우고 브라우저로 열기
-param([switch]$Rehearsal, [switch]$StatusOnly)
+# -Test (start_test.bat, 바탕화면 '창고 테스트'): 창고 시작과 같고, 브라우저에 테스트 페이지(/test) 탭도 같이 열기
+param([switch]$Rehearsal, [switch]$StatusOnly, [switch]$Test)
 $ErrorActionPreference = 'Stop'
 $Root       = $PSScriptRoot                                  # 저장소 루트
 $Python     = Join-Path $Root 'venv\Scripts\python.exe'       # 공용 가상환경 (Python 3.9, requirements.txt)
@@ -131,4 +132,5 @@ if ($gatewayRunning) {
 }
 Step '로그: warehouse 터미널 창의 각 탭 / board\logs, keycap_tray\logs 폴더 / logs 폴더(서비스)'
 Start-Process $StatusUrl   # 상태판을 브라우저로
+if ($Test) { Start-Process "$StatusUrl/test" }   # 테스트 페이지 - 주문 스냅샷을 손으로 올림 (로봇이 실제로 움직임)
 Start-Sleep -Seconds 5

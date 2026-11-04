@@ -27,10 +27,11 @@ import requests
 from dotenv import dotenv_values
 
 import check_all
+import test_page
 
 PORT = 5080
-REFRESH_SEC = 10       # 점검 간격 (한 번 점검에 수 초 걸림 - 끝난 뒤 이만큼 쉬고 다시)
-PAGE_REFRESH_SEC = 10  # 브라우저 자동 새로고침
+REFRESH_SEC = 5        # 점검 간격 (한 번 점검에 수 초 걸림 - 끝난 뒤 이만큼 쉬고 다시)
+PAGE_REFRESH_SEC = 5   # 브라우저 자동 새로고침
 STALE_SEC = 45         # 마지막 점검이 이보다 오래되면 "갱신 멈춤" (점검 몇 초 + 쉬는 10초보다 넉넉히)
 PROCESS_POLL_SEC = 5   # 주문 칩용 cnt_process 조회 간격
 STAGE_SLOW_SEC = 60    # 한 단계에 이보다 오래 머물면 칩 노랑 (플랫폼 stage_timeout은 약 2분)
@@ -875,6 +876,8 @@ def _render(result, error):
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if test_page.handle(self, "GET"):   # /test - 테스트 페이지 (같은 공유기에서만)
+            return
         with _lock:
             result, error, process = _latest, _error, _process
         if self.path in ("/", "/index.html"):
@@ -902,7 +905,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        # 이 화면에서 유일한 조작: 고장 칸 복구 -> 키캡 Flask /repair/<칸> (아두이노에 MQTT 복구 명령, 칸 상태만 되돌림)
+        if test_page.handle(self, "POST"):   # /test/send - 테스트 페이지에서 스냅샷 올리기
+            return
+        # 상태판 화면에서 유일한 조작: 고장 칸 복구 -> 키캡 Flask /repair/<칸> (아두이노에 MQTT 복구 명령, 칸 상태만 되돌림)
         if self.path != "/repair":
             self.send_response(404)
             self.end_headers()

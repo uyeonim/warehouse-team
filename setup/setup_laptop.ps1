@@ -5,7 +5,7 @@
 #   3) Redis 설정 파일(setup\redis.warehouse.conf -> redis\, 없을 때만) + data 폴더
 #   4) 방화벽 인바운드 5001·5002·5003·5080 (규칙 이름 warehouse-<포트>, 점검이 warehouse-* 로 찾음)
 #   5) 전원: 충전 중·배터리 모두 절전·최대 절전 안 함, 덮개를 닫아도 아무것도 안 함
-#   6) 바탕화면 바로가기: 창고 시작 / 창고 점검 / 재고 초기화
+#   6) 바탕화면 바로가기: 창고 시작 / 창고 점검 / 창고 테스트 / 재고 초기화
 # 사람이 할 일(공유기 IP 예약, .env·Redis 데이터 복사, DobotLink 설치, 카메라 번호 확인)은 노트북_이전_가이드.md
 $ErrorActionPreference = 'Stop'
 $Repo     = Split-Path $PSScriptRoot -Parent                  # 저장소 루트 (예: C:\warehouse\warehouse-team)
@@ -93,6 +93,7 @@ $shell = New-Object -ComObject WScript.Shell
 $desktop = [Environment]::GetFolderPath('Desktop')
 foreach ($s in @(@{ Name = '창고 시작'; Bat = 'start_all.bat' },
                  @{ Name = '창고 점검'; Bat = 'status.bat' },
+                 @{ Name = '창고 테스트'; Bat = 'start_test.bat' },
                  @{ Name = '재고 초기화'; Bat = 'reset_stock.bat' })) {   # 리허설(start_rehearsal.bat)은 바로가기 안 만듦
     $lnk = $shell.CreateShortcut((Join-Path $desktop "$($s.Name).lnk"))
     $lnk.TargetPath = Join-Path $Repo $s.Bat
