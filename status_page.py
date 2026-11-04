@@ -191,7 +191,12 @@ def _station_states(facts, rails=None):
                 if not h:
                     worst.append(("bad", f"{prog} 꺼짐"))
                 elif h["state"] == "link_lost":
-                    worst.append(("bad", f"연결 끊김 {h['age']}초"))
+                    # 게이트웨이는 끊긴 팔을 작업 문구로 알려 줌 ("트레이 팔 연결 끊김, 키캡 팔1 연결 끊김").
+                    # 문구가 있으면 그 팔을 쓰는 장비만 빨강 (키캡 벨트는 키캡 팔 MagicBox에 붙어 있음)
+                    job = h.get("job") or ""
+                    arm = "트레이 팔" if st["name"] == "트레이 팔" else "키캡 팔"
+                    if st["program"] != "keycap_tray" or not job or arm in job:
+                        worst.append(("bad", f"연결 끊김 {h['age']}초"))
                 elif h["state"] == "waiting_mobius":
                     worst.append(("bad", f"Mobius 대기 {h['age']}초"))
                 elif h["state"] == "starting":

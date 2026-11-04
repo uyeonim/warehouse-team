@@ -127,6 +127,7 @@ import os
 import queue
 import threading
 import time
+import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -301,6 +302,12 @@ def accept_snapshot(data, source, from_poll=False):
       먼저 처리됐을 수 있어서, 옛 스냅샷으로 상태가 뒤로 돌아가는 걸 막음
       (seq가 숫자가 아니면 비교 불가라 "다르면 받음"으로 처리)"""
     global last_seq
+    # [11/05] 형식이 이상한 스냅샷(orders가 null·목록 등)은 여기서 버림 - 그대로 넘기면 메인 루프가 죽어서
+    # 보드 main 전체가 꺼졌음 (주기 조회 스레드는 조용히 죽었음)
+    orders = data.get("orders") if isinstance(data, dict) else None
+    if not isinstance(orders, dict) or not all(isinstance(o, dict) for o in orders.values()):
+        log("RECV", f"형식이 이상한 스냅샷({source}) - 무시: {str(data)[:200]}")
+        return
     with _seq_lock:
         seq = data.get("seq", -1)
         if seq == last_seq:
@@ -361,22 +368,32 @@ def _poll_cnt_process():
     Mobius는 알림을 한 번만 보내고 재전송하지 않아서, 네트워크가 잠깐 끊기면 그 스냅샷이
     다음 변화 때까지 안 들어옴 -> 이 조회가 안전망. 알림이 정상이면 항상 같은 seq라 아무 일 없음.
     첫 조회가 시작 시 최신 상태 따라잡기 역할도 함. 실패 로그는 상태가 바뀔 때만 남김."""
-    first, failing = True, False
     while True:
-        latest = fetch_latest_cin("cnt_process", quiet=True)
-        if hb is not None:
-            hb.update(poll_ok=latest is not None)
-        if latest is None:
-            if not failing:
-                log("RECV", f"cnt_process 주기 조회 실패 - {MOBIUS_POLL_INTERVAL_SEC:g}초마다 재시도 (알림 수신은 계속)")
-                failing = True
-        else:
-            if failing:
-                log("RECV", "cnt_process 주기 조회 복구됨")
-                failing = False
-            accept_snapshot(latest, "시작 시 la 조회" if first else "주기 조회 - 알림 누락 보충", from_poll=True)
-            first = False
+        try:
+            _poll_once()
+        except Exception as e:   # 이 스레드가 죽으면 알림을 놓쳤을 때 안전망이 없어짐 -> 로그만 남기고 계속
+            log("RECV", f"!! 주기 조회 중 예외 - 계속 조회함: {type(e).__name__}: {e}")
         time.sleep(MOBIUS_POLL_INTERVAL_SEC)
+
+
+_poll_state = {"first": True, "failing": False}
+
+
+def _poll_once():
+    st = _poll_state
+    latest = fetch_latest_cin("cnt_process", quiet=True)
+    if hb is not None:
+        hb.update(poll_ok=latest is not None)
+    if latest is None:
+        if not st["failing"]:
+            log("RECV", f"cnt_process 주기 조회 실패 - {MOBIUS_POLL_INTERVAL_SEC:g}초마다 재시도 (알림 수신은 계속)")
+            st["failing"] = True
+        return
+    if st["failing"]:
+        log("RECV", "cnt_process 주기 조회 복구됨")
+        st["failing"] = False
+    accept_snapshot(latest, "시작 시 la 조회" if st["first"] else "주기 조회 - 알림 누락 보충", from_poll=True)
+    st["first"] = False
 
 
 def start_cnt_process_poller():
@@ -654,6 +671,38 @@ def is_ok(res):
     return not (isinstance(res, str) and (res.startswith("TIMEOUT") or res.startswith("ERROR")))
 
 
+# ============================== 알람(빨간불) 해제 ==============================
+# [11/05] 게이트웨이(keycap_tray/dobot_control.py clear_alarms_now)와 같은 방식. 알람이 남아 있으면 그 뒤 이동 명령이
+# 전부 무시돼서 HOME 복귀도 안 되고 다음 주문까지 실패함 (예전엔 재연결 때만 풀었음).
+# GetAlarmsState의 state = 16바이트 비트맵, 바이트x8 + 비트 = 알람 번호 (Dobot 알람 설명서 기준)
+ALARM_NAMES = {
+    0x00: "재시작 후 남은 알람", 0x01: "알 수 없는 명령", 0x11: "목표점이 작업 범위 밖", 0x12: "목표점이 관절 한계 밖",
+    0x20: "이동 중 특이 자세", 0x21: "이동 중 작업 범위 벗어남", 0x22: "이동 중 관절 한계 넘음",
+    0x40: "관절1 +한계", 0x41: "관절1 -한계", 0x42: "관절2 +한계", 0x43: "관절2 -한계",
+    0x44: "관절3 +한계", 0x45: "관절3 -한계", 0x46: "관절4 +한계", 0x47: "관절4 -한계",
+    0x50: "관절1 탈조(충돌)", 0x51: "관절2 탈조(충돌)", 0x52: "관절3 탈조(충돌)", 0x53: "관절4 탈조(충돌)",
+}
+
+
+def _alarm_codes(state):
+    values = state.get("state") if isinstance(state, dict) else None
+    if not isinstance(values, list):
+        return []
+    return [i * 8 + b for i, v in enumerate(values) if isinstance(v, int) for b in range(8) if v >> b & 1]
+
+
+async def clear_alarms_now(arm_api, why):
+    """알람이 있으면 무슨 알람인지 로그에 남기고 해제. 탈조(0x50~)는 위치가 틀어졌을 수 있어 같이 경고"""
+    state = await safe_call(arm_api.GetAlarmsState(portName=DOBOT_PORT), 3)
+    codes = _alarm_codes(state)
+    if codes:
+        await safe_call(arm_api.ClearAllAlarmsState(portName=DOBOT_PORT), 3)
+        names = ", ".join(f"0x{c:02X} {ALARM_NAMES.get(c, '기타')}" for c in codes)
+        lost = " - 탈조: 위치가 틀어졌을 수 있음, 팔 확인" if any(0x50 <= c <= 0x53 for c in codes) else ""
+        log("ALARM", f"알람 해제 ({why}): {names}{lost}")
+    return codes
+
+
 # ============================== 로봇 연결 감시 / 자동 재연결 ==============================
 # USB가 빠졌다 다시 꽂히거나 로봇 전원이 껐다 켜지면 DobotLink 연결이 끊겨서, 그 뒤 모든 명령이
 # ERROR: {'code': 141, 'message': 'device is not connected.'} 로 실패함(2026-11-02 section0 실측).
@@ -755,6 +804,9 @@ class RehearsalDobot:
     def ClearAllAlarmsState(self, **kw):
         return self._ok()
 
+    def GetAlarmsState(self, **kw):
+        return self._ok({"state": [0] * 16})
+
     def GetPose(self, **kw):
         return self._ok(dict(self.pose))
 
@@ -780,6 +832,7 @@ def ensure_link(loop):
             _mark_link_lost(f"작업 전 확인 응답 없음 ({res})")
         else:
             _link_timeouts = 0
+            loop.run_until_complete(clear_alarms_now(_arm_api, "작업 전"))   # 지난 작업에서 남은 알람
     if link_lost:
         log("LINK", "작업 시작 전 재연결 시도")
         _last_link_check = time.time()
@@ -824,12 +877,15 @@ async def move_and_wait(arm_api, pose, label="", settle_sec=0.0):
                 if resends >= MOVE_MAX_RESEND:
                     break
                 resends += 1
+                await clear_alarms_now(arm_api, label)   # 알람이 걸려 있으면 재전송도 무시됨
                 moved = await send()
                 log("ARM", f"{label} - 목표 못 간 채 멈춤 -> 명령 재전송 {resends}/{MOVE_MAX_RESEND} ({moved})")
                 still_since = time.time()
             prev = actual
     if arrived and settle_sec > 0:
         await asyncio.sleep(settle_sec)
+    if not arrived and not link_lost:
+        await clear_alarms_now(arm_api, f"{label} 도착 실패 뒤")   # 다음 복귀 이동이 무시되지 않게
 
     elapsed = time.time() - started
     status = f"도착 {elapsed:.1f}초" if arrived else f"!! 도착 실패({elapsed:.1f}초)"
@@ -1090,11 +1146,8 @@ async def pick_and_place_board_async(arm_api, order_id, color, count):
         if not descend_ok or not _position_matches(descend_actual, place_target):
             log("ARM", f"트레이 하강 도달 실패 - 목표={tuple(round(v, 1) for v in place_target)} "
                         f"실제={descend_actual} - 흡착 끄고 실패 처리")
+            await suck(arm_api, False)   # [11/05] 보고(최대 2회 x 5초)보다 먼저 - 보드를 매단 채 기다리지 않게
             report_board_robot_arm(order_id, "failed")
-            try:
-                await suck(arm_api, False)
-            except Exception:
-                pass
             await travel(arm_api, (place_x, place_y, travel_z), HOME_XYZ, wrist, "초기위치로 복귀")
             return False, consumed
 
@@ -1125,10 +1178,7 @@ async def pick_and_place_board_async(arm_api, order_id, color, count):
 
     except Exception as e:
         log("ARM", f"예외 발생 - 실패 처리: {e}")
-        try:
-            await suck(arm_api, False)
-        except Exception:
-            pass
+        await suck(arm_api, False)   # safe_call이라 예외를 안 던짐
         report_board_robot_arm(order_id, "failed")
         await _recover_to_home(arm_api, travel_z)
         return False, consumed
@@ -1310,12 +1360,11 @@ def check_fault_transitions(loop, arm_api, box_api, orders):
             color = order.get("board")
             if retry_kind == "pick":
                 process_board_job(loop, arm_api, box_api, oid, color)
-            elif retry_kind == "conveyor0":
-                handle_tray_conveyor(loop, box_api, oid, "0")
-            elif retry_kind == "conveyor1":
-                handle_tray_conveyor(loop, box_api, oid, "1")
-            elif retry_kind == "conveyor2":
-                handle_tray_conveyor(loop, box_api, oid, "2")
+            elif retry_kind in ("conveyor0", "conveyor1", "conveyor2"):
+                handle_tray_conveyor(loop, box_api, oid, retry_kind[-1])
+                # [11/05] 재시도한 단계는 처리한 것으로 기록 - 안 하면 같은 스냅샷 5단계가 기록 없음으로 보고
+                # 한 번 더 돌릴 수 있음 (재시도 보고가 아직 못 나가서 Mobius엔 failed로 남아 있을 때)
+                handled_status[oid] = order.get("status")
         return
 
     for order_id, order in orders.items():
@@ -1498,7 +1547,11 @@ def handle_snapshot(loop, arm_api, box_api, data):
     #    컨베이어(keycap_packed/board_packed)는 즉시 반응(status 기반 dedup 유지)
     for order_id, order in list(orders.items()):
         if order.get("fault") is not None:
-            handled_status.pop(order_id, None)
+            # [11/05] 처리 기록은 우리 fault(보드 놓기·트레이 벨트)일 때만 지움 - 해제 뒤 같은 단계를 다시 하려고.
+            # 다른 팀 fault(키캡 벨트 막힘 등)까지 지우면 그게 풀릴 때 이미 돌린 트레이 벨트를 또 돌려서
+            # 트레이가 지나쳐 버림 (Mobius에서 done 확인이 안 되면)
+            if order.get("fault") in TRACKED_FAULTS:
+                handled_status.pop(order_id, None)
             continue
 
         status = order.get("status")
@@ -1610,17 +1663,27 @@ def main():
             resync_stock_if_idle()    # 쉬는 동안 사람이 바꾼 재고 따라가기
             try:
                 data = snapshot_queue.get(timeout=1)
-                handle_snapshot(loop, arm_api, box_api, data)
-                first_snapshot_handled = True
             except queue.Empty:
-                pass
+                data = None
+            if data is not None:
+                try:
+                    handle_snapshot(loop, arm_api, box_api, data)
+                except Exception:   # [11/05] 스냅샷 하나 때문에 main 전체가 꺼지지 않게 - 로그 남기고 다음으로
+                    log("ERROR", f"!! 스냅샷 처리 중 예외 (seq={data.get('seq')}) - 건너뛰고 계속:\n{traceback.format_exc()}")
+                    _hb("idle")
+                first_snapshot_handled = True
 
             # 첫 스냅샷을 받기 전엔 큐를 꺼내지 않음 - 복원된 job이 이미 끝난/사라진 주문인지,
             # 중복인지를 스냅샷으로 먼저 정리(prune/중복체크)한 뒤에 처리하려고
             if first_snapshot_handled and gate_open and job_queue:
                 job = job_queue.pop(0)
                 log("ARM", f"{job['order_id']}: 큐에서 꺼내 처리 시작 (색상={job['color']})")
-                process_board_job(loop, arm_api, box_api, job["order_id"], job["color"])
+                try:
+                    process_board_job(loop, arm_api, box_api, job["order_id"], job["color"])
+                except Exception:
+                    log("ERROR", f"!! {job['order_id']} 처리 중 예외 - 건너뛰고 계속 (팔 위치·보드 확인 필요):\n"
+                                 f"{traceback.format_exc()}")
+                    _hb("idle")
     except KeyboardInterrupt:
         log("SHUTDOWN", "Ctrl+C로 종료")
     finally:

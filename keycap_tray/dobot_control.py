@@ -90,14 +90,21 @@ ARMS_TAKE_TURNS = os.environ.get("ARMS_TAKE_TURNS", "1").strip() != "0"
 _usb_ports = list_ports()
 
 
+def _port_spec(name, default):
+    """(.env <이름>_SERIAL, <이름>_PORT 또는 기본 COM) - 재연결 때 COM 을 다시 찾으려고 설정에 같이 둠"""
+    return os.environ.get(f"{name}_SERIAL", "").strip(), (os.environ.get(f"{name}_PORT") or default).strip()
+
+
 def _port(name, default):
     """.env 의 <이름>_SERIAL(USB 시리얼)이 있으면 그 팔이 지금 꽂힌 COM 을 찾아 씀 (USB 를 다시 꽂아
-    COM 번호가 바뀌어도 팔이 뒤바뀌지 않음). 시리얼을 못 찾으면 켜지 않음 — 다른 팔 COM 으로 움직이면 충돌.
-    시리얼이 없으면 예전처럼 <이름>_PORT (SET1_PORT / SET2_PORT / TRAY_PORT)."""
-    serial = os.environ.get(f"{name}_SERIAL", "")
-    port = resolve_port(serial, (os.environ.get(f"{name}_PORT") or default).strip(), _usb_ports)
+    COM 번호가 바뀌어도 팔이 뒤바뀌지 않음). 시리얼을 못 찾으면 None — 다른 팔 COM 으로 움직이면 충돌하므로
+    예비 COM 으로 넘어가지 않음. 시리얼이 없으면 예전처럼 <이름>_PORT (SET1_PORT / SET2_PORT / TRAY_PORT).
+    [11/05] 못 찾아도 끝내지 않음 (예전엔 RuntimeError 로 게이트웨이가 안 켜졌음) - 연결 감시가 5초마다 다시 찾음"""
+    serial, fallback = _port_spec(name, default)
+    port = resolve_port(serial, fallback, _usb_ports)
     if port is None:
-        raise RuntimeError(f"{name} 팔(USB 시리얼 {serial.strip()})이 안 보임 — USB/전원 확인 후 다시 켜기")
+        print(f"[{time.strftime('%H:%M:%S')}] [LINK  ] !! {name} 팔(USB 시리얼 {serial})이 안 보임 - USB/전원 확인 "
+              f"(켜진 뒤 자동으로 다시 찾음)")
     return port
 
 
@@ -143,6 +150,11 @@ TRAY = {
     "place_slots": {1: None},    # 벨트 위 놓는 곳
     "keycaps": [("빈 트레이", 1, 1)],  # arm_set 가 쓰는 형식 (이름, 슬롯, 번호)
 }
+
+
+for _cfg, _name, _default in ((SETS["set1"], "SET1", "COM6"), (SETS["set2"], "SET2", "COM7"), (TRAY, "TRAY", "COM8")):
+    _cfg["serial"], _cfg["fallback"] = _port_spec(_name, _default)
+ARM_LABEL = {"set1": "키캡 팔1", "set2": "키캡 팔2", "tray": "트레이 팔"}
 
 
 def load_poses(cfg, name):
@@ -510,7 +522,7 @@ async def run_all_sets(arm_api, box_api):
 _loop = None
 _arm_api = None
 _box_api = None
-_connected = {}  # 포트 → 설정. 끝날 때 연결한 팔 전부 (트레이 팔 포함) 해제하려고 기억
+_connected = {}  # 팔 이름 → 설정. 끝날 때 연결한 팔 전부 (트레이 팔 포함) 해제하려고 기억
 
 
 def arms():
@@ -521,23 +533,104 @@ def arms():
     return out
 
 
-def connect(cfgs=None):
-    """프로그램 시작 때 한 번. 쓰는 팔 전부 연결 (cfgs 를 주면 그것만)."""
+def _init_api():
+    """이벤트루프와 DobotLink 연결 객체는 한 번만 만듦 (보드 main 과 같음). 예전엔 재연결 때마다 새로 만들었음"""
     global _loop, _arm_api, _box_api
     if _loop is None:
         _loop = asyncio.new_event_loop()
         asyncio.set_event_loop(_loop)
-    dobotlink = DobotlinkAdapter(RPCClient(), is_sync=False)
-    _arm_api = getattr(dobotlink, NAMESPACE_ARM)
-    _box_api = getattr(dobotlink, NAMESPACE_BOX)
+    if _arm_api is None:
+        dobotlink = DobotlinkAdapter(RPCClient(), is_sync=False)
+        _arm_api = getattr(dobotlink, NAMESPACE_ARM)
+        _box_api = getattr(dobotlink, NAMESPACE_BOX)
 
+
+def connect(cfgs=None):
+    """프로그램 시작 때 한 번. 쓰는 팔 전부 연결 (cfgs 를 주면 그것만). 연결 못 한 팔 이름 목록 반환 -
+    그 팔은 link_watchdog 가 5초마다 다시 시도함 (끝내지 않음)."""
+    _init_api()
     targets = cfgs if cfgs is not None else arms()
     log("INIT", f"로봇팔 연결: {', '.join(targets)}  (좌표: {LAYOUT})")
     check_poses(targets)
-    for key, cfg in targets.items():
-        res = _loop.run_until_complete(safe_call(_arm_api.ConnectDobot(portName=cfg["port"])))
-        log("INIT", f"{cfg['port']} ({key}): {res}")
-        _connected[cfg["port"]] = cfg
+    return [key for key, cfg in targets.items() if not _connect_one(key, cfg)]
+
+
+# ---------------------------------------------------------------
+# [11/05] 연결 감시 / 자동 재연결 - 보드 main(link_watchdog·reconnect_robot)과 같은 방식
+#   USB 를 뺐다 꽂거나 로봇 전원을 껐다 켜면 DobotLink 연결이 끊김. 예전엔 일을 시킬 때에야 알았고,
+#   COM 번호가 바뀌면 게이트웨이를 다시 켜야 했음. 이제 대기 중에도 확인하고, 끊긴 팔만 시리얼로 COM 을
+#   다시 찾아 끊고 → 다시 연결. 끊긴 동안 heartbeat 는 link_lost (상태판·점검에 "연결 끊김")
+# ---------------------------------------------------------------
+LINK_CHECK_SEC = 10      # 정상일 때 확인 간격
+LINK_RETRY_SEC = 5       # 끊겼을 때 재연결 시도 간격
+LINK_TIMEOUT_LIMIT = 2   # 대기 중 GetPose TIMEOUT 이 이만큼 연달아 나면 끊김으로 봄
+_lost = {}               # 팔 이름 -> 끊김을 처음 안 시각
+_timeouts = {}
+_last_link_check = 0.0
+
+
+def _mark_lost(key, why):
+    if key not in _lost:
+        _lost[key] = time.time()
+        log("LINK", f"!! {ARM_LABEL.get(key, key)} 연결 끊김 ({why}) - {LINK_RETRY_SEC}초마다 재연결 시도")
+
+
+def _connect_one(key, cfg):
+    """팔 하나: 시리얼로 COM 다시 찾기 → 끊기 → 연결. 성공하면 True"""
+    port = resolve_port(cfg.get("serial"), cfg.get("fallback"))
+    if port is None:
+        _mark_lost(key, f"USB 시리얼 {cfg.get('serial')} 안 보임 - USB/전원 확인")
+        return False
+    if port != cfg.get("port"):
+        if cfg.get("port"):
+            log("LINK", f"{ARM_LABEL.get(key, key)} COM 번호: {cfg['port']} -> {port}")
+        cfg["port"] = port
+    # 끊는 걸 먼저: DobotLink 가 끊긴 포트를 아직 열린 걸로 보고 연결을 거부할 수 있음 (처음 연결 땐 오류만 나고 무해)
+    _loop.run_until_complete(safe_call(_arm_api.DisconnectDobot(portName=port)))
+    res = _loop.run_until_complete(safe_call(_arm_api.ConnectDobot(portName=port)))
+    _connected[key] = cfg
+    if not is_ok(res):
+        log("INIT", f"{port} ({key}) 연결 실패: {res}")
+        _mark_lost(key, res)
+        return False
+    log("INIT", f"{port} ({key}): {res}")
+    if _lost.pop(key, None) is not None:
+        log("LINK", f"{ARM_LABEL.get(key, key)} 재연결 성공")
+    _timeouts[key] = 0
+    return True
+
+
+def link_watchdog():
+    """게이트웨이가 주문을 기다리는 동안(작업 사이) 매 폴링마다 부름. 정상이면 LINK_CHECK_SEC 마다 GetPose 로
+    확인, 끊긴 팔이 있으면 LINK_RETRY_SEC 마다 그 팔만 재연결. 오류(141 등)는 바로, TIMEOUT 은 연달아 났을 때 끊김"""
+    global _last_link_check
+    if _loop is None:
+        return
+    now = time.time()
+    if now - _last_link_check < (LINK_RETRY_SEC if _lost else LINK_CHECK_SEC):
+        return
+    _last_link_check = now
+    for key, cfg in arms().items():
+        if key in _lost or not cfg.get("port"):
+            if _connect_one(key, cfg):
+                _loop.run_until_complete(clear_alarms_now(_arm_api, cfg["port"], "재연결 뒤"))
+            continue
+        res = _loop.run_until_complete(safe_call(_arm_api.GetPose(portName=cfg["port"], isQueued=False), 3))
+        if isinstance(res, dict):
+            _timeouts[key] = 0
+        elif res == "TIMEOUT":
+            _timeouts[key] = _timeouts.get(key, 0) + 1
+            if _timeouts[key] >= LINK_TIMEOUT_LIMIT:
+                _mark_lost(key, f"GetPose TIMEOUT {_timeouts[key]}회 연속")
+        else:
+            _mark_lost(key, res)
+
+
+def link_problem():
+    """끊긴 팔 설명 (없으면 None) - 게이트웨이가 heartbeat link_lost 작업 문구로 씀"""
+    if not _lost:
+        return None
+    return ", ".join(f"{ARM_LABEL.get(k, k)} 연결 끊김" for k in _lost)
 
 
 def keepalive():
@@ -555,13 +648,14 @@ def ensure_connected(cfgs=None):
     if _loop is None:
         connect(targets)
         return
-    for key, cfg in targets.items():
-        res = _loop.run_until_complete(safe_call(_arm_api.GetPose(portName=cfg["port"], isQueued=False), 3))
+    for key, cfg in targets.items():   # [11/05] 응답 없는 팔만 다시 연결 (예전엔 전부 새로 연결)
+        res = None
+        if key not in _lost and cfg.get("port"):
+            res = _loop.run_until_complete(safe_call(_arm_api.GetPose(portName=cfg["port"], isQueued=False), 3))
         if not isinstance(res, dict):
-            log("WARN", f"{cfg['port']} ({key}) 응답 없음({res}) → DobotLink 다시 연결")
-            connect(targets)
-            break
-    clear_alarms(targets)
+            log("WARN", f"{cfg.get('port')} ({key}) 응답 없음({res}) → 다시 연결")
+            _connect_one(key, cfg)
+    clear_alarms({k: c for k, c in targets.items() if c.get("port")})
 
 
 def clear_alarms(cfgs=None):
@@ -577,6 +671,8 @@ def disconnect():
         return
     log("INIT", "연결 해제")
     for cfg in _connected.values():
+        if not cfg.get("port"):
+            continue
         if "conveyor_index" in cfg:  # Ctrl+C 로 벨트 도중 끊겨도 벨트는 세움
             _loop.run_until_complete(conveyor(_box_api, cfg["port"], cfg["conveyor_index"], False, 0))
         _loop.run_until_complete(safe_call(_arm_api.DisconnectDobot(portName=cfg["port"])))

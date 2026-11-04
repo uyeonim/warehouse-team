@@ -260,26 +260,65 @@ def _summary(con):
     return "\n".join(lines)
 
 
-def _relay(kind, con, via):
-    """스냅샷을 MQTT로 보냄. 보낸 내용을 기억해서 주기 조회(_process_poll_loop)가 같은 걸 또 보내지 않게 함"""
-    global _last_relayed
-    reset_con = _auto_hard_reset(con) if kind == "process" else None
-    # 하드리셋 땐 아두이노 수량 맞추기용 keycap_restock을 실은 스냅샷을 보냄. _last_relayed가 원래 스냅샷과 달라지므로
-    # 다음 주기 조회(5초 안)가 원래 스냅샷을 다시 보내서 브로커 retain도 restock 없는 걸로 바뀜 (같은 seq라 아두이노는 무시)
-    payload = json.dumps(reset_con or con, ensure_ascii=False)
-    ok = publish(TOPICS[kind], payload)
-    if ok:
-        with _relay_lock:
+STALE_SEQ_GAP = 10   # 이만큼 안쪽으로 작은 seq = 늦게 도착한 옛 스냅샷. 더 크게 작아지면 플랫폼 서버 재시작으로 봄
+
+
+def _is_stale(con):
+    """방금 보낸 것보다 옛 스냅샷인지 (_relay_lock 안에서 부름). 알림 두 개가 거의 동시에 오면(플랫폼 restock은
+    보고 30ms 뒤) 처리 스레드가 달라서 순서가 뒤집힐 수 있음 -> 아두이노가 옛 스냅샷을 나중에 받으면 새 주문을
+    큐에서 지워 버림 (11/05 검토). updated_at이 양쪽에 있으면 그걸로, 없으면 seq 차이로 판단"""
+    if not isinstance(con, dict) or _last_key is None:
+        return False
+    last_seq, last_upd = _last_key
+    seq, upd = con.get("seq"), con.get("updated_at")
+    if isinstance(upd, str) and isinstance(last_upd, str) and upd and last_upd:
+        return upd < last_upd
+    if isinstance(seq, int) and isinstance(last_seq, int):
+        return last_seq - STALE_SEQ_GAP <= seq < last_seq
+    return False
+
+
+def _relay(kind, con, via, gen=None):
+    """스냅샷을 MQTT로 보냄. 보낸 내용을 기억해서 주기 조회(_process_poll_loop)가 같은 걸 또 보내지 않게 함.
+    [11/05] 비교·전송·기억을 _relay_lock 하나로 묶음 - 알림 스레드와 주기 조회가 동시에 보내면 순서가 뒤집혔음.
+    gen: 주기 조회가 Mobius를 읽기 전의 _relay_gen. 그 사이 다른 스냅샷이 나갔으면 읽은 게 옛것일 수 있어서 버림"""
+    global _last_relayed, _last_key, _relay_gen
+    reset_con = None
+    with _relay_lock:
+        if gen is not None and gen != _relay_gen:
+            return True   # 읽는 동안 알림이 더 새것을 보냄 - 다음 조회가 다시 확인
+        if kind == "process" and _is_stale(con):
+            logger.warning(f"[{kind}] seq {con.get('seq')} 건너뜀 - 방금 보낸 seq {_last_key[0]}보다 옛 스냅샷 ({via})")
+            return True
+        reset_con = _auto_hard_reset(con) if kind == "process" else None
+        # 하드리셋 땐 아두이노 수량 맞추기용 keycap_restock을 실은 스냅샷을 seq를 바꿔서 보냄 ("<seq>-reset").
+        # 원래 seq 그대로면 주기 조회가 원래 스냅샷을 먼저 보낸 경우 아두이노가 "이미 받은 seq"로 무시했음 (11/05).
+        # 다음 주기 조회(5초 안)가 원래 스냅샷을 다시 보내서 브로커 retain도 restock 없는 걸로 바뀜 (주문이 비어 있어 무해)
+        out = dict(reset_con, seq=f"{con.get('seq')}-reset") if reset_con is not None else con
+        payload = json.dumps(out, ensure_ascii=False)
+        ok = publish(TOPICS[kind], payload)
+        if ok:
             _last_relayed = payload
-        seq = (reset_con or con).get("seq") if isinstance(con, dict) else "?"
-        logger.info(f"[{kind}] seq {seq} → MQTT 전송 완료 ({via})\n{_summary(reset_con or con)}")
-    else:
-        logger.error(f"[{kind}] → MQTT 전송 실패 ({via})\n{_summary(reset_con or con)}")
-    logger.debug(f"[{kind}] payload: {payload}")
+            _relay_gen += 1
+            if isinstance(out, dict):
+                _last_key = (out.get("seq"), out.get("updated_at"))
+            seq = out.get("seq") if isinstance(out, dict) else "?"
+            logger.info(f"[{kind}] seq {seq} → MQTT 전송 완료 ({via})\n{_summary(out)}")
+        else:
+            logger.error(f"[{kind}] → MQTT 전송 실패 ({via})\n{_summary(out)}")
+        logger.debug(f"[{kind}] payload: {payload}")
     if reset_con is not None:
-        failed = _upload_reset_to_mobius()
-        logger.info(f"[reset] 하드리셋 모비우스 업로드 실패: {failed if failed else '없음'}")
+        if not ok:   # reset:last_id는 이미 적혀서 같은 리셋은 다시 안 옴 -> 아두이노 수량 맞추기만 따로 다시 보냄
+            logger.warning("[reset] 수량 맞추기 스냅샷 전송 실패 - 5초 뒤 동기화로 다시 보냄")
+            threading.Timer(5, _sync_arduinos, args=(_all_keycap_letter_colors(),)).start()
+        # 36칸 Mobius 업로드(칸마다 최대 5초)는 알림 응답을 붙잡지 않게 따로 돌림
+        threading.Thread(target=_upload_reset_in_background, daemon=True).start()
     return ok
+
+
+def _upload_reset_in_background():
+    failed = _upload_reset_to_mobius()
+    logger.info(f"[reset] 하드리셋 모비우스 업로드 실패: {failed if failed else '없음'}")
 
 
 # ============================================================
@@ -292,7 +331,9 @@ def _relay(kind, con, via):
 # ============================================================
 PROCESS_POLL_SEC = float(os.getenv("PROCESS_POLL_SEC", "5"))
 _last_relayed = None
-_relay_lock = threading.Lock()
+_last_key = None      # 마지막으로 보낸 스냅샷의 (seq, updated_at) - 옛 스냅샷 거르기용
+_relay_gen = 0        # 보낼 때마다 +1 - 주기 조회가 읽는 사이 다른 게 나갔는지 확인용
+_relay_lock = threading.Lock()   # _relay 전체(비교·전송·기억)를 한 번에 하나씩
 
 
 def _get_latest_process():
@@ -313,6 +354,7 @@ def _process_poll_loop():
     failing = False
     while True:
         time.sleep(PROCESS_POLL_SEC)
+        gen = _relay_gen   # 읽기 전 번호 - 읽는 동안 알림이 새 스냅샷을 보내면 이번 결과는 버림
         try:
             con = _get_latest_process()
             if failing:
@@ -326,7 +368,7 @@ def _process_poll_loop():
         with _relay_lock:
             same = json.dumps(con, ensure_ascii=False) == _last_relayed
         if not same:
-            _relay("process", con, "주기 조회 - 알림 누락 보충" if _last_relayed else "시작 시 조회")
+            _relay("process", con, "주기 조회 - 알림 누락 보충" if _last_relayed else "시작 시 조회", gen=gen)
 
 
 if PROCESS_POLL_SEC > 0:
@@ -869,7 +911,7 @@ def _sync_arduinos(rails):
     최신 cnt_process에 keycap_restock=rails를 실어 seq만 바꿔(아두이노는 seq가 직전과 같으면 무시) MQTT로 보내면
     아두이노가 /restock/<글자>/<색>을 부르고, RESET_RESTOCK_WINDOW_SEC 동안은 pool을 안 빼고 지금 stock만 돌려줌.
     플랫폼 주문 목록은 최신 그대로라 주문 처리는 바뀌지 않음 (이미 처리한 주문은 아두이노가 걸러냄)"""
-    global _last_relayed
+    global _last_relayed, _last_key, _relay_gen
     try:
         latest = _get_latest_process()
     except Exception as e:
@@ -877,9 +919,16 @@ def _sync_arduinos(rails):
         latest = {"orders": {}}
     redis.set("reset:restock_window", 1, ex=RESET_RESTOCK_WINDOW_SEC)
     snap = dict(latest, seq=f"{latest.get('seq')}-sync{int(time.time())}", keycap_restock=list(rails))
-    ok = publish(TOPICS["process"], json.dumps(snap, ensure_ascii=False))
-    with _relay_lock:   # 주기 조회가 원래 스냅샷을 또 보내지 않게 (아두이노가 같은 주문을 한 번 더 훑는 걸 피함)
-        _last_relayed = json.dumps(latest, ensure_ascii=False)
+    payload = json.dumps(snap, ensure_ascii=False)
+    with _relay_lock:   # 다른 스냅샷 전송과 순서가 섞이지 않게
+        ok = publish(TOPICS["process"], payload)
+        if ok:
+            # [11/05] 보낸 그대로 기억 - 다음 주기 조회가 원래 스냅샷으로 브로커 retain을 덮음 (restock 실린 retain이
+            # 남아 있으면 나중에 재부팅한 아두이노가 또 restock을 부름). 예전엔 원래 스냅샷을 기억해서 15초 타이머가
+            # 실패하면 retain이 그대로 남았음
+            _last_relayed = payload
+            _last_key = (snap.get("seq"), snap.get("updated_at"))
+            _relay_gen += 1
     logger.info(f"[sync] 아두이노 수량 맞추기 {'전송' if ok else '실패'}: {len(rails)}칸 (seq={snap['seq']})")
     # 브로커 retain에 restock 실린 스냅샷이 남으면 나중에 재부팅한 아두이노가 또 restock을 부름 -> 잠시 뒤 원래 스냅샷으로 덮음
     threading.Timer(15, _restore_retained).start()

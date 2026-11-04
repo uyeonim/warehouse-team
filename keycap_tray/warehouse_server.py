@@ -102,6 +102,12 @@ BOARD_DISPENSE = "cnt_warehouse/cnt_board_dispense"
 
 SHELVES = {1: "EI", 2: "NS", 3: "TF", 4: "PJ"}  # keycap1~4 담당 선반 = MBTI 1~4번째 글자
 
+# 우리(키캡 벨트·키캡 팔·트레이 팔) 장비 fault - 풀리면 그 단계를 다시 함. 나머지는 다른 팀 담당
+OWN_FAULTS = {"keycap_01_belt_jammed", "keycap_02_belt_jammed", "keycap_pack_failed", "tray_load_failed"}
+
+# 재시작 이어하기: 단계 -> 그 단계에서 우리가 올리는 보고 (Mobius 에 이 주문 보고가 있으면 이미 한 것)
+STAGE_REPORT = {"assigned": TRAY_ARM, "keycap_dispensed": KEYCAP_CONVEYOR, "keycap_reached": KEYCAP_ARM}
+
 app = Flask(__name__)
 
 last_seq = None
@@ -382,15 +388,20 @@ def handle_order(order_id, order):
 
     if order.get("fault"):
         print(f"[정지] {order_id} status={status} fault={order['fault']}")
-        handled_by_order.pop(order_id, None)  # fault 가 풀리면 같은 status 로 다시 실행되도록
-        conveyor_results.pop(order_id, None)
+        # [11/05] 처리 기록은 우리 장비 fault 일 때만 지움 - 해제 뒤 같은 단계를 다시 하려고.
+        # 다른 팀 fault(보드 트레이 벨트 막힘·키캡 카트리지 등)까지 지우면 그게 풀릴 때 이미 돌린 키캡 벨트를
+        # 또 돌리고 같은 보고를 두 번 보냄. fault_seen 도 우리 fault 만 - 다른 팀 fault 뒤 keycap_reached 가 오면
+        # "사람이 고침"으로 보고 팔을 안 움직이는 문제가 생김
+        if order.get("fault") in OWN_FAULTS:
+            handled_by_order.pop(order_id, None)  # fault 가 풀리면 같은 status 로 다시 실행되도록
+            conveyor_results.pop(order_id, None)
+            fault_seen.add(order_id)
         # 트레이를 새로 올리는 건 트레이 팔 자기 실패(tray_load_failed)일 때만.
         # assigned 단계에는 키캡 카트리지 fault(keycap_driver_failed 등)도 걸리는데, 그때 지우면
         # 해제 후 이미 벨트에 있는 트레이 위에 하나를 더 올림 (2026-11-02 assigned 상태 fault 시험으로 확인).
         # 안 지우면 해제 후 on_assigned 는 "이미 올림 — 보고만" 으로 끝남
         if order.get("fault") == "tray_load_failed":
             tray_results.pop(order_id, None)
-        fault_seen.add(order_id)
         return True
 
     handler = HANDLERS.get(status)
@@ -447,12 +458,30 @@ def _process_snapshot(snapshot):
     return "ok" if all_ok else "retry"
 
 
-def mark_as_handled(snapshot):
-    """사진 속 주문들을 '이미 처리함'으로만 기록 (실행 안 함). PC 게이트웨이 시작 때 옛 사진에 반응하지 않도록."""
+def mark_as_handled(snapshot, reported=None):
+    """사진 속 주문들을 '이미 처리함'으로만 기록 (실행 안 함). PC 게이트웨이 시작 때 옛 사진에 반응하지 않도록.
+    [11/05] reported(보고경로, 주문) -> True(이 주문 보고 있음) / False(없음) / None(조회 실패)를 주면,
+    우리 단계(키캡 벨트·키캡 팔)인데 보고가 없는 주문은 기록하지 않고 남겨 둠 -> 바로 다시 실행.
+    단계가 돌던 중에 게이트웨이를 다시 켜면 그 주문이 영영 안 돼서 stage_timeout 이 났음.
+    트레이 투입(assigned)은 보고가 없어도 자동으로 다시 하지 않음 - 이미 올렸는데 보고만 못 했으면 트레이가 두 장이 됨"""
     global last_seq
-    last_seq = snapshot.get("seq")
+    resume = []
     for order_id, order in (snapshot.get("orders") or {}).items():
-        handled_by_order[order_id] = (order.get("status"), order.get("retry"))
+        status = order.get("status")
+        path = STAGE_REPORT.get(status)
+        if reported and path and status in HANDLERS and not order.get("fault"):
+            if reported(path, order_id) is False:
+                if status == "assigned":
+                    print(f"[재시작] {order_id} assigned - 트레이 투입 보고가 없음. 트레이가 벨트에 올라가 있는지 확인 "
+                          f"(자동으로 다시 올리지 않음)")
+                else:
+                    print(f"[재시작] {order_id} {status} - 우리 보고가 없음 → 이 단계를 이어서 실행")
+                    resume.append(order_id)
+                    continue
+        handled_by_order[order_id] = (status, order.get("retry"))
+    # 이어서 할 주문이 있으면 seq 를 기록하지 않음 - 같은 사진을 "중복"으로 건너뛰지 않고 처리하게
+    last_seq = None if resume else snapshot.get("seq")
+    return resume
 
 
 @app.route("/notify", methods=["POST"])

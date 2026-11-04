@@ -118,12 +118,25 @@ def run():
             if waited:
                 print('[시작 대기] Mobius 연결됨 - 시작')
             if initial is not None:
+                def reported(path, order_id):
+                    """Mobius 에 이 주문의 우리 보고(그 단계 컨테이너 최신 CIN)가 있는지. 못 읽으면 None"""
+                    try:
+                        con = local_transport.get_latest(path)
+                    except Exception as error:
+                        print(f'[재시작] {path} 읽기 실패 - 이미 한 것으로 봄: {error}')
+                        return None
+                    return isinstance(con, dict) and con.get('order_id') == order_id
+
                 inbox.submit(initial, from_poll=True)
-                ws.mark_as_handled(initial)  # 켤 때 이미 진행 중이던 주문은 기준으로만 (새 status 부터 반응)
+                # 켤 때 이미 진행 중이던 주문은 기준으로만 (새 status 부터 반응). 단 우리 단계인데 보고가 없으면
+                # 꺼지기 전에 못 끝낸 것 -> 이어서 실행 (11/05)
+                ws.mark_as_handled(initial, reported)
             # 시작 기준을 잡은 뒤에 수신 시작 (Mobius 구독 nu = NOTIFY_BASE_URL/notify/process)
             server = notify_server(inbox, notify_port)
             if ws.hw:
-                ws.hw.connect()
+                missing = ws.hw.connect()   # 안 보이는 팔이 있어도 끝내지 않음 - 아래 연결 감시가 다시 찾음
+                if missing:
+                    print(f'!! 연결 못 한 팔: {", ".join(missing)} - USB/전원 확인. 5초마다 다시 시도')
             hb.set_state('idle')
             while True:
                 now = time.monotonic()
@@ -151,6 +164,12 @@ def run():
                     pending = snapshot if process(snapshot) == 'retry' else None
                 if ws.hw:
                     ws.hw.keepalive()
+                    ws.hw.link_watchdog()   # 작업 사이에만: 연결 확인 / 끊긴 팔 재연결 (11/05)
+                    problem = ws.hw.link_problem()
+                    if problem:
+                        hb.set_state('link_lost', problem)   # 상태판·점검에 "연결 끊김"
+                    elif hb.data.get('state') == 'link_lost':
+                        hb.set_state('idle')
                 time.sleep(0.1)
         except KeyboardInterrupt:
             print('로컬 작업자를 종료합니다.')
