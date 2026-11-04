@@ -451,18 +451,23 @@ JS = """
     if (at && Date.now() - at < 20000) { b.disabled = true; b.textContent = '복구 보냄'; }
     b.addEventListener('click', function(){
       var rail = b.getAttribute('data-rail');
+      clearTimeout(window.__refresh);   // 확인 창을 보는 동안 새로 고침이 끼어들어 요청을 취소하지 않게
       if (!window.confirm(rail + ' 칸의 고장 표시를 풀까요? (아두이노에 복구 명령)\\n' +
-        '실패했던 주문을 다시 배출하지는 않습니다 - 다시 배출하려면 플랫폼에서 fault 해제.')) return;
+        '실패했던 주문을 다시 배출하지는 않습니다 - 다시 배출하려면 플랫폼에서 fault 해제.')) {
+        window.__refresh = setTimeout(function(){ location.reload(); }, 3000);   // 취소하면 평소대로 다시 새로 고침
+        return;
+      }
       b.disabled = true; b.textContent = '보내는 중';
       fetch('/repair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rail: rail }) })
         .then(function(r){ return r.json().then(function(j){ return { ok: r.ok, j: j }; }); })
         .then(function(x){
-          if (!x.ok) { window.alert('복구 명령 실패: ' + (x.j.error || JSON.stringify(x.j))); b.disabled = false; b.textContent = '복구'; return; }
+          if (!x.ok) { window.alert('복구 명령 실패: ' + (x.j.error || JSON.stringify(x.j))); b.disabled = false; b.textContent = '복구'; window.__refresh = setTimeout(function(){ location.reload(); }, 10000); return; }
           // 아두이노가 "대기"를 보고하기까지 몇 초 걸림 - 바로 새로 고치면 아직 고장으로 보여서 또 누르게 됨(11/04)
           sent[rail] = Date.now(); try { sessionStorage.setItem('repairSent', JSON.stringify(sent)); } catch(e) {}
           b.textContent = '복구 보냄'; setTimeout(function(){ location.reload(); }, 5000);
         })
-        .catch(function(err){ window.alert('복구 명령 실패: ' + err); b.disabled = false; b.textContent = '복구'; });
+        .catch(function(err){ window.alert('복구 명령 실패: ' + err); b.disabled = false; b.textContent = '복구';
+                               window.__refresh = setTimeout(function(){ location.reload(); }, 10000); });
     });
   });
 })();
@@ -558,8 +563,11 @@ def _render(result, error):
     e = html.escape
     head = (f'<!doctype html><html lang="ko"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">'
-            f'<meta http-equiv="refresh" content="{PAGE_REFRESH_SEC}">'
-            f'<title>창고 상태판</title><style>{CSS}</style></head><body><main class="wrap">')
+            f'<noscript><meta http-equiv="refresh" content="{PAGE_REFRESH_SEC}"></noscript>'
+            f'<title>창고 상태판</title><style>{CSS}</style></head><body><main class="wrap">'
+            # 자동 새로 고침은 스크립트 타이머 - 복구 버튼을 누르면 멈춤. meta refresh는 확인 창이 떠 있는 동안
+            # 밀려 있다가 "확인" 직후 페이지를 넘겨서 막 보낸 복구 요청이 취소됐음 (11/04 두 번 눌러야 하던 원인)
+            f'<script>window.__refresh = setTimeout(function(){{ location.reload(); }}, {PAGE_REFRESH_SEC * 1000});</script>')
     if not result:
         msg = f"점검 코드 오류: {e(error)}" if error else "첫 점검을 하고 있습니다. 20초쯤 걸립니다."
         return head + f'<section class="verdict warn"><p class="say">{msg}</p></section></main></body></html>'
