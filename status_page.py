@@ -444,7 +444,11 @@ JS = """
 })();
 (function(){
   // 고장 칸 "복구": 확인 창에서 "확인"을 눌러야 보냄 (잘못 눌러도 바로 안 나가게)
+  var sent = {}; try { sent = JSON.parse(sessionStorage.getItem('repairSent') || '{}') || {}; } catch(e) {}
   document.querySelectorAll('.rail .fix').forEach(function(b){
+    // 20초 안에 보낸 칸은 새로 고침(10초마다) 뒤에도 "복구 보냄"으로 잠가 둠 - 아직 보고 전이면 또 누르지 않게
+    var at = sent[b.getAttribute('data-rail')];
+    if (at && Date.now() - at < 20000) { b.disabled = true; b.textContent = '복구 보냄'; }
     b.addEventListener('click', function(){
       var rail = b.getAttribute('data-rail');
       if (!window.confirm(rail + ' 칸의 고장 표시를 풀까요? (아두이노에 복구 명령)\\n' +
@@ -452,8 +456,12 @@ JS = """
       b.disabled = true; b.textContent = '보내는 중';
       fetch('/repair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rail: rail }) })
         .then(function(r){ return r.json().then(function(j){ return { ok: r.ok, j: j }; }); })
-        .then(function(x){ window.alert(x.ok ? rail + ' 복구 명령을 보냈습니다. 몇 초 뒤 대기로 바뀌면 됩니다 (배출 중이면 끝난 뒤 다시).'
-                                             : '복구 명령 실패: ' + (x.j.error || JSON.stringify(x.j))); location.reload(); })
+        .then(function(x){
+          if (!x.ok) { window.alert('복구 명령 실패: ' + (x.j.error || JSON.stringify(x.j))); b.disabled = false; b.textContent = '복구'; return; }
+          // 아두이노가 "대기"를 보고하기까지 몇 초 걸림 - 바로 새로 고치면 아직 고장으로 보여서 또 누르게 됨(11/04)
+          sent[rail] = Date.now(); try { sessionStorage.setItem('repairSent', JSON.stringify(sent)); } catch(e) {}
+          b.textContent = '복구 보냄'; setTimeout(function(){ location.reload(); }, 5000);
+        })
         .catch(function(err){ window.alert('복구 명령 실패: ' + err); b.disabled = false; b.textContent = '복구'; });
     });
   });
