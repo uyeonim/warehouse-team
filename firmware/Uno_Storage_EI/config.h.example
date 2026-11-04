@@ -1,0 +1,16 @@
+#pragma once
+// 이 파일을 복사해서 config.h 로 저장한 뒤 값을 채움. config.h 는 커밋 안 됨 (비밀번호 포함)
+
+// ===== WiFi (2.4GHz, R4 WiFi는 5GHz 미지원) =====
+#define WIFI_SSID   "전시장_와이파이_이름"
+#define WIFI_PASS   "전시장_와이파이_비밀번호"
+
+// ===== MQTT (로컬 Mosquitto, TLS 없음) =====
+#define MQTT_HOST   "192.168.0.100"
+#define MQTT_PORT   1883
+#define MQTT_USER   ""      // 익명이면 비워둠
+#define MQTT_PASS   ""
+
+// ===== Flask (창고 PC 키캡 Flask, 로컬 HTTP) =====
+#define FLASK_HOST  "192.168.0.12"
+#define FLASK_PORT  5002

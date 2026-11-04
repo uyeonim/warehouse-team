@@ -541,6 +541,60 @@
    - 변경: 레일이 disable이면 count만 갱신하고 status는 disable 유지. 사람이 fault를
      내리거나 REPAIR 해야만 풀리고, 풀릴 때 갱신된 count 기준으로 idle/empty가 정해짐.
 
+  [2026-11-04 11/03 통합 테스트 대응 - MQTT 구독 확인 + 재부팅 중복 방지 + 복원 재시도]
+   - 배경: 11/03 테스트에서 EI/TF/PJ가 MQTT 연결 LED는 켜진 채 주문을 전혀 못 받음
+     (subscribe 실패를 확인하지 않아 "연결됨 + 수신 불가" 상태로 굳음). NS는 재부팅 후
+     이미 배출한 주문(N_r)을 서버 큐에 다시 넣음. 부팅 시 서버 복원도 1회만 시도했음.
+   - 함께 바뀐 것: Flask가 cnt_process를 retain=True로 발행함. 브로커가 마지막 스냅샷을
+     들고 있다가 구독하는 순간 바로 보내주므로, 재접속/재부팅 직후 항상 최신 주문 목록을
+     받음 (스냅샷은 진행 중 주문 "전체"라서 끊긴 사이 놓친 주문도 다 들어 있음).
+   - (1) 구독 실패 시 재연결: tryConnectMQTT()에서 subscribe() 반환값을 확인하고, 실패면
+     disconnect() -> ensureMQTT()가 MQTT_RETRY_MS(3초)마다 성공할 때까지 계속 재시도.
+   - (2) 자기 에코 확인: PubSubClient의 subscribe()는 SUBSCRIBE 패킷을 "보냈는지"만 알려주고
+     브로커가 거부해도 true를 반환하므로 (1)만으로는 부족함. 보드 전용 토픽
+     (sjuiot/warehouse/ping/{BOARD_NAME})을 같이 구독하고 PING_INTERVAL_MS(2분)마다 자기에게
+     핑을 보내서, PING_TIMEOUT_MS(30초) 안에 안 돌아오면 구독이 죽은 것으로 보고 끊고
+     재접속함. 정상일 땐 절대 끊지 않음. 끊는 건 배출 사이클 중이 아닐 때(DS_IDLE)만.
+     접속 직후 첫 핑은 PING_FIRST_DELAY_MS(10초) 뒤에 보냄.
+     타임아웃을 넉넉히 30초로 잡은 이유: report 호출이 최대 8초 블로킹돼서 핑 수신
+     처리가 늦어질 수 있음.
+   - (3) 재부팅 후 중복 적재 방지: wasHandled() 추가 - "게이트가 잡고 있는 주문 = 이미
+     배출한 주문"으로 취급. 배출은 했는데 아직 assigned인 주문은 게이트에 걸린 주문
+     하나뿐이고(게이트가 풀리면 그 주문은 이미 pickup_reached 이후라 다시 주울 일이 없음),
+     게이트는 Redis에 영속화돼 재부팅해도 남아 있음. handleAssignedOrder()와
+     handleOrderFaults()의 fault 해제 분기 둘 다 이걸로 판단함 - 한쪽만 바꾸면 재부팅 후
+     실패 주문의 fault가 풀릴 때 "미시도 -> 정상 경로에 맡김"으로 빠지는데, 정상 경로는
+     게이트 때문에 안 주워가서 재배출도 게이트 해제도 안 되는 데드락이 생김.
+   - (4) 서버 복원 재시도: 재고/큐/게이트 복원 성공 여부를 각각 플래그로 관리하고, 실패한
+     것만 loop()에서 RESTORE_RETRY_MS(5초)마다 재시도. 셋 다 끝나기 전엔 MQTT 접속(주문
+     수신)도, 배출도 하지 않음. (재고 조회 실패 시 전부 count 0/empty로 시작해서 들어온
+     주문을 "레일 사용 불가"로 버리던 문제, 게이트 조회 실패 시 기본값 open으로 시작하던
+     문제 방지) 복원이 끝난 뒤 구독하면 retained 스냅샷이 바로 들어오므로 주문 유실 없음
+     -> 플랫폼 서버/Flask/아두이노 켜는 순서와 무관하게 동작.
+   - 남겨둔 구멍(기존과 동일): 서보 동작 도중 전원이 나가면 그 job은 서버 큐에 남아
+     재부팅 후 한 번 더 배출될 수 있음.
+
+  [2026-11-04 MQTT 원격 복구(REPAIR) 명령 추가 - 창고팀 요청]
+   - 배경: disable 칸을 푸는 방법이 시리얼 REPAIR(USB 연결 필요)와 플랫폼 fault 해제뿐이라,
+     전시 중 원격으로 disable만 풀 방법이 없었음. 창고팀이 키캡 Flask에 복구 경로와
+     상태판 "복구" 버튼을 붙이기로 하고, 펌웨어는 MQTT로 명령을 받게 해 달라고 요청함.
+   - 토픽: sjuiot/warehouse/command (4대 공통 구독). 메시지(JSON):
+       {"cmd": "REPAIR", "rail": "E_r"}                  -> 시리얼 REPAIR E_r 와 동일
+       {"cmd": "REPAIR", "rail": "ALL", "board": "EI"}   -> 시리얼 REPAIR ALL 과 동일
+     · board(선택): 있으면 BOARD_NAME과 같을 때만 처리. 없으면 rail로만 판단함.
+       rail이 ALL인데 board가 없으면 4대 전부 REPAIR ALL이 되므로, ALL은 board를 같이 보낼 것.
+     · rail이 자기 보드 담당이 아니면 조용히 무시 (4대가 같은 토픽을 받으므로 정상 동작).
+     · 발행 측은 반드시 retain 없이 보낼 것 - retain이면 재부팅/재접속 때마다 REPAIR가 다시 실행됨.
+       (PubSubClient 콜백은 retain 여부를 알려주지 않아 펌웨어에서 걸러낼 수 없음)
+   - 시리얼 REPAIR 처리(상태 복구 + 서버 보고)를 repairRail()/repairAllRails()로 빼서
+     시리얼과 MQTT가 같은 함수를 씀.
+   - 지금 배출 중(busy)인 레일은 REPAIR로 건드리지 않음 (시리얼도 동일하게 적용). 배출 도중
+     idle로 바꾸면 배출 결과 처리와 꼬임 - 배출이 끝난 뒤 다시 보내면 됨.
+   - 구독 실패 확인(11/04 위 항목)에 명령 토픽도 포함.
+   - 참고: REPAIR는 레일 상태만 풂. 플랫폼의 fault는 그대로이고, REPAIR로 먼저 푼 뒤 fault를
+     내리면 "우리 레일은 disable 아니었음"으로 판단해 실패 주문을 재배출하지 않음
+     (재배출이 필요하면 REPAIR 대신 플랫폼에서 fault를 해제할 것).
+
   다른 3개 보드는 이 파일을 복사한 뒤 "보드별 설정" 블록만 아래 표대로
   바꿔서 각 보드에 업로드하면 됩니다. (지금 이 파일은 TF 보드용입니다)
 
@@ -552,6 +606,7 @@
    T/F       'T' / 'F'             2            "arduino_TF"     "TF"
    P/J       'P' / 'J'             3            "arduino_PJ"     "PJ"
   ------------------------------------------------------------------------------
+  ※ AXIS_NAME도 BOARD_NAME과 같은 값으로 바꿀 것 (핑 토픽은 BOARD_NAME으로 만들어짐)
 
   필요 라이브러리 (라이브러리 매니저에서 설치)
    - WiFiS3, PubSubClient, ArduinoJson(v6), ArduinoHttpClient,
@@ -582,7 +637,7 @@ const char  LETTER_0            = 'T';
 const char  LETTER_1            = 'F';
 const uint8_t AXIS_INDEX        = 2;      // keycap 문자열에서의 내 축 위치 (E/I=0, N/S=1, T/F=2, P/J=3)
 const char* MQTT_CLIENT_ID      = "arduino_TF";
-const char* BOARD_NAME           = "TF";  // /queue/{board}/*, /stock/keycap?board=*, /gate/{board} 에 그대로 씀
+const char* BOARD_NAME           = "TF";  // /queue/{board}/*, /stock/keycap?board=*, /gate/{board}, 핑 토픽에 그대로 씀
 // ===========================================================================
 
 // ---- 색상 순서 (colors 배열/보드 내부 인덱싱과 동일 순서로 고정) ----
@@ -791,6 +846,17 @@ bool queueContains(const String& orderId, char letter, char color) {
 bool   gateOpen = true;
 String gateOrderId = "";
 
+// ---- [11/04] 이 주문(의 우리 레일 job)을 이미 처리했는가 ----
+// alreadyProcessed(RAM 기록)는 재부팅하면 지워지므로, 게이트도 같이 봄.
+// "배출은 했는데 아직 assigned인 주문"은 항상 게이트에 걸린 그 주문 하나뿐이고
+// (게이트가 풀리면 그 주문은 이미 pickup_reached 이후라 다시 주울 일이 없음),
+// 게이트는 Redis에 영속화돼 재부팅 후에도 복원되므로 이것만으로 충분함.
+// handleAssignedOrder()와 handleOrderFaults()의 fault 해제 분기 둘 다 이걸로 판단해야 함.
+bool wasHandled(const String& orderId, const String& jobKey) {
+  if (alreadyProcessed(jobKey)) return true;
+  return (!gateOpen && gateOrderId == orderId);
+}
+
 // ---- 게이트를 열어도 되는 상태 목록 ----
 // pickup_reached 이후 단계는 전부 "우리 픽업 지점은 이미 비워진 상태"이므로
 // 다음 배출을 시작해도 됨. 스냅샷 유실로 pickup_reached를 건너뛰고 바로
@@ -813,6 +879,19 @@ bool isGateOpenStatus(const char* status) {
   }
   return false;
 }
+
+// ============================== [11/04] 서버 복원 상태 ==============================
+// 재고/큐/게이트를 서버(Redis)에서 각각 받아왔는지. 셋 다 true가 되기 전엔
+// MQTT에 접속하지 않고(=주문을 안 받고) 배출도 시작하지 않음.
+// 실패한 항목만 loop()의 tryRestoreFromServer()가 RESTORE_RETRY_MS마다 재시도함.
+bool stockRestored = false;
+bool queueRestored = false;
+bool gateRestored  = false;
+bool restoreAttempted = false;
+unsigned long lastRestoreAttemptMs = 0;
+const unsigned long RESTORE_RETRY_MS = 5000;
+
+bool serverRestored() { return stockRestored && queueRestored && gateRestored; }
 
 // ============================== 배출 상태 머신 ==============================
 enum DispenseState { DS_IDLE, DS_HOMING, DS_BREAKAWAY_WAIT, DS_SWEEPING, DS_HOLDING, DS_RETURNING, DS_WAIT_IR };
@@ -871,6 +950,21 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
 // ---- MQTT 토픽 ----
 const char* TOPIC_CNT_PROCESS = "sjuiot/warehouse/process";
+const char* TOPIC_COMMAND     = "sjuiot/warehouse/command";  // [11/04] 원격 REPAIR 명령 (4대 공통, retain 없이 발행할 것)
+
+// ---- [11/04] 구독 생존 확인용 자기 에코(핑) ----
+// 보드 전용 토픽(sjuiot/warehouse/ping/{BOARD_NAME})을 주문 토픽과 같이 구독해두고,
+// 주기적으로 자기에게 핑을 보내서 돌아오는지 확인함. 안 돌아오면 "연결은 됐는데
+// 메시지를 못 받는" 상태로 보고 끊고 재접속함 (재접속 후 retained 스냅샷을 바로 받으므로 유실 없음).
+#define TOPIC_PING_PREFIX     "sjuiot/warehouse/ping/"
+#define PING_FIRST_DELAY_MS   10000UL   // 접속 직후 첫 핑까지 대기 (11/03 같은 상황을 빨리 잡기 위해 짧게)
+#define PING_INTERVAL_MS      120000UL  // 이후 핑 주기 (2분)
+#define PING_TIMEOUT_MS       30000UL   // 이 안에 자기 핑이 안 돌아오면 구독이 죽은 것으로 판단
+char          topicPing[48];            // setup()에서 BOARD_NAME으로 만듦
+bool          pingPending = false;      // 핑을 보내고 아직 돌아오길 기다리는 중
+unsigned long pingSentMs = 0;           // 마지막 핑 보낸 시각
+unsigned long nextPingMs = 0;           // 다음 핑 보낼 시각
+String        pingToken = "";           // 마지막으로 보낸 핑 내용 (돌아온 게 내 핑인지 비교)
 
 // ---- Flask(로컬 서버) 엔드포인트 ----
 const char* REPORT_STATUS_PATH   = "/report/keycap-status";
@@ -896,6 +990,7 @@ bool          ledState = false;
 void ensureWiFi();
 void ensureMQTT();
 bool tryConnectMQTT();
+void checkMqttEcho();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void handleOrdersField(JsonObject orders);
 void handleRestockField(JsonArray restock);
@@ -916,13 +1011,18 @@ int  letterSlot(char c);
 int  colorSlot(char c);
 bool postJsonToFlask(const char* path, const char* payload, String& responseOut, unsigned long timeoutMs = 5000);
 bool getJsonFromFlask(const char* path, String& responseOut);
-void fetchInitialStock();
-void restoreQueueFromServer();
+void tryRestoreFromServer();
+bool fetchInitialStock();
+void checkAllDisabledAfterStockRestore();
+bool restoreQueueFromServer();
 void enqueueToServer(const DispenseJob& job);
 void completeOnServer(const DispenseJob& job);
 void callRestock(int l, int c);
 void checkSerialCommand();
-void restoreGateFromServer();
+void handleCommandMessage(byte* payload, unsigned int length);
+bool repairRail(int l, int c, const char* source);
+void repairAllRails(const char* source);
+bool restoreGateFromServer();
 void lockGateOnServer(const String& orderId);
 void clearGateOnServer();
 void startConnectBlink();
@@ -1001,29 +1101,14 @@ void setup() {
   mqttClient.setBufferSize(4096); // 이보다 큰 메시지는 PubSubClient가 콜백 없이 조용히 버림 - 주문이 몰릴 때 대비해 여유 있게
   mqttClient.setCallback(mqttCallback);
 
-  // 서버(Redis)에서 재고/큐/게이트 복원 - WiFi 연결된 상태에서만 의미 있음
-  // 순서 중요: restoreQueueFromServer()가 먼저 끝나야 jobQueue가 채워진 상태에서
-  // 이후 게이트 재평가(스냅샷 수신 시)가 정상적으로 이어짐.
-  if (WiFi.status() == WL_CONNECTED) {
-    fetchInitialStock();
-    restoreQueueFromServer();
-    restoreGateFromServer();
+  // [11/04] 보드 전용 핑 토픽 (예: sjuiot/warehouse/ping/EI)
+  snprintf(topicPing, sizeof(topicPing), "%s%s", TOPIC_PING_PREFIX, BOARD_NAME);
 
-    // [11/01] 8개 레일이 전부 disable로 복원됐으면 driver 고장 중에 재부팅된 것으로 보고
-    // 배출 금지 상태로 시작 (사람이 keycap_driver_failed fault를 내리거나 REPAIR ALL 할 때까지)
-    bool allDisabled = true;
-    for (int l = 0; l < 2; l++) {
-      for (int c = 0; c < 4; c++) {
-        if (rail[l][c].status != RAIL_DISABLE) allDisabled = false;
-      }
-    }
-    if (allDisabled) {
-      pcaDriverFailed = true;
-      Serial.println("[PCA] 8개 레일 전부 disable로 복원됨 - fault 해제(또는 REPAIR ALL) 전까지 배출 금지");
-    }
-  } else {
-    Serial.println("[경고] WiFi 미연결 상태로 setup 종료 - 재고/큐/게이트 복원 실패, 로컬 기본값 사용됨");
-  }
+  // [11/04] 서버(Redis)에서 재고/큐/게이트 복원 - 여기서 1차 시도하고, 실패한 항목은
+  // loop()의 tryRestoreFromServer()가 RESTORE_RETRY_MS(5초)마다 재시도함.
+  // 셋 다 끝나기 전엔 MQTT 접속(주문 수신)과 배출을 하지 않으므로, Flask가 늦게
+  // 켜져도 재고 0/게이트 open 같은 잘못된 기본값으로 주문을 처리하는 일이 없음.
+  tryRestoreFromServer();
 
   Serial.print("[");
   Serial.print(AXIS_NAME);
@@ -1033,13 +1118,21 @@ void setup() {
   Serial.print("도, IR감시=");   Serial.print(IR_POLL_WINDOW_MS);
   Serial.print("ms, 최소끊김="); Serial.print(IR_MIN_BREAK_MS);
   Serial.print("ms, IR센서=");   Serial.println(IR_SENSOR_INSTALLED ? "사용" : "없음(항상 성공 처리)");
+  Serial.print("[설정] 핑 토픽="); Serial.println(topicPing);
   Serial.println("[안내] 시리얼 명령: SETEMPTY T_r / REPAIR T_r / REPAIR ALL (테스트용)");
+  Serial.print("[안내] 원격 복구: ");
+  Serial.print(TOPIC_COMMAND);
+  Serial.print(" 에 {\"cmd\":\"REPAIR\",\"rail\":\"T_r\"} 또는 {\"cmd\":\"REPAIR\",\"rail\":\"ALL\",\"board\":\"");
+  Serial.print(BOARD_NAME);
+  Serial.println("\"}");
 }
 
 void loop() {
   ensureWiFi();
-  ensureMQTT();
+  tryRestoreFromServer();   // [11/04] 복원 안 끝난 항목만 5초마다 재시도 (다 끝났으면 바로 return)
+  ensureMQTT();             // [11/04] 복원이 다 끝나야 접속함
   mqttClient.loop();
+  checkMqttEcho();          // [11/04] 구독이 살아있는지 자기 핑으로 확인
   runDispenseStateMachine();
   checkSerialCommand();
   updateStatusLed();
@@ -1063,6 +1156,7 @@ const unsigned long MQTT_RETRY_MS = 3000;
 
 void ensureMQTT() {
   if (WiFi.status() != WL_CONNECTED) return;
+  if (!serverRestored()) return;   // [11/04] 재고/큐/게이트 복원 전엔 주문을 받지 않음
   if (mqttClient.connected()) return;
   unsigned long now = millis();
   if (now - lastMqttAttempt < MQTT_RETRY_MS) return;
@@ -1073,6 +1167,9 @@ void ensureMQTT() {
 // [11/01] MQTT_USER가 빈 문자열이면 익명 접속, 아니면 계정 접속
 // 실패 시 state: -2 = TCP 연결 불가(Mosquitto 외부 접속 미허용/방화벽/IP 오류),
 //                 4 = 계정/비번 틀림, 5 = 인증 필요(익명 불가)
+// [11/04] 접속 후 구독(주문 토픽 + 핑 토픽)이 하나라도 실패하면 바로 끊음 ->
+// ensureMQTT()가 MQTT_RETRY_MS(3초)마다 접속+구독이 다 성공할 때까지 계속 재시도.
+// (예전엔 구독 실패를 확인하지 않아서 "연결됨(LED 켜짐) + 수신 불가" 상태로 굳었음 - 11/03)
 bool tryConnectMQTT() {
   Serial.print("[MQTT] 연결 시도... ");
   bool ok;
@@ -1081,15 +1178,66 @@ bool tryConnectMQTT() {
   } else {
     ok = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS);  // 계정
   }
-  if (ok) {
-    Serial.println("성공");
-    mqttClient.subscribe(TOPIC_CNT_PROCESS, 1);
-    startConnectBlink();  // [11/01] 연결 성공 표시
-    return true;
+  if (!ok) {
+    Serial.print("실패, state=");
+    Serial.println(mqttClient.state());
+    return false;
   }
-  Serial.print("실패, state=");
-  Serial.println(mqttClient.state());
-  return false;
+
+  bool subProcess = mqttClient.subscribe(TOPIC_CNT_PROCESS, 1);
+  bool subPing    = mqttClient.subscribe(topicPing, 0);
+  bool subCommand = mqttClient.subscribe(TOPIC_COMMAND, 1);   // [11/04] 원격 REPAIR
+  if (!subProcess || !subPing || !subCommand) {
+    Serial.print("연결은 됐지만 구독 실패 (주문=");
+    Serial.print(subProcess ? "OK" : "실패");
+    Serial.print(", 핑=");
+    Serial.print(subPing ? "OK" : "실패");
+    Serial.print(", 명령=");
+    Serial.print(subCommand ? "OK" : "실패");
+    Serial.println(") - 끊고 재시도");
+    mqttClient.disconnect();
+    return false;
+  }
+
+  Serial.println("성공 (구독 완료)");
+  pingPending = false;
+  nextPingMs = millis() + PING_FIRST_DELAY_MS;  // 접속 직후 첫 핑은 조금 빨리
+  startConnectBlink();  // [11/01] 연결 성공 표시
+  return true;
+}
+
+// ---- [11/04] 구독 생존 확인 (자기 에코) ----
+// 주기적으로 내 핑 토픽에 핑을 보내고, PING_TIMEOUT_MS 안에 그대로 돌아오는지 확인.
+// 돌아오면 브로커 -> 아두이노 수신 경로가 살아있는 것. 안 돌아오면 구독이 죽은
+// 것으로 보고 끊음 -> ensureMQTT()가 재접속+재구독하고, retained 스냅샷을 바로 받음.
+// 정상일 땐 절대 끊지 않음. 끊는 건 배출 사이클 중이 아닐 때(DS_IDLE)만 -
+// 배출 중이면 사이클이 끝난 뒤 다음 loop()에서 판단함.
+void checkMqttEcho() {
+  if (!mqttClient.connected()) { pingPending = false; return; }
+  unsigned long now = millis();
+
+  if (pingPending) {
+    if (now - pingSentMs < PING_TIMEOUT_MS) return;  // 아직 기다리는 중
+    if (dsState != DS_IDLE) return;                    // 배출 중엔 끊지 않음
+    Serial.println("[MQTT] 자기 핑이 " + String(PING_TIMEOUT_MS / 1000) + "초 안에 안 돌아옴 - 구독이 죽은 것으로 보고 재접속");
+    pingPending = false;
+    mqttClient.disconnect();
+    return;
+  }
+
+  if ((long)(now - nextPingMs) < 0) return;  // 아직 보낼 때 아님
+
+  pingToken = String(now);
+  if (mqttClient.publish(topicPing, pingToken.c_str())) {
+    pingPending = true;
+    pingSentMs = now;
+  } else {
+    // 발행 자체가 실패 = 연결이 이미 이상함. 다음 주기에 다시 시도하되,
+    // 배출 중이 아니면 바로 끊고 재접속함.
+    Serial.println("[MQTT] 핑 발행 실패");
+    if (dsState == DS_IDLE) mqttClient.disconnect();
+  }
+  nextPingMs = now + PING_INTERVAL_MS;
 }
 
 // ---- [11/01] MQTT 연결 상태 LED ----
@@ -1121,6 +1269,21 @@ void updateStatusLed() {
 
 // ============================== MQTT 수신 콜백 ==============================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // [11/04] 내 핑이 돌아온 것 - 구독 살아있음 확인
+  if (strcmp(topic, topicPing) == 0) {
+    if (pingPending && length == pingToken.length() &&
+        memcmp(payload, pingToken.c_str(), length) == 0) {
+      pingPending = false;
+    }
+    return;
+  }
+
+  // [11/04] 원격 REPAIR 명령
+  if (strcmp(topic, TOPIC_COMMAND) == 0) {
+    handleCommandMessage(payload, length);
+    return;
+  }
+
   if (strcmp(topic, TOPIC_CNT_PROCESS) != 0) return;
 
   // 스택(지역 2KB 배열) 대신 힙에 할당 - 주문이 많아지면 2048로는 NoMemory로 파싱 실패함
@@ -1137,6 +1300,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   // seq가 없는 스냅샷은 중복 비교를 하지 않음 (없을 때 "null" 문자열끼리 같다고
   // 판단해서 이후 스냅샷을 전부 버리는 일을 막음)
+  // [11/04] retained 스냅샷: 재접속 시 이미 처리한 스냅샷이 다시 오면 여기서 걸러지고,
+  // 끊긴 사이 새 스냅샷이 있었으면 seq가 달라서 정상 처리됨. 재부팅 후엔 lastSeqStr이
+  // 비어 있어 처리되지만, wasHandled()/큐 복원 기록이 중복 적재를 막음.
   if (!doc["seq"].isNull()) {
     String seqStr = doc["seq"].as<String>();
     if (seqStr == lastSeqStr) return; // 동일 스냅샷 -> 재전송 무시
@@ -1280,6 +1446,14 @@ void handleAssignedOrder(const String& orderId, const char* keycap, JsonArray co
   String jobKey = orderId + "_" + String(letter) + "_" + String(color);
   if (alreadyProcessed(jobKey)) return;
 
+  // [11/04] 게이트가 잡고 있는 주문 = 이미 배출한 주문 (재부팅으로 RAM 기록이 지워져도
+  // Redis에서 복원된 게이트로 알 수 있음). 다시 큐에 넣지 않고 기록만 남김.
+  if (wasHandled(orderId, jobKey)) {
+    markProcessed(jobKey);
+    Serial.println("[큐] " + orderId + " 게이트가 잡고 있는 주문(이미 배출함) - 다시 적재하지 않음");
+    return;
+  }
+
   DispenseJob job{orderId, letter, color};
   if (!queuePush(job)) {
     // 중복방지 기록을 남기지 않았으므로 다음 스냅샷에서 다시 주워짐 (유실 아님)
@@ -1296,7 +1470,7 @@ void handleRestockField(JsonArray restock) {
   bool presentNow[2][4] = { {false,false,false,false}, {false,false,false,false} };
 
   for (JsonVariant item : restock) {
-    String rc = item.as<String>(); // 예: "T_r"
+    String rc = item.as<String>(); // 예: "E_r"
     if (rc.length() < 3) continue;
     char letter = rc.charAt(0);
     char color  = rc.charAt(2);
@@ -1432,14 +1606,18 @@ void handleOrderFaults(JsonObject orders) {
           restoreRailsAfterDriverFault(l, c);
         }
 
-        // "아직 한 번도 시도 안 된 job인지"는 status가 아니라 alreadyProcessed로
+        // "아직 한 번도 시도 안 된 job인지"는 status가 아니라 처리 기록으로
         // 판단해야 정확함 - status=="assigned"이어도 이미 배출을 한 번 시도했다가
         // (예: IR 실패로 disable됐다가) fault가 걸린 경우엔 jobKey가 이미
         // processedJobKeys에 있어서 handleOrdersField()가 정상적으로 다시
         // 안 주워감. 그러니 "이미 시도됐는가"만 보고 우리가 직접 넣을지 정함.
+        // [11/04] alreadyProcessed -> wasHandled: 재부팅으로 RAM 기록이 지워졌어도
+        // 게이트가 이 주문을 잡고 있으면 "이미 시도됨"으로 봄. (alreadyProcessed만 보면
+        // 재부팅 후 "미시도 -> 정상 경로에 맡김"으로 빠지는데, 정상 경로는 게이트 때문에
+        // 안 주워가서 재배출도 게이트 해제도 안 되는 데드락이 생김)
         String jobKey = orderId + "_" + String(letter) + "_" + String(color);
 
-        if (!alreadyProcessed(jobKey)) {
+        if (!wasHandled(orderId, jobKey)) {
           // 한 번도 시도된 적 없는 job(진짜 stage_timeout류가 대기 중에 뜬 경우
           // 등) - handleOrdersField()가 이번 스냅샷에서 정상 경로로 알아서
           // 주워가므로 여기선 아무것도 안 함
@@ -1508,6 +1686,10 @@ void runDispenseStateMachine() {
   }
 
   if (dsState == DS_IDLE) {
+    // [11/04] 재고/큐/게이트를 서버에서 다 받아오기 전엔 배출 시작 안 함
+    // (큐만 복원되고 게이트는 아직이면 기본값 open으로 배출해버릴 수 있음)
+    if (!serverRestored()) return;
+
     // PCA9685 드라이버 헬스체크 - 큐에 job이 있을 때만(=배출을 시도할 상황일 때만)
     // 확인함. job이 없으면 아무도 이 값에 의존하지 않으니 체크 자체를 스킵.
     // job이 있는 동안엔 dsState가 계속 DS_IDLE에 머물면서 loop()가 초당 수백~
@@ -1828,6 +2010,57 @@ bool getJsonFromFlask(const char* path, String& responseOut) {
   return false;
 }
 
+// ============================== [11/04] 서버 복원 (재시도 포함) ==============================
+// setup()에서 1차 시도, 이후 loop()에서 실패한 항목만 RESTORE_RETRY_MS(5초)마다 재시도.
+// 셋 다 성공해야 ensureMQTT()가 접속을 시작하고, 배출 상태머신도 job을 꺼내기 시작함.
+// 복원 중엔 MQTT도 배출도 없어서 HTTP 호출이 길게 블로킹돼도 문제없음.
+void tryRestoreFromServer() {
+  if (serverRestored()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  unsigned long now = millis();
+  if (restoreAttempted && now - lastRestoreAttemptMs < RESTORE_RETRY_MS) return;
+  restoreAttempted = true;
+  lastRestoreAttemptMs = now;
+
+  // 순서: 재고 -> 큐 -> 게이트 (각각 독립적으로 재시도, 이미 성공한 건 다시 안 함)
+  if (!stockRestored) {
+    stockRestored = fetchInitialStock();
+    if (stockRestored) checkAllDisabledAfterStockRestore();
+  }
+  if (!queueRestored) queueRestored = restoreQueueFromServer();
+  if (!gateRestored)  gateRestored  = restoreGateFromServer();
+
+  if (serverRestored()) {
+    Serial.println("[복원] 재고/큐/게이트 복원 완료 - 이제 MQTT 접속(주문 수신) 시작");
+    lastMqttAttempt = 0;  // 바로 접속 시도하도록
+  } else {
+    Serial.print("[복원] 일부 실패 (재고=");
+    Serial.print(stockRestored ? "OK" : "실패");
+    Serial.print(", 큐=");
+    Serial.print(queueRestored ? "OK" : "실패");
+    Serial.print(", 게이트=");
+    Serial.print(gateRestored ? "OK" : "실패");
+    Serial.println(") - 5초 뒤 재시도, 완료 전까지 주문 수신/배출 안 함");
+  }
+}
+
+// ---- [11/01] 8개 레일이 전부 disable로 복원됐으면 driver 고장 중에 재부팅된 것으로 보고
+// 배출 금지 상태로 시작 (사람이 keycap_driver_failed fault를 내리거나 REPAIR ALL 할 때까지)
+// [11/04] setup()에 있던 것을 재고 복원 성공 시점에 실행하도록 옮김
+void checkAllDisabledAfterStockRestore() {
+  bool allDisabled = true;
+  for (int l = 0; l < 2; l++) {
+    for (int c = 0; c < 4; c++) {
+      if (rail[l][c].status != RAIL_DISABLE) allDisabled = false;
+    }
+  }
+  if (allDisabled) {
+    pcaDriverFailed = true;
+    Serial.println("[PCA] 8개 레일 전부 disable로 복원됨 - fault 해제(또는 REPAIR ALL) 전까지 배출 금지");
+  }
+}
+
 // ---- 부팅 시 재고 초기 조회 ----
 // 가정하는 응답 형식: {"N_r":{"count":8,"status":"idle"}, "N_y":{...}, ...}
 // count는 항상 로컬 count에 반영. status가 "disable"이면 재부팅 전 마지막
@@ -1835,18 +2068,20 @@ bool getJsonFromFlask(const char* path, String& responseOut) {
 // 재부팅됐다가 모르고 새 배출을 시도하는 걸 막기 위함) - 그 외 status는
 // count 기준(0이면 empty, 아니면 idle)으로 로컬에서 새로 판단함.
 // (형식 다르면 Flask 쪽과 맞춰서 이 파싱부만 수정할 것)
-void fetchInitialStock() {
+// [11/04] 성공 여부를 반환 - 실패하면 tryRestoreFromServer()가 다시 시도함
+// (실패한 동안엔 MQTT/배출이 막혀 있어서 임시값 count 0/empty로 주문을 버리는 일 없음)
+bool fetchInitialStock() {
   String path = String("/stock/keycap?board=") + BOARD_NAME;
   String resp;
   if (!getJsonFromFlask(path.c_str(), resp)) {
-    Serial.println("[재고] 초기 조회 실패 - 로컬 count 0으로 시작 (empty 취급)");
+    Serial.println("[재고] 초기 조회 실패 - 재시도 예정 (그동안 임시로 count 0/empty)");
     for (int l = 0; l < 2; l++) {
       for (int c = 0; c < 4; c++) {
         rail[l][c].count = 0;
         rail[l][c].status = RAIL_EMPTY;
       }
     }
-    return;
+    return false;
   }
 
   StaticJsonDocument<768> doc;
@@ -1854,7 +2089,7 @@ void fetchInitialStock() {
   if (err) {
     Serial.print("[재고] 응답 파싱 실패: ");
     Serial.println(err.c_str());
-    return;
+    return false;
   }
 
   Serial.println("[재고] 서버에서 복원된 값:");
@@ -1868,9 +2103,9 @@ void fetchInitialStock() {
       rail[l][c].count = count;
       if (strcmp(serverStatus, "disable") == 0) {
         // 재부팅 전 disable 상태였음 - 원인(고장/fault)이 해결됐는지 여기선 알 수
-        // 없으므로 일단 disable로 시작. PCA 헬스체크는 살아있으면 자동 복구되고,
-        // fault는 다음 스냅샷에서 재평가되고, 카트리지/서보 고장은 REPAIR 명령
-        // 전까지 그대로 disable 유지됨(의도된 동작).
+        // 없으므로 일단 disable로 시작. fault는 다음 스냅샷에서 재평가되고,
+        // 카트리지/서보 고장은 fault 해제나 REPAIR 명령 전까지 그대로 disable
+        // 유지됨(의도된 동작).
         rail[l][c].status = RAIL_DISABLE;
       } else {
         rail[l][c].status = (count == 0) ? RAIL_EMPTY : RAIL_IDLE;
@@ -1878,16 +2113,19 @@ void fetchInitialStock() {
       Serial.println("  " + key + " = count:" + String(count) + " status:" + String(serverStatus));
     }
   }
+  return true;
 }
 
 // ---- 부팅 시 미완료 큐 복원 ----
-// 가정하는 응답 형식: [{"order_id":"o1","letter":"T","color":"r"}, ...]
-void restoreQueueFromServer() {
+// 가정하는 응답 형식: [{"order_id":"o1","letter":"E","color":"r"}, ...]
+// [11/04] 성공 여부를 반환. 조회/파싱이 실패하면 큐에 아무것도 안 넣은 상태라
+// 재시도해도 중복으로 들어가지 않음.
+bool restoreQueueFromServer() {
   String path = String("/queue/") + BOARD_NAME + "/next";
   String resp;
   if (!getJsonFromFlask(path.c_str(), resp)) {
-    Serial.println("[큐] 서버 큐 조회 실패 - 빈 큐로 시작");
-    return;
+    Serial.println("[큐] 서버 큐 조회 실패 - 재시도 예정");
+    return false;
   }
 
   StaticJsonDocument<1024> doc;
@@ -1895,7 +2133,7 @@ void restoreQueueFromServer() {
   if (err) {
     Serial.print("[큐] 응답 파싱 실패: ");
     Serial.println(err.c_str());
-    return;
+    return false;
   }
 
   JsonArray arr = doc.as<JsonArray>();
@@ -1916,6 +2154,7 @@ void restoreQueueFromServer() {
   }
   Serial.print("[큐] 서버에서 복원된 대기 주문: ");
   Serial.println(restored);
+  return true;
 }
 
 void enqueueToServer(const DispenseJob& job) {
@@ -1985,14 +2224,17 @@ void callRestock(int l, int c) {
 }
 
 // ============================== 게이트 서버 동기화 ==============================
-// ---- 부팅 시 딱 1회: 서버(Redis)에 저장된 게이트 상태 복원 ----
+// ---- 부팅 시: 서버(Redis)에 저장된 게이트 상태 복원 ----
 // 가정하는 응답 형식: {"locked": true, "order_id": "order_test_8017"} 또는 {"locked": false}
-void restoreGateFromServer() {
+// [11/04] 성공 여부를 반환. 조회/파싱 실패 시 예전처럼 "열림"으로 넘어가지 않고
+// tryRestoreFromServer()가 다시 시도함 (열림으로 시작하면 직전 배출이 아직 픽업 안 됐는데
+// 다음 주문을 배출하거나, 이미 배출한 주문을 다시 큐에 넣을 수 있음).
+bool restoreGateFromServer() {
   String path = String(GATE_PATH) + "/" + BOARD_NAME;
   String resp;
   if (!getJsonFromFlask(path.c_str(), resp)) {
-    Serial.println("[게이트] 서버 상태 조회 실패 - 기본값(open)으로 시작");
-    return;
+    Serial.println("[게이트] 서버 상태 조회 실패 - 재시도 예정");
+    return false;
   }
 
   StaticJsonDocument<192> doc;
@@ -2000,8 +2242,7 @@ void restoreGateFromServer() {
   if (err) {
     Serial.print("[게이트] 응답 파싱 실패: ");
     Serial.println(err.c_str());
-    Serial.println("[게이트] 기본값(open)으로 시작");
-    return;
+    return false;
   }
 
   bool locked = doc["locked"] | false;
@@ -2011,15 +2252,16 @@ void restoreGateFromServer() {
       // 서버가 locked=true인데 order_id를 안 줬으면 판단 불가 - 안전하게 열림 처리
       gateOpen = true;
       Serial.println("[게이트] 복원: locked=true인데 order_id 없음 - 방어적으로 열림 처리");
-      return;
+      return true;
     }
     gateOpen = false;
-    Serial.println("[게이트] 복원: " + gateOrderId + " pickup 대기 중 (잠금 상태로 시작)");
+    Serial.println("[게이트] 복원: " + gateOrderId + " pickup 대기 중 (잠금 상태로 시작, 이 주문은 다시 적재하지 않음)");
   } else {
     gateOpen = true;
     gateOrderId = "";
     Serial.println("[게이트] 복원: 잠긴 것 없음 (열림 상태로 시작)");
   }
+  return true;
 }
 
 // ---- 게이트 잠글 때(배출 직후) 서버에도 기록 - 재부팅 대비 ----
@@ -2084,11 +2326,99 @@ void reportDispenseResult(const String& orderId, char letter, char color) {
   postJsonToFlask(REPORT_DISPENSE_PATH, payload, resp, FLASK_MOBIUS_TIMEOUT_MS);
 }
 
+// ============================== [11/04] REPAIR 공통 처리 (시리얼 + MQTT) ==============================
+// 시리얼 REPAIR와 MQTT 원격 REPAIR가 같은 함수를 씀. source는 로그 구분용("시리얼"/"MQTT").
+
+// ---- 레일 1개 복구: 재고 기준 상태(0이면 empty, 아니면 idle)로 되돌리고 서버(Mobius)에 보고 ----
+// 지금 배출 중(busy)인 레일은 건드리지 않음 - 배출 결과 처리와 꼬이므로, 끝난 뒤 다시 보내면 됨.
+// 처리했으면 true, busy라서 건너뛰었으면 false.
+bool repairRail(int l, int c, const char* source) {
+  String key = letterColorKey(l, c);
+  if (rail[l][c].status == RAIL_BUSY) {
+    Serial.println("[" + String(source) + "] REPAIR " + key + " -> 지금 배출 중이라 건너뜀 (끝난 뒤 다시 보낼 것)");
+    return false;
+  }
+  rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
+  reportRailStatus(letterOf(l), colorOf(c), rail[l][c].status, ""); // 명령발 - order_id 없음(null)
+  Serial.println("[" + String(source) + "] REPAIR " + key + " -> " + (rail[l][c].status == RAIL_EMPTY ? "empty" : "idle") + "로 복구, 서버에도 보고함");
+  if (pcaDriverFailed) {
+    Serial.println("[" + String(source) + "] 참고: driver 고장으로 배출 금지 중 - fault를 내리거나 REPAIR ALL 해야 배출이 재개됨");
+  }
+  return true;
+}
+
+// ---- 전체 복구: disable 레일 전부 복구 + driver 고장 배출 금지 해제 ----
+// (PCA 고장 당시 대기 주문이 없어 플랫폼에 내릴 fault가 없을 때 등)
+void repairAllRails(const char* source) {
+  for (int l = 0; l < 2; l++) {
+    for (int c = 0; c < 4; c++) {
+      if (rail[l][c].status != RAIL_DISABLE) continue;
+      rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
+      reportRailStatus(letterOf(l), colorOf(c), rail[l][c].status, ""); // 명령발 - order_id 없음(null)
+    }
+  }
+  pcaDriverFailed = false;
+  pcaHasRelatedOrder = false;
+  Serial.println("[" + String(source) + "] REPAIR ALL -> disable 레일 전부 복구, 배출 금지 해제, 서버에도 보고함");
+}
+
+// ---- [11/04] MQTT 원격 명령 처리 (sjuiot/warehouse/command) ----
+// 형식: {"cmd": "REPAIR", "rail": "E_r"} / {"cmd": "REPAIR", "rail": "ALL", "board": "EI"}
+// - board가 있으면 내 보드일 때만 처리, 없으면 rail로만 판단
+// - rail이 내 담당이 아니면 조용히 무시 (4대가 같은 토픽을 받음)
+// - REPAIR 외의 cmd는 무시 (SETEMPTY 등은 원격으로 열지 않음)
+void handleCommandMessage(byte* payload, unsigned int length) {
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    Serial.print("[MQTT명령] JSON 파싱 실패: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  const char* board = doc["board"] | "";
+  if (board[0] != '\0' && strcmp(board, BOARD_NAME) != 0) return;  // 다른 보드 대상
+
+  String cmd  = String((const char*)(doc["cmd"] | ""));
+  String railStr = String((const char*)(doc["rail"] | ""));
+  cmd.trim();
+  railStr.trim();
+  cmd.toUpperCase();
+
+  if (cmd != "REPAIR") {
+    if (board[0] != '\0') {  // 나를 콕 집어 보낸 명령인데 모르는 cmd면 로그만 남김
+      Serial.println("[MQTT명령] 알 수 없는 cmd: " + cmd);
+    }
+    return;
+  }
+
+  if (railStr.equalsIgnoreCase("ALL")) {
+    if (board[0] == '\0') {
+      Serial.println("[MQTT명령] REPAIR ALL (board 지정 없음 - 4대 공통으로 처리됨)");
+    }
+    repairAllRails("MQTT명령");
+    return;
+  }
+
+  if (railStr.length() < 3 || railStr.charAt(1) != '_') {
+    if (board[0] != '\0') Serial.println("[MQTT명령] rail 형식 오류: " + railStr + " (예: E_r)");
+    return;
+  }
+  int l = letterSlot(railStr.charAt(0));
+  int c = colorSlot(railStr.charAt(2));
+  if (l < 0 || c < 0) {
+    if (board[0] != '\0') Serial.println("[MQTT명령] " + railStr + " 는 이 보드(" + String(BOARD_NAME) + ") 담당 레일이 아님");
+    return;  // 다른 보드 담당 - 정상적으로 무시
+  }
+  repairRail(l, c, "MQTT명령");
+}
+
 // ============================== 시리얼 테스트 명령 ==============================
-// SETEMPTY T_r  : 해당 레일을 강제로 count=0/empty로 만듦 (restock 흐름 테스트용)
-// REPAIR T_r    : disable 상태인 레일을 idle로 복구 (count는 그대로 유지)
+// SETEMPTY E_r  : 해당 레일을 강제로 count=0/empty로 만듦 (restock 흐름 테스트용)
+// REPAIR E_r    : disable 상태인 레일을 idle로 복구 (count는 그대로 유지)
 // REPAIR ALL    : disable 레일 전부 복구 + driver 고장 배출 금지 해제
 //                 (PCA 고장 당시 대기 주문이 없어 플랫폼에 내릴 fault가 없을 때 사용)
+// [11/04] REPAIR 처리는 repairRail()/repairAllRails()로 옮김 (MQTT 원격 명령과 공용)
 void checkSerialCommand() {
   if (!Serial.available()) return;
   String line = Serial.readStringUntil('\n');
@@ -2101,22 +2431,13 @@ void checkSerialCommand() {
   arg.trim();
 
   if (cmd == "REPAIR" && (arg == "ALL" || arg == "all")) {
-    for (int l = 0; l < 2; l++) {
-      for (int c = 0; c < 4; c++) {
-        if (rail[l][c].status != RAIL_DISABLE) continue;
-        rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
-        reportRailStatus(letterOf(l), colorOf(c), rail[l][c].status, ""); // 시리얼 명령발 - order_id 없음(null)
-      }
-    }
-    pcaDriverFailed = false;
-    pcaHasRelatedOrder = false;
-    Serial.println("[명령] REPAIR ALL -> disable 레일 전부 복구, 배출 금지 해제, 서버에도 보고함");
+    repairAllRails("명령");
     return;
   }
 
   if (cmd == "SETEMPTY" || cmd == "REPAIR") {
     if (arg.length() < 3 || arg.charAt(1) != '_') {
-      Serial.println("[명령] 형식: " + cmd + " T_r (글자_색상)");
+      Serial.println("[명령] 형식: " + cmd + " E_r (글자_색상)");
       return;
     }
     char letter = arg.charAt(0);
@@ -2134,12 +2455,7 @@ void checkSerialCommand() {
       reportRailStatus(letter, color, RAIL_EMPTY, ""); // 시리얼 명령발 - order_id 없음(null)
       Serial.println("[명령] " + arg + " -> empty로 강제 설정, 서버에도 보고함");
     } else { // REPAIR
-      rail[l][c].status = (rail[l][c].count == 0) ? RAIL_EMPTY : RAIL_IDLE;
-      reportRailStatus(letter, color, rail[l][c].status, ""); // 시리얼 명령발 - order_id 없음(null)
-      Serial.println("[명령] " + arg + " -> " + (rail[l][c].status == RAIL_EMPTY ? "empty" : "idle") + "로 복구, 서버에도 보고함");
-      if (pcaDriverFailed) {
-        Serial.println("[명령] 참고: driver 고장으로 배출 금지 중 - fault를 내리거나 REPAIR ALL 해야 배출이 재개됨");
-      }
+      repairRail(l, c, "명령");
     }
     return;
   }

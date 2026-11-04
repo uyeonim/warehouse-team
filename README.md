@@ -45,7 +45,7 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 │  └─ tools/                       좌표·R 튜닝, 카메라, 픽업/컨베이어 점검, 구독 등록, 통신 테스트
 ├─ keycap_flask/                   키캡 Flask + 구독 등록             (.env.example)
 ├─ keycap_tray/                    키캡 팔 2 · 트레이 팔 · 키캡 벨트   (.env.local.example, README, 참고사항.md)
-└─ firmware/                       키캡 아두이노 PJ · TF (EI · NS는 키캡팀 최신 로컬 버전 반영 대기)
+└─ firmware/                       키캡 아두이노 4대 EI · NS · TF · PJ (11/04 키캡팀 버전 - 원격 복구·재접속, config.h.example 복사해 값 채움)
 ```
 
 ## 처음 설치 (창고 노트북 한 번)
