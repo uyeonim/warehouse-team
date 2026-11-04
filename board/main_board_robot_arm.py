@@ -1417,20 +1417,20 @@ def check_board_restock(data):
             handled_restock.discard(color)
 
 
-# ---- 플랫폼 하드리셋 (orders가 빈 스냅샷 = 전시 시작 때 한 번. 끝난 주문은 completed로 남음) ----
+# ---- 플랫폼 하드리셋 (cnt_process에 "reset": true. orders가 빈 것만으론 아님 - restock 스냅샷도 비어서 옴) ----
 # 재고 초기화는 키캡 Flask가 한 곳에서 함(같은 Redis) -> 여기선 주문 기억을 비우고, 초기화가 끝났을
 # 즈음 재고를 다시 읽음. 큐·게이트·컨베이어 기억은 "목록에서 사라진 주문" 정리로 이미 비워짐
 HARD_RESET_STOCK_RELOAD_SEC = (5, 15)   # 키캡 Flask가 알림을 놓쳐 5초 조회로 늦게 리셋해도 따라가게 두 번
 _stock_reload_at = []
 
 
-def check_hard_reset(orders):
-    if orders:
+def check_hard_reset(data):
+    if data.get("reset") is not True:
         return
     processed_job_keys.clear()
     now = time.time()
     _stock_reload_at[:] = [now + s for s in HARD_RESET_STOCK_RELOAD_SEC]
-    log("RESET", "orders 빈 스냅샷(플랫폼 하드리셋) - 픽업 기록 비움, 재고는 키캡 Flask 초기화 뒤 다시 읽음")
+    log("RESET", "플랫폼 하드리셋(reset 표시) - 픽업 기록 비움, 재고는 키캡 Flask 초기화 뒤 다시 읽음")
 
 
 def reload_stock_if_due():
@@ -1452,7 +1452,7 @@ def handle_snapshot(loop, arm_api, box_api, data):
     orders = data.get("orders", {})
 
     # 0. 플랫폼 하드리셋
-    check_hard_reset(orders)
+    check_hard_reset(data)
 
     # 1. 게이트 재평가
     check_gate_against_orders(orders)
