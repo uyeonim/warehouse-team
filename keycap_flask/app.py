@@ -104,7 +104,10 @@ RAIL_CAPACITY = 30  # 카트리지(stock) 최대 장전 개수, 아두이노 MAX
 # 키캡과 동일한 한 글자 색상 코드를 그대로 재사용함 (cnt_red 같은 전체 단어 아님)
 BOARD_COLORS = COLORS  # ["r", "y", "b", "g"]
 BOARD_CARTRIDGE_CAPACITY = 20  # 카트리지에 실제로 장전되는 재고
-BOARD_POOL_TOTAL = 300  # 색상별 전체 재고 총량(카트리지 포함) — 창고 pool = 이 값 - 카트리지분
+# [11/04] 전시 총 재고표 (카트리지 포함, 색마다 같은 수) - 하드리셋 때 pool = 총량 - 카트리지분
+#   보드 66×5 = 330/색 (예전 300), 키캡은 글자별 (문자 키캡 ★·꽃 등은 카트리지 칸이 없어 제외)
+BOARD_POOL_TOTAL = 330  # 색상별 전체 재고 총량(카트리지 포함) — 창고 pool = 이 값 - 카트리지분
+KEYCAP_TOTAL_PER_COLOR = {"E": 190, "I": 170, "N": 160, "S": 200, "T": 170, "F": 200, "P": 180, "J": 180}
 
 app = Flask(__name__)
 
@@ -241,7 +244,10 @@ def notify(kind):
 def _relay(kind, con, via):
     """스냅샷을 MQTT로 보냄. 보낸 내용을 기억해서 주기 조회(_process_poll_loop)가 같은 걸 또 보내지 않게 함"""
     global _last_relayed
-    payload = json.dumps(con, ensure_ascii=False)
+    reset_con = _auto_hard_reset(con) if kind == "process" else None
+    # 하드리셋 땐 아두이노 수량 맞추기용 keycap_restock을 실은 스냅샷을 보냄. _last_relayed가 원래 스냅샷과 달라지므로
+    # 다음 주기 조회(5초 안)가 원래 스냅샷을 다시 보내서 브로커 retain도 restock 없는 걸로 바뀜 (같은 seq라 아두이노는 무시)
+    payload = json.dumps(reset_con or con, ensure_ascii=False)
     ok = publish(TOPICS[kind], payload)
     if ok:
         with _relay_lock:
@@ -249,6 +255,9 @@ def _relay(kind, con, via):
         logger.info(f"[{kind}] → MQTT 전송 완료(retain, {via}): {payload}")
     else:
         logger.error(f"[{kind}] → MQTT 전송 실패({via}): {payload}")
+    if reset_con is not None:
+        failed = _upload_reset_to_mobius()
+        logger.info(f"[reset] 하드리셋 모비우스 업로드 실패: {failed if failed else '없음'}")
     return ok
 
 
@@ -551,6 +560,13 @@ def restock_letter_color(letter, color):
     # 개수 기준으로 새로 계산함 - restock은 보통 재고가 empty였을 때 일어나는데,
     # 마지막 저장값을 그대로 쓰면 다 채워놓고도 status가 옛날 empty로 잘못
     # 올라가는 문제가 있었음.
+    # [11/04] 하드리셋 직후: 아두이노 RAM 수량 맞추기용 호출 - pool·status·모비우스는 리셋에서 이미 처리했으니
+    # 건드리지 않고 지금 stock만 돌려줌 (_auto_hard_reset 참고)
+    if redis.exists("reset:restock_window"):
+        stock = int(redis.get(f"stock:{letter_color}") or 0)
+        print(f"[restock] {letter_color}: 하드리셋 직후 수량 맞추기 -> {stock}개 (pool 그대로)")
+        return jsonify({"filled": stock, "status": get_last_status(f"status:{letter_color}"), "mobius_ok": True}), 200
+
     data = request.get_json(force=True, silent=True) or {}
     status_key = f"status:{letter_color}"
     status = data.get("status")
@@ -651,9 +667,61 @@ def clear_gate(board):
 #   업로드함. status 캐시(status:{key})는 그대로 유지함 — 재고 초기화가 고장난
 #   하드웨어를 고쳐주는 건 아니므로, 실제 마지막 상태 정보를 잃어버리면 안 됨.
 #
-# 주의: 키캡의 pool:{letter}_{color}(전체 재고) 총량은 이 코드에서 관리하지 않으므로
-# 하드 리셋에서도 건드리지 않음. (로컬 Redis 최초 구성 시 redis-cli -n 2 set pool:E_r 158
-# 처럼 직접 넣어야 restock이 0개로 채워지지 않음)
+# [11/04] 키캡 pool:{letter}_{color}도 하드리셋 때 KEYCAP_TOTAL_PER_COLOR - RAIL_CAPACITY로 되돌림
+#   (예전엔 키캡 pool은 안 건드려서 redis-cli로 직접 넣어야 했음)
+#
+# [11/04] 자동 하드리셋: 플랫폼이 orders가 빈 cnt_process를 보내면(전시 시작 때 한 번뿐 - 끝난 주문은
+#   completed로 남음) _relay()가 위 하드리셋을 한 번 실행하고, 아두이노 4대가 자기 RAM의 수량을 맞추도록
+#   그 스냅샷에 keycap_restock(32칸 전부)을 실어 보냄. 아두이노는 기존 재보충 기능으로 /restock/<글자>/<색>을
+#   부르는데, 리셋 직후(RESET_RESTOCK_WINDOW_SEC)엔 pool을 빼지 않고 지금 stock만 돌려줌.
+#   disable 칸은 수량만 바뀌고 disable 유지 (아두이노 펌웨어가 restock으로 disable을 안 풂).
+#   같은 리셋 스냅샷(seq+updated_at)이 다시 와도(알림 재전송·주기 조회·재시작) 두 번 안 함 - Redis reset:last_id
+# ============================================================
+RESET_RESTOCK_WINDOW_SEC = 120
+_reset_lock = threading.Lock()
+
+
+def _do_hard_reset():
+    """Redis 재고·pool·큐·게이트를 전시 시작 상태로. 모비우스 업로드는 _upload_reset_to_mobius()"""
+    for letters in BOARD_LETTERS.values():
+        for letter in letters:
+            for color in COLORS:
+                redis.set(f"stock:{letter}_{color}", RAIL_CAPACITY)
+                redis.set(f"pool:{letter}_{color}", KEYCAP_TOTAL_PER_COLOR[letter] - RAIL_CAPACITY)
+    for color in BOARD_COLORS:
+        redis.set(f"stock:board_{color}", BOARD_CARTRIDGE_CAPACITY)
+        redis.set(f"pool:board_{color}", BOARD_POOL_TOTAL - BOARD_CARTRIDGE_CAPACITY)
+    for board in BOARD_LETTERS:
+        redis.delete(f"queue:{board}")
+        redis.delete(f"gate:{board}")
+
+
+def _upload_reset_to_mobius():
+    # status 캐시는 지우지 않음 — 재고 초기화가 고장 상태를 고쳐주는 게 아니라서,
+    # 지워버리면 다음 restock 때 실제로는 disable인데 idle로 잘못 올라갈 수 있음
+    results = {}
+    for lc in _all_keycap_letter_colors():
+        content = {"order_id": None, "count": RAIL_CAPACITY, "status": None}
+        results[lc] = post_cin_to_mobius(f"cnt_warehouse/cnt_keycap_status/cnt_{lc}", content)
+    for color in BOARD_COLORS:
+        content = {"order_id": None, "count": BOARD_CARTRIDGE_CAPACITY, "status": None}
+        results[f"board_{color}"] = post_cin_to_mobius(f"cnt_warehouse/cnt_board_status/cnt_{color}", content)
+    return [k for k, ok in results.items() if not ok]
+
+
+def _auto_hard_reset(con):
+    """orders가 빈 스냅샷이면 한 번만 하드리셋. 했으면 아두이노에 보낼 스냅샷(keycap_restock 32칸 포함)을 반환"""
+    if not isinstance(con, dict) or con.get("orders") != {}:
+        return None
+    reset_id = f"{con.get('seq')}|{con.get('updated_at')}"
+    with _reset_lock:
+        if redis.get("reset:last_id") == reset_id:
+            return None
+        _do_hard_reset()
+        redis.set("reset:last_id", reset_id)
+        redis.set("reset:restock_window", 1, ex=RESET_RESTOCK_WINDOW_SEC)
+    logger.info(f"[reset] 플랫폼 하드리셋 감지 (orders 빈 스냅샷 seq={con.get('seq')}) -> 재고·pool·큐·게이트 초기화")
+    return dict(con, keycap_restock=_all_keycap_letter_colors())
 # ============================================================
 def _all_keycap_letter_colors():
     return [
@@ -696,37 +764,10 @@ def reset_mobius():
 
 @app.route("/reset/hard", methods=["POST"])
 def reset_hard():
-    # 1) 키캡 카트리지 재고 → 최대치(RAIL_CAPACITY)로 리셋
-    keycap_lcs = _all_keycap_letter_colors()
-    for lc in keycap_lcs:
-        redis.set(f"stock:{lc}", RAIL_CAPACITY)
-
-    # 2) 보드 카트리지 재고 → 최대치로, 창고 pool → 전체 재고에서 카트리지분을 뺀 값으로 리셋
-    for color in BOARD_COLORS:
-        redis.set(f"stock:board_{color}", BOARD_CARTRIDGE_CAPACITY)
-        redis.set(f"pool:board_{color}", BOARD_POOL_TOTAL - BOARD_CARTRIDGE_CAPACITY)
-
-    # 3) 진행 중이던 주문 상태(큐/게이트) 전부 비움
-    for board in BOARD_LETTERS:
-        redis.delete(f"queue:{board}")
-        redis.delete(f"gate:{board}")
-
-    # 4) 리셋된 값을 order_id=null, status=null로 모비우스에 업로드
-    #    (status 캐시는 지우지 않음 — 재고 초기화가 고장 상태를 고쳐주는 게 아니라서,
-    #    지워버리면 다음 restock 때 실제로는 disable인데 idle로 잘못 올라갈 수 있음)
-    results = {}
-
-    for lc in keycap_lcs:
-        content = {"order_id": None, "count": RAIL_CAPACITY, "status": None}
-        ok = post_cin_to_mobius(f"cnt_warehouse/cnt_keycap_status/cnt_{lc}", content)
-        results[lc] = ok
-
-    for color in BOARD_COLORS:
-        content = {"order_id": None, "count": BOARD_CARTRIDGE_CAPACITY, "status": None}
-        ok = post_cin_to_mobius(f"cnt_warehouse/cnt_board_status/cnt_{color}", content)
-        results[f"board_{color}"] = ok
-
-    failed = [k for k, ok in results.items() if not ok]
+    # 수동 하드리셋 - 자동(_auto_hard_reset)과 같은 값. 아두이노 RAM 수량은 안 바뀜 -> 아두이노 전원 껐다 켤 것
+    with _reset_lock:
+        _do_hard_reset()
+    failed = _upload_reset_to_mobius()
     print(f"[reset/hard] 하드 리셋 완료, 모비우스 업로드 실패: {failed if failed else '없음'}")
     return jsonify({"result": "ok" if not failed else "partial_fail", "failed": failed}), (200 if not failed else 207)
 
