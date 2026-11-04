@@ -3,6 +3,8 @@ import json
 import uuid
 import logging
 import sys
+import threading
+import time
 import requests
 import paho.mqtt.client as mqtt
 import redis as redis_lib
@@ -232,14 +234,73 @@ def notify(kind):
         except ValueError as e:
             logger.error(f"[notify/{kind}] con JSON 파싱 실패: {e}, con 원본: {con}")
 
+    _relay(kind, con, "알림")
+    return "", 200
+
+
+def _relay(kind, con, via):
+    """스냅샷을 MQTT로 보냄. 보낸 내용을 기억해서 주기 조회(_process_poll_loop)가 같은 걸 또 보내지 않게 함"""
+    global _last_relayed
     payload = json.dumps(con, ensure_ascii=False)
     ok = publish(TOPICS[kind], payload)
     if ok:
-        logger.info(f"[{kind}] → MQTT 전송 완료(retain): {payload}")
+        with _relay_lock:
+            _last_relayed = payload
+        logger.info(f"[{kind}] → MQTT 전송 완료(retain, {via}): {payload}")
     else:
-        logger.error(f"[{kind}] → MQTT 전송 실패: {payload}")
+        logger.error(f"[{kind}] → MQTT 전송 실패({via}): {payload}")
+    return ok
 
-    return "", 200
+
+# ============================================================
+# [11/04] cnt_process 주기 조회 - 알림 누락 보충 (보드 main·게이트웨이와 같은 방식)
+#  - 노트북 절전·네트워크 끊김 동안 Mobius 알림을 못 받으면 그 주문이 아두이노에 영영 안 감
+#    (retain은 마지막으로 "보낸" 스냅샷만 다시 줌). 2026-11-04 19:26~19:42 절전 사례.
+#  - PROCESS_POLL_SEC마다 cnt_process/la를 읽어서, 마지막으로 보낸 것과 내용이 다르면 그대로 보냄.
+#    같은 스냅샷이 두 번 가도 아두이노는 seq로 걸러냄. 켜자마자 첫 조회에서 최신 스냅샷을 한 번 보냄.
+#  - PROCESS_POLL_SEC=0 이면 끔
+# ============================================================
+PROCESS_POLL_SEC = float(os.getenv("PROCESS_POLL_SEC", "5"))
+_last_relayed = None
+_relay_lock = threading.Lock()
+
+
+def _get_latest_process():
+    url = f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/cnt_process/la"
+    headers = {"Accept": "application/json", "X-M2M-RI": str(uuid.uuid4()), "X-M2M-RVI": "3",
+               "X-M2M-Origin": ORIGIN}
+    if COSS_API_KEY:
+        headers["X-API-KEY"] = COSS_API_KEY
+        headers["X-AUTH-CUSTOM-LECTURE"] = COSS_LECTURE
+        headers["X-AUTH-CUSTOM-CREATOR"] = COSS_CREATOR
+    resp = requests.get(url, headers=headers, timeout=5)
+    resp.raise_for_status()
+    con = resp.json()["m2m:cin"]["con"]
+    return json.loads(con) if isinstance(con, str) else con
+
+
+def _process_poll_loop():
+    failing = False
+    while True:
+        time.sleep(PROCESS_POLL_SEC)
+        try:
+            con = _get_latest_process()
+            if failing:
+                logger.info("[poll] cnt_process 주기 조회 복구됨")
+                failing = False
+        except Exception as e:
+            if not failing:   # 끊겨 있는 동안 5초마다 찍히지 않게 처음 한 번만
+                logger.warning(f"[poll] cnt_process 주기 조회 실패 - {PROCESS_POLL_SEC:g}초마다 재시도 ({e})")
+                failing = True
+            continue
+        with _relay_lock:
+            same = json.dumps(con, ensure_ascii=False) == _last_relayed
+        if not same:
+            _relay("process", con, "주기 조회 - 알림 누락 보충" if _last_relayed else "시작 시 조회")
+
+
+if PROCESS_POLL_SEC > 0:
+    threading.Thread(target=_process_poll_loop, daemon=True, name="process-poll").start()
 
 
 # ============================================================

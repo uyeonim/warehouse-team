@@ -678,7 +678,7 @@ def _mark_link_lost(res):
 async def reconnect_robot(arm_api):
     """연결 해제 -> 다시 연결 -> 알람 해제 -> HOME. 성공하면 True.
     해제를 먼저 하는 이유: DobotLink가 끊긴 포트를 아직 열린 걸로 보고 연결을 거부할 수 있음."""
-    global link_lost, DOBOT_PORT
+    global link_lost, DOBOT_PORT, _link_timeouts
     if not REHEARSAL:
         # USB를 다시 꽂았으면 COM 번호가 바뀌었을 수 있음 -> 시리얼로 다시 찾음 (못 찾으면 다음 주기에 다시)
         port = resolve_port(DOBOT_SERIAL, DOBOT_PORT_FALLBACK)
@@ -693,6 +693,7 @@ async def reconnect_robot(arm_api):
         return False
     await safe_call(arm_api.ClearAllAlarmsState(portName=DOBOT_PORT))
     link_lost = False   # 아래 이동에서 또 끊기면 safe_call이 다시 True로 만듦
+    _link_timeouts = 0
     hx, hy, hz = HOME_XYZ
     ok, _ = await move_and_wait(arm_api, (hx, hy, hz, r_for(hx, hy, HOME_WRIST_DEG)),
                                 label="재연결 - 초기위치로 이동")
@@ -704,12 +705,17 @@ async def reconnect_robot(arm_api):
     return True
 
 
+LINK_TIMEOUT_LIMIT = 2   # 대기 중 GetPose TIMEOUT이 이만큼 연달아 나면 끊김으로 봄
+_link_timeouts = 0
+
+
 def link_watchdog(loop):
     """메인 루프에서 주문 처리 사이에만 호출. 끊겼으면 LINK_RETRY_INTERVAL_SEC마다 재연결,
     정상이면 LINK_CHECK_INTERVAL_SEC마다 GetPose로 확인 (주문이 오기 전에 미리 알아채려고).
-    GetPose는 정상이면 에러가 날 일이 없어서, TIMEOUT 이 아닌 ERROR 면 끊김으로 봄
-    (DobotLink 자체가 꺼진 경우처럼 141 이 아닌 에러도 잡으려고)."""
-    global _last_link_check
+    GetPose는 정상이면 에러가 날 일이 없어서 ERROR 면 바로 끊김 (DobotLink 자체가 꺼진 경우처럼
+    141 이 아닌 에러도 잡으려고). TIMEOUT 은 LINK_TIMEOUT_LIMIT번 연달아 나면 끊김 -
+    2026-11-04 노트북 절전 뒤 DobotLink가 에러 없이 무응답만 해서 컨베이어가 failed 됨."""
+    global _last_link_check, _link_timeouts
     now = time.time()
     interval = LINK_RETRY_INTERVAL_SEC if link_lost else LINK_CHECK_INTERVAL_SEC
     if now - _last_link_check < interval:
@@ -721,6 +727,12 @@ def link_watchdog(loop):
     res = loop.run_until_complete(safe_call(_arm_api.GetPose(portName=DOBOT_PORT, isQueued=False)))
     if isinstance(res, str) and res.startswith("ERROR"):
         _mark_link_lost(res)
+    elif res == "TIMEOUT":
+        _link_timeouts += 1
+        if _link_timeouts >= LINK_TIMEOUT_LIMIT:
+            _mark_link_lost(f"GetPose TIMEOUT {_link_timeouts}회 연속")
+    else:
+        _link_timeouts = 0
 
 
 class RehearsalDobot:
@@ -758,9 +770,16 @@ class RehearsalDobot:
 
 
 def ensure_link(loop):
-    """작업(픽업/컨베이어) 시작 직전: 끊김 표시가 있으면 재연결을 한 번 시도.
+    """작업(픽업/컨베이어) 시작 직전: 팔이 응답하는지 GetPose로 한 번 보고(TIMEOUT 포함 응답 없으면 끊김),
+    끊겼으면 재연결(-> HOME)을 한 번 시도. 게이트웨이 dobot_control.ensure_connected()와 같은 방식.
     그래도 안 되면 그대로 진행 -> 명령이 실패해서 지금처럼 failed 보고."""
-    global _last_link_check
+    global _last_link_check, _link_timeouts
+    if not link_lost:
+        res = loop.run_until_complete(safe_call(_arm_api.GetPose(portName=DOBOT_PORT, isQueued=False), 3))
+        if not isinstance(res, dict):
+            _mark_link_lost(f"작업 전 확인 응답 없음 ({res})")
+        else:
+            _link_timeouts = 0
     if link_lost:
         log("LINK", "작업 시작 전 재연결 시도")
         _last_link_check = time.time()

@@ -4,7 +4,7 @@
 #   2) Python 3.9 가상환경(venv) + requirements.txt
 #   3) Redis 설정 파일(setup\redis.warehouse.conf -> redis\, 없을 때만) + data 폴더
 #   4) 방화벽 인바운드 5001·5002·5003·5080 (규칙 이름 warehouse-<포트>, 점검이 warehouse-* 로 찾음)
-#   5) 전원: 충전 중 절전·최대 절전 안 함, 덮개를 닫아도 아무것도 안 함
+#   5) 전원: 충전 중·배터리 모두 절전·최대 절전 안 함, 덮개를 닫아도 아무것도 안 함
 #   6) 바탕화면 바로가기: 창고 시작 / 창고 점검 / 창고 리허설
 # 사람이 할 일(공유기 IP 예약, .env·Redis 데이터 복사, DobotLink 설치, 카메라 번호 확인)은 노트북_이전_가이드.md
 $ErrorActionPreference = 'Stop'
@@ -76,12 +76,16 @@ foreach ($port in 5001, 5002, 5003, 5080) {
 }
 
 # ---------------- 5) 전원 ----------------
-Step '전원 (충전 중)'
+Step '전원 (충전 중 + 배터리)'
+# 배터리일 때도 끔 - 2026-11-04 충전기 빠진 채 19:26 절전 -> 깬 뒤 DobotLink 무응답으로 컨베이어 failed
 powercfg /change standby-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
+powercfg /change standby-timeout-dc 0
+powercfg /change hibernate-timeout-dc 0
 powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
 powercfg /setactive SCHEME_CURRENT
-Ok '절전 안 함, 최대 절전 안 함, 덮개 닫아도 아무것도 안 함'
+Ok '충전 중·배터리 모두 절전 안 함, 최대 절전 안 함, 덮개 닫아도 아무것도 안 함 (배터리는 금방 닳으니 충전기는 꽂아 둘 것)'
 
 # ---------------- 6) 바탕화면 바로가기 ----------------
 Step '바탕화면 바로가기'
