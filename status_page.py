@@ -41,15 +41,38 @@ RAIL_STATE = {"idle": ("ok", "대기"), "busy": ("busy", "배출 중"), "empty":
 
 
 def _rails():
-    """{"E_r": (status, count), ..., "board_r": (...)} - 못 읽으면 None"""
+    """{"E_r": (status, 카트리지 개수, 창고 pool), ..., "board_r": (...)} - 못 읽으면 None"""
     keys = [f"{letter}_{c}" for _, letter in KEYCAP_ROWS for c, _ in RAIL_COLORS] + [f"board_{c}" for c, _ in RAIL_COLORS]
+    num = lambda v: None if v is None else int(v)
     try:
         r = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=2)
         statuses = r.mget([f"status:{k}" for k in keys])
         counts = r.mget([f"stock:{k}" for k in keys])
+        pools = r.mget([f"pool:{k}" for k in keys])
     except Exception:
         return None
-    return {k: (s or "idle", None if n is None else int(n)) for k, s, n in zip(keys, statuses, counts)}
+    return {k: (s or "idle", num(n), num(p)) for k, s, n, p in zip(keys, statuses, counts, pools)}
+
+
+def _original_totals():
+    """전시 총 재고표 {"E": 190, ..., "board": 330} - 키캡 Flask 코드의 KEYCAP_TOTAL_PER_COLOR / BOARD_POOL_TOTAL을
+    import 없이 읽음 (import하면 MQTT 조회 스레드 등이 같이 뜸). 숫자를 두 곳에 적지 않으려고. 못 읽으면 {}"""
+    try:
+        tree = ast.parse((ROOT / "keycap_flask" / "app.py").read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return {}
+    found = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            if node.targets[0].id in ("KEYCAP_TOTAL_PER_COLOR", "BOARD_POOL_TOTAL"):
+                try:
+                    found[node.targets[0].id] = ast.literal_eval(node.value)
+                except ValueError:
+                    pass
+    totals = dict(found.get("KEYCAP_TOTAL_PER_COLOR") or {})
+    if "BOARD_POOL_TOTAL" in found:
+        totals["board"] = found["BOARD_POOL_TOTAL"]
+    return totals
 
 _lock = threading.Lock()
 _latest = None         # check_all.run_checks() 결과
@@ -103,8 +126,8 @@ def _station_states(facts, rails=None):
             else:
                 note = "Flask·브로커 정상"
             keycap = [v for k, v in (rails or {}).items() if not k.startswith("board_")]
-            broken = sum(1 for s, _ in keycap if s == "disable")
-            empty = sum(1 for s, _ in keycap if s == "empty")
+            broken = sum(1 for v in keycap if v[0] == "disable")
+            empty = sum(1 for v in keycap if v[0] == "empty")
             if broken or empty:   # 그 칸이 든 주문만 막힘 -> 노랑 (나머지 주문은 돎)
                 worst.append(("warn", " · ".join(t for t in (f"고장 {broken}칸" if broken else "",
                                                              f"빈 칸 {empty}" if empty else "") if t)))
@@ -343,6 +366,21 @@ h2 { font-size:15px; margin:0 0 8px; color:var(--soft); font-weight:700; }
 .rail.bad .s, .rail.bad .n { color:var(--stop); font-weight:700; }
 .boardrow th, .boardrow td { border-top:2px solid var(--rule); }
 .legend { font-size:12px; color:var(--soft); margin:6px 0 0; }
+.rail .of { font-size:12px; font-weight:400; color:var(--soft); margin-left:1px; }
+.rail .bar { display:block; height:4px; margin:4px 6px 2px; background:var(--rule); border-radius:2px; overflow:hidden; }
+.rail .bar i { display:block; height:100%; background:var(--go); }
+.rail.warn .bar i { background:var(--caution); }
+/* 재고 두 장 - 옆으로 넘기기 (탭 버튼 / 휴대폰은 밀기) */
+.stock-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px; }
+.stock-head h2 { margin:0; }
+.tabs { display:inline-flex; background:var(--panel); border-radius:6px; padding:3px; gap:2px; }
+.tabs button { font:inherit; font-size:13px; font-weight:700; color:var(--soft); background:transparent; border:0;
+               border-radius:4px; padding:6px 12px; cursor:pointer; min-height:32px; }
+.tabs button[aria-selected="true"] { background:var(--ground); color:var(--ink); box-shadow:0 1px 2px rgba(0,0,0,.12); }
+.tabs button:focus-visible { outline:3px solid var(--go); outline-offset:1px; }
+.panes { display:flex; overflow-x:auto; scroll-snap-type:x mandatory; scrollbar-width:none; overscroll-behavior-x:contain; }
+.panes::-webkit-scrollbar { display:none; }
+.pane { flex:0 0 100%; min-width:0; scroll-snap-align:start; }
 
 /* 최근 작업 + 카메라 */
 .recent { display:grid; grid-template-columns:minmax(0, 1fr) 280px; gap:20px; align-items:start; }
@@ -385,32 +423,75 @@ JS = """
   try { if (sessionStorage.getItem('okOpen') === '1') d.open = true; } catch(e) {}
   d.addEventListener('toggle', function(){ try { sessionStorage.setItem('okOpen', d.open ? '1' : '0'); } catch(e) {} });
 })();
+(function(){
+  // 재고 패널: 탭 누르면 그 장으로 넘김, 밀어서 넘기면 탭 표시 따라감. 10초 새로고침 뒤에도 보던 장 유지
+  var box = document.getElementById('stockpanes'); if (!box) return;
+  var tabs = document.querySelectorAll('.tabs [role="tab"]');
+  function mark(i){ tabs.forEach(function(t, k){ t.setAttribute('aria-selected', k === i ? 'true' : 'false'); });
+                    try { sessionStorage.setItem('stockPane', String(i)); } catch(e) {} }
+  function go(i){ box.scrollLeft = i * box.clientWidth; mark(i); }   // 바로 넘김 (부드러운 스크롤은 탭이 뒤에 있으면 멈춤)
+  tabs.forEach(function(t, k){ t.addEventListener('click', function(){ go(k); }); });
+  var timer; box.addEventListener('scroll', function(){ clearTimeout(timer); timer = setTimeout(function(){
+    mark(Math.round(box.scrollLeft / Math.max(1, box.clientWidth))); }, 80); });
+  var saved = 0; try { saved = parseInt(sessionStorage.getItem('stockPane') || '0', 10) || 0; } catch(e) {}
+  if (saved) go(saved);
+})();
 """
 
 
+LOW_TOTAL_RATIO = 0.2   # 전체 재고가 원래의 이 비율 아래면 노랑 (창고에서 더 꺼낼 게 얼마 안 남음)
+
+
 def _render_rails(rails):
+    """카트리지 칸 / 전체 재고 두 장을 옆으로 넘기는 패널 (탭 버튼 또는 휴대폰에서 옆으로 밀기)"""
     e = html.escape
     if rails is None:
-        return '<section><h2>카트리지 칸</h2><p class="empty">Redis를 못 읽어서 칸 상태를 볼 수 없습니다.</p></section>'
+        return '<section><h2>재고</h2><p class="empty">Redis를 못 읽어서 재고를 볼 수 없습니다.</p></section>'
+    totals = _original_totals()
 
-    def cell(key):
-        status, count = rails[key]
+    def cart_cell(key):
+        status, count, _ = rails[key]
         cls, word = RAIL_STATE.get(status, ("warn", status))
         num = "-" if count is None else str(count)
-        return (f'<td class="rail {cls}"><span class="n num">{e(num)}</span>'
-                f'<span class="s">{e(word)}</span></td>')
+        return f'<td class="rail {cls}"><span class="n num">{e(num)}</span><span class="s">{e(word)}</span></td>'
 
-    head = "".join(f'<th scope="col">{e(name)}</th>' for _, name in RAIL_COLORS)
-    rows = []
-    for board, letter in KEYCAP_ROWS:
-        rows.append(f'<tr><th scope="row">{e(letter)}<span class="bd">{e(board)}</span></th>'
-                    + "".join(cell(f"{letter}_{c}") for c, _ in RAIL_COLORS) + "</tr>")
-    rows.append('<tr class="boardrow"><th scope="row">보드</th>'
-                + "".join(cell(f"board_{c}") for c, _ in RAIL_COLORS) + "</tr>")
-    return ('<section><h2>카트리지 칸 (숫자 = 카트리지에 남은 개수)</h2>'
-            f'<table class="rails"><thead><tr><th></th>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table>'
-            '<p class="legend">고장 = 센서·모터 문제로 그 칸이 든 주문은 키캡 단계에서 멈춤 (재고 초기화로 안 풀림, 사람이 고쳐야 함)'
-            ' · 비었음 = 재보충 필요</p></section>')
+    def total_cell(key, original):
+        _, count, pool = rails[key]
+        if count is None and pool is None:
+            return '<td class="rail"><span class="n num">-</span></td>'
+        now = (count or 0) + (pool or 0)
+        if not original:
+            return f'<td class="rail"><span class="n num">{now}</span><span class="s">칸 {count or 0}</span></td>'
+        ratio = max(0.0, min(1.0, now / original))
+        cls = "warn" if ratio < LOW_TOTAL_RATIO else ""
+        return (f'<td class="rail {cls}"><span class="n num">{now}<span class="of">/{original}</span></span>'
+                f'<span class="bar" aria-hidden="true"><i style="width:{ratio * 100:.0f}%"></i></span>'
+                f'<span class="s">칸 {count or 0}</span></td>')
+
+    def table(cell_for_key, board_key_total):
+        head = "".join(f'<th scope="col">{e(name)}</th>' for _, name in RAIL_COLORS)
+        rows = []
+        for board, letter in KEYCAP_ROWS:
+            rows.append(f'<tr><th scope="row">{e(letter)}<span class="bd">{e(board)}</span></th>'
+                        + "".join(cell_for_key(f"{letter}_{c}", totals.get(letter)) for c, _ in RAIL_COLORS) + "</tr>")
+        rows.append('<tr class="boardrow"><th scope="row">보드</th>'
+                    + "".join(cell_for_key(f"board_{c}", board_key_total) for c, _ in RAIL_COLORS) + "</tr>")
+        return f'<table class="rails"><thead><tr><th></th>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table>'
+
+    cart = table(lambda k, _orig: cart_cell(k), None)
+    total = table(total_cell, totals.get("board"))
+    return ('<section class="stock"><div class="stock-head"><h2>재고</h2>'
+            '<div class="tabs" role="tablist" aria-label="재고 보기">'
+            '<button type="button" role="tab" data-pane="0" aria-selected="true">카트리지 칸</button>'
+            '<button type="button" role="tab" data-pane="1" aria-selected="false">전체 재고</button></div></div>'
+            '<div class="panes" id="stockpanes">'
+            f'<div class="pane" role="tabpanel" aria-label="카트리지 칸">{cart}'
+            '<p class="legend">숫자 = 카트리지에 남은 개수 · 고장 = 센서·모터 문제로 그 칸이 든 주문은 키캡 단계에서 멈춤 '
+            '(재고 초기화로 안 풀림, 사람이 고쳐야 함) · 비었음 = 재보충 필요</p></div>'
+            f'<div class="pane" role="tabpanel" aria-label="전체 재고">{total}'
+            '<p class="legend">지금 / 원래 = (카트리지 + 창고 풀) / 전시 총 재고표 · 칸 = 그중 카트리지에 든 개수 · 막대 = 남은 비율, '
+            f'{LOW_TOTAL_RATIO:.0%} 아래면 노랑 · 총 재고표는 키캡 Flask 코드(KEYCAP_TOTAL_PER_COLOR)에서 읽음</p></div>'
+            '</div></section>')
 
 
 def _render_recent():
@@ -453,7 +534,7 @@ def _render(result, error):
 
     bad, warn, ok = _issues(result)
     rails = _rails()
-    broken = [k for k, (s, _) in (rails or {}).items() if s == "disable"]
+    broken = [k for k, v in (rails or {}).items() if v[0] == "disable"]
     if broken:   # 점검(check_all) 항목은 아니지만 주문이 멈추는 원인이라 "확인할 것"에 같이 올림
         warn = warn + [("!!", 0, "카트리지 칸", f"고장(disable) {len(broken)}칸: {', '.join(broken)} - 이 칸이 든 주문은 키캡 단계에서 멈춤")]
     if bad:
