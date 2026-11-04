@@ -18,6 +18,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import redis as redis_lib
+
 import check_all
 
 PORT = 5080
@@ -27,6 +29,27 @@ ROOT = Path(__file__).resolve().parent
 RECENT_MAX = 12        # "최근 작업"에 보여줄 개수
 LOG_TAIL_BYTES = 300_000   # 로그는 끝부분만 읽음 (하루치가 커져도 가볍게)
 CAMERA_DIR = ROOT / "board" / "board_camera_capture_log"   # board_config.CAMERA_IMAGE_DIR와 같은 곳
+REDIS_URL = "redis://127.0.0.1:6379/0"   # 보드·키캡 Flask와 같은 Redis (.env REDIS_URL)
+
+# ============================== 카트리지 칸 (키캡 32칸 + 보드 4색) ==============================
+# 키캡 Flask가 아두이노 보고(/report/keycap-status)를 받을 때마다 쓰는 Redis status:/stock: 값을 그대로 보여줌
+KEYCAP_ROWS = [("EI", "E"), ("EI", "I"), ("NS", "N"), ("NS", "S"),
+               ("TF", "T"), ("TF", "F"), ("PJ", "P"), ("PJ", "J")]
+RAIL_COLORS = [("r", "핑크"), ("y", "옐로우"), ("b", "블루"), ("g", "그린")]
+RAIL_STATE = {"idle": ("ok", "대기"), "busy": ("busy", "배출 중"), "empty": ("warn", "비었음"),
+              "disable": ("bad", "고장")}
+
+
+def _rails():
+    """{"E_r": (status, count), ..., "board_r": (...)} - 못 읽으면 None"""
+    keys = [f"{letter}_{c}" for _, letter in KEYCAP_ROWS for c, _ in RAIL_COLORS] + [f"board_{c}" for c, _ in RAIL_COLORS]
+    try:
+        r = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=2)
+        statuses = r.mget([f"status:{k}" for k in keys])
+        counts = r.mget([f"stock:{k}" for k in keys])
+    except Exception:
+        return None
+    return {k: (s or "idle", None if n is None else int(n)) for k, s, n in zip(keys, statuses, counts)}
 
 _lock = threading.Lock()
 _latest = None         # check_all.run_checks() 결과
@@ -63,7 +86,7 @@ RANK = {"ok": 0, "busy": 0, "off": 1, "warn": 2, "bad": 3}
 PROGRAM_NAME = {"board_main": "보드 main", "keycap_tray": "게이트웨이"}
 
 
-def _station_states(facts):
+def _station_states(facts, rails=None):
     """장비마다 (램프, 아래 문구, 작업 중 주문). 램프는 프로그램 상태·USB·서버 중 가장 나쁜 것"""
     hb = facts.get("hb")
     com = facts.get("com", {})
@@ -79,6 +102,12 @@ def _station_states(facts):
                 worst.append(("bad", "MQTT 브로커 접속 안 됨"))
             else:
                 note = "Flask·브로커 정상"
+            keycap = [v for k, v in (rails or {}).items() if not k.startswith("board_")]
+            broken = sum(1 for s, _ in keycap if s == "disable")
+            empty = sum(1 for s, _ in keycap if s == "empty")
+            if broken or empty:   # 그 칸이 든 주문만 막힘 -> 노랑 (나머지 주문은 돎)
+                worst.append(("warn", " · ".join(t for t in (f"고장 {broken}칸" if broken else "",
+                                                             f"빈 칸 {empty}" if empty else "") if t)))
         else:
             if hb is None:
                 worst.append(("off", "상태 확인 불가"))
@@ -299,6 +328,22 @@ body {
 .issue .msg { min-width:0; overflow-wrap:anywhere; }
 h2 { font-size:15px; margin:0 0 8px; color:var(--soft); font-weight:700; }
 
+/* 카트리지 칸 */
+.rails { width:100%; border-collapse:separate; border-spacing:3px; table-layout:fixed; }
+.rails th { font-size:13px; color:var(--soft); font-weight:700; text-align:center; padding:2px; }
+.rails tbody th { text-align:left; color:var(--ink); font-size:15px; width:4.2em; }
+.rails .bd { font-size:11px; color:var(--soft); font-weight:400; margin-left:4px; }
+.rail { background:var(--panel); border-radius:4px; padding:6px 4px; text-align:center; line-height:1.15; }
+.rail .n { display:block; font-size:17px; font-weight:700; }
+.rail .s { display:block; font-size:11px; color:var(--soft); }
+.rail.busy { box-shadow:inset 0 0 0 2px var(--go); }
+.rail.warn { background:var(--caution-wash); }
+.rail.warn .s { color:var(--ink); font-weight:700; }
+.rail.bad { background:var(--stop-wash); }
+.rail.bad .s, .rail.bad .n { color:var(--stop); font-weight:700; }
+.boardrow th, .boardrow td { border-top:2px solid var(--rule); }
+.legend { font-size:12px; color:var(--soft); margin:6px 0 0; }
+
 /* 최근 작업 + 카메라 */
 .recent { display:grid; grid-template-columns:minmax(0, 1fr) 280px; gap:20px; align-items:start; }
 .events { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px; }
@@ -343,6 +388,31 @@ JS = """
 """
 
 
+def _render_rails(rails):
+    e = html.escape
+    if rails is None:
+        return '<section><h2>카트리지 칸</h2><p class="empty">Redis를 못 읽어서 칸 상태를 볼 수 없습니다.</p></section>'
+
+    def cell(key):
+        status, count = rails[key]
+        cls, word = RAIL_STATE.get(status, ("warn", status))
+        num = "-" if count is None else str(count)
+        return (f'<td class="rail {cls}"><span class="n num">{e(num)}</span>'
+                f'<span class="s">{e(word)}</span></td>')
+
+    head = "".join(f'<th scope="col">{e(name)}</th>' for _, name in RAIL_COLORS)
+    rows = []
+    for board, letter in KEYCAP_ROWS:
+        rows.append(f'<tr><th scope="row">{e(letter)}<span class="bd">{e(board)}</span></th>'
+                    + "".join(cell(f"{letter}_{c}") for c, _ in RAIL_COLORS) + "</tr>")
+    rows.append('<tr class="boardrow"><th scope="row">보드</th>'
+                + "".join(cell(f"board_{c}") for c, _ in RAIL_COLORS) + "</tr>")
+    return ('<section><h2>카트리지 칸 (숫자 = 카트리지에 남은 개수)</h2>'
+            f'<table class="rails"><thead><tr><th></th>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table>'
+            '<p class="legend">고장 = 센서·모터 문제로 그 칸이 든 주문은 키캡 단계에서 멈춤 (재고 초기화로 안 풀림, 사람이 고쳐야 함)'
+            ' · 비었음 = 재보충 필요</p></section>')
+
+
 def _render_recent():
     e = html.escape
     events = _recent_events()
@@ -382,6 +452,10 @@ def _render(result, error):
         return head + f'<section class="verdict warn"><p class="say">{msg}</p></section></main></body></html>'
 
     bad, warn, ok = _issues(result)
+    rails = _rails()
+    broken = [k for k, (s, _) in (rails or {}).items() if s == "disable"]
+    if broken:   # 점검(check_all) 항목은 아니지만 주문이 멈추는 원인이라 "확인할 것"에 같이 올림
+        warn = warn + [("!!", 0, "카트리지 칸", f"고장(disable) {len(broken)}칸: {', '.join(broken)} - 이 칸이 든 주문은 키캡 단계에서 멈춤")]
     if bad:
         cls, say = "bad", f"{bad[0][3]}"
         sub = f"문제 {len(bad)}건, 주의 {len(warn)}건. 맨 위 문제부터 해결하면 아래 항목이 같이 풀리는 경우가 많습니다."
@@ -399,7 +473,7 @@ def _render(result, error):
                    f'<p class="sub">{e(sub)}</p></section>']
 
     parts.append('<ol class="line" aria-label="창고 라인 - 주문이 지나가는 순서">')
-    for s in _station_states(result.get("facts", {})):
+    for s in _station_states(result.get("facts", {}), rails):
         job = f'<span class="job">{e(s["job"])}</span>' if s["job"] else ""
         parts.append(f'<li class="st {s["lamp"]}"><span class="lamp" aria-hidden="true"></span>'
                      f'<span class="text"><span class="name">{e(s["name"])}</span>'
@@ -415,6 +489,7 @@ def _render(result, error):
                          f'<span class="where">{e(_section_short(where))}</span>{e(msg)}</span></div>')
         parts.append('</div></section>')
 
+    parts.append(_render_rails(rails))
     parts.append(_render_recent())
 
     parts.append(f'<details id="okbox"><summary>정상 항목 {len(ok)}개</summary><ul class="oklist">')
