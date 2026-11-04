@@ -477,25 +477,34 @@ def restock_board(color):
     pool_key = f"pool:board_{color}"
     stock_key = f"stock:board_{color}"
 
-    pool_qty = int(redis.get(pool_key) or 0)
-    fill_amount = min(BOARD_CARTRIDGE_CAPACITY, pool_qty)
-
-    redis.set(stock_key, fill_amount)
-    if fill_amount > 0:
-        redis.decrby(pool_key, fill_amount)
+    # [11/04] 모자란 만큼만 pool에서 뺌 (_fill_from_pool 참고). filled = 채운 뒤 개수
+    filled, moved, pool_left = _fill_from_pool(stock_key, pool_key, BOARD_CARTRIDGE_CAPACITY)
 
     if status is None:
-        status = "empty" if fill_amount == 0 else "idle"
+        status = "empty" if filled == 0 else "idle"
     redis.set(status_key, status)
 
     # 채운 결과를 order_id=null로 모비우스에 업로드 (여기서 한 번만 올림 -
     # 아두이노 쪽에서 이 호출 이후 또 보고하면 같은 restock이 중복으로
     # 올라가므로 절대 여기 말고 다른 곳에서 또 올리지 않도록 유지할 것)
-    content = {"order_id": None, "count": fill_amount, "status": status}
+    content = {"order_id": None, "count": filled, "status": status}
     ok = post_cin_to_mobius(f"cnt_warehouse/cnt_board_status/cnt_{color}", content)
 
-    print(f"[restock] board_{color}: {fill_amount}개로 채움 (pool 남음 {pool_qty - fill_amount}, status={status}, 모비우스 업로드 {'성공' if ok else '실패'})")
-    return jsonify({"filled": fill_amount, "status": status, "mobius_ok": ok}), 200
+    print(f"[restock] board_{color}: {filled}개 (pool에서 {moved}개, pool 남음 {pool_left}, status={status}, 모비우스 업로드 {'성공' if ok else '실패'})")
+    return jsonify({"filled": filled, "moved": moved, "status": status, "mobius_ok": ok}), 200
+
+
+def _fill_from_pool(stock_key, pool_key, capacity):
+    """카트리지를 capacity까지, 모자란 만큼만 pool에서 옮김. (채운 뒤 개수, 옮긴 개수, pool 남은 개수)
+    [11/04] 예전엔 남은 게 있어도 카트리지를 capacity로 덮어쓰고 pool에서 capacity만큼 빼서, 가득 찬 칸에
+    restock이 오면(11/04 22:14 E_r 사례: 30개인데 restock -> pool만 30 감소) 전체 재고가 그만큼 사라졌음"""
+    current = int(redis.get(stock_key) or 0)
+    pool_qty = int(redis.get(pool_key) or 0)
+    moved = min(max(0, capacity - current), pool_qty)
+    redis.set(stock_key, current + moved)
+    if moved > 0:
+        redis.decrby(pool_key, moved)
+    return current + moved, moved, pool_qty - moved
 
 
 # ============================================================
@@ -573,25 +582,21 @@ def restock_letter_color(letter, color):
 
     pool_key = f"pool:{letter_color}"  # 색상별로 분리 (예: pool:E_r), 글자 단위 pool:E 아님
 
-    pool_qty = int(redis.get(pool_key) or 0)
-    fill_amount = min(RAIL_CAPACITY, pool_qty)
-
-    redis.set(f"stock:{letter_color}", fill_amount)
-    if fill_amount > 0:
-        redis.decrby(pool_key, fill_amount)
+    # [11/04] 모자란 만큼만 pool에서 뺌 (_fill_from_pool 참고). filled = 채운 뒤 개수 - 아두이노가 이 값을 count로 씀
+    filled, moved, pool_left = _fill_from_pool(f"stock:{letter_color}", pool_key, RAIL_CAPACITY)
 
     if status is None:
-        status = "empty" if fill_amount == 0 else "idle"
+        status = "empty" if filled == 0 else "idle"
     redis.set(status_key, status)
 
     # 채운 결과를 order_id=null로 모비우스에 업로드 (여기서 한 번만 올림 -
     # 아두이노 쪽에서 이 호출 이후 또 보고하면 같은 restock이 중복으로
     # 올라가므로 절대 여기 말고 다른 곳에서 또 올리지 않도록 유지할 것)
-    content = {"order_id": None, "count": fill_amount, "status": status}
+    content = {"order_id": None, "count": filled, "status": status}
     ok = post_cin_to_mobius(f"cnt_warehouse/cnt_keycap_status/cnt_{letter_color}", content)
 
-    print(f"[restock] {letter_color}: {fill_amount}개로 채움 (pool 남음 {pool_qty - fill_amount}, status={status}, 모비우스 업로드 {'성공' if ok else '실패'})")
-    return jsonify({"filled": fill_amount, "status": status, "mobius_ok": ok}), 200
+    print(f"[restock] {letter_color}: {filled}개 (pool에서 {moved}개, pool 남음 {pool_left}, status={status}, 모비우스 업로드 {'성공' if ok else '실패'})")
+    return jsonify({"filled": filled, "moved": moved, "status": status, "mobius_ok": ok}), 200
 
 
 # ============================================================
@@ -766,12 +771,57 @@ def reset_mobius():
 
 @app.route("/reset/hard", methods=["POST"])
 def reset_hard():
-    # 수동 하드리셋 - 자동(_auto_hard_reset)과 같은 값. 아두이노 RAM 수량은 안 바뀜 -> 아두이노 전원 껐다 켤 것
+    # 수동 하드리셋 (reset_stock.bat) - 자동(_auto_hard_reset)과 같은 값. 아두이노 RAM 수량도 _sync_arduinos로
+    # 맞추고, 보드 main은 쉬는 동안 30초마다 재고를 다시 읽어서 따라감 -> 재부팅 필요 없음
     with _reset_lock:
         _do_hard_reset()
+    synced = _sync_arduinos(_all_keycap_letter_colors())
     failed = _upload_reset_to_mobius()
-    print(f"[reset/hard] 하드 리셋 완료, 모비우스 업로드 실패: {failed if failed else '없음'}")
-    return jsonify({"result": "ok" if not failed else "partial_fail", "failed": failed}), (200 if not failed else 207)
+    print(f"[reset/hard] 하드 리셋 완료, 아두이노 동기화 {'전송' if synced else '실패'}, "
+          f"모비우스 업로드 실패: {failed if failed else '없음'}")
+    return jsonify({"result": "ok" if not failed else "partial_fail", "failed": failed, "arduino_sync": synced}), \
+        (200 if not failed else 207)
+
+
+@app.route("/sync/keycap", methods=["POST"])
+def sync_keycap():
+    """아두이노 RAM 수량을 지금 Redis 값으로 맞춤 (재부팅 대신). body {"rails": ["E_r", ...]} 없으면 32칸 전부.
+    숫자를 /report/keycap-status 로 고친 뒤 부르면 됨. pool·status·모비우스는 안 건드림"""
+    rails = (request.get_json(force=True, silent=True) or {}).get("rails") or _all_keycap_letter_colors()
+    bad = [r for r in rails if r not in _all_keycap_letter_colors()]
+    if bad:
+        return jsonify({"error": f"없는 칸: {bad}"}), 400
+    ok = _sync_arduinos(rails)
+    return jsonify({"result": "ok" if ok else "mqtt_fail", "rails": rails}), (200 if ok else 502)
+
+
+def _sync_arduinos(rails):
+    """아두이노 RAM의 칸 수량을 Redis stock으로 맞추게 함 - 펌웨어 수정 없이 기존 restock 기능을 빌림.
+    최신 cnt_process에 keycap_restock=rails를 실어 seq만 바꿔(아두이노는 seq가 직전과 같으면 무시) MQTT로 보내면
+    아두이노가 /restock/<글자>/<색>을 부르고, RESET_RESTOCK_WINDOW_SEC 동안은 pool을 안 빼고 지금 stock만 돌려줌.
+    플랫폼 주문 목록은 최신 그대로라 주문 처리는 바뀌지 않음 (이미 처리한 주문은 아두이노가 걸러냄)"""
+    global _last_relayed
+    try:
+        latest = _get_latest_process()
+    except Exception as e:
+        logger.warning(f"[sync] 최신 cnt_process 못 읽음 - 빈 주문 목록으로 보냄 ({e})")
+        latest = {"orders": {}}
+    redis.set("reset:restock_window", 1, ex=RESET_RESTOCK_WINDOW_SEC)
+    snap = dict(latest, seq=f"{latest.get('seq')}-sync{int(time.time())}", keycap_restock=list(rails))
+    ok = publish(TOPICS["process"], json.dumps(snap, ensure_ascii=False))
+    with _relay_lock:   # 주기 조회가 원래 스냅샷을 또 보내지 않게 (아두이노가 같은 주문을 한 번 더 훑는 걸 피함)
+        _last_relayed = json.dumps(latest, ensure_ascii=False)
+    logger.info(f"[sync] 아두이노 수량 맞추기 {'전송' if ok else '실패'}: {len(rails)}칸 (seq={snap['seq']})")
+    # 브로커 retain에 restock 실린 스냅샷이 남으면 나중에 재부팅한 아두이노가 또 restock을 부름 -> 잠시 뒤 원래 스냅샷으로 덮음
+    threading.Timer(15, _restore_retained).start()
+    return ok
+
+
+def _restore_retained():
+    try:
+        _relay("process", _get_latest_process(), "동기화 뒤 retain 정리")
+    except Exception as e:
+        logger.warning(f"[sync] retain 정리 실패 (다음 주문 때 자연히 바뀜): {e}")
 
 
 if __name__ == "__main__":

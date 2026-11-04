@@ -240,7 +240,9 @@ def restock_board(color):
     board_restock 감지 시 로봇암 PC가 호출 - 키캡의 /restock/<letter>/<color>와
     동일한 패턴(pool에서 실제로 차감하며 채움, 고정값으로 덮어쓰지 않음).
     color: red/yellow/blue/green (전체 이름 - URL 경로 가독성 위해 코드 아님)
-    응답: {"filled": N}  (로봇암 PC가 로컬 재고 갱신에 사용)
+    응답: {"filled": N}  N = 채운 뒤 카트리지 개수 (로봇암 PC가 로컬 재고 갱신에 사용)
+    [11/04] 모자란 만큼만 pool에서 뺌 - 예전엔 남은 게 있어도 카트리지를 가득으로 덮어쓰고 pool에서
+    가득만큼 빼서, 가득 찬 칸에 restock이 오면(11/04 22:14 E_r 사례) 전체 재고가 그만큼 사라졌음
     """
     if color not in BOARD_COLORS:
         return jsonify({"error": f"color는 {'/'.join(BOARD_COLORS)} 중 하나"}), 400
@@ -250,21 +252,23 @@ def restock_board(color):
     stock_key = f"stock:board_{code}"
 
     pool_qty = int(redis.get(pool_key) or 0)
-    fill_amount = min(BOARD_CARTRIDGE_CAPACITY, pool_qty)
+    current = int(redis.get(stock_key) or 0)
+    moved = min(max(0, BOARD_CARTRIDGE_CAPACITY - current), pool_qty)
+    filled = current + moved
 
-    redis.set(stock_key, fill_amount)
-    if fill_amount > 0:
-        redis.decrby(pool_key, fill_amount)
+    redis.set(stock_key, filled)
+    if moved > 0:
+        redis.decrby(pool_key, moved)
     redis.set(f"status:board_{code}", "idle")
 
-    content = {"order_id": None, "count": fill_amount, "status": "idle"}
+    content = {"order_id": None, "count": filled, "status": "idle"}
     ok = post_cin_to_mobius(f"cnt_warehouse/cnt_board_status/cnt_{code}", content)
-    print(f"[restock/board/{color}] {fill_amount}개로 채움 (pool 남음 {pool_qty - fill_amount}), "
+    print(f"[restock/board/{color}] {current} -> {filled}개 (pool에서 {moved}개, pool 남음 {pool_qty - moved}), "
           f"모비우스 {'성공' if ok else '실패'}")
 
     if not ok:
         return jsonify({"error": "mobius CIN 생성 실패"}), 502
-    return jsonify({"filled": fill_amount}), 200
+    return jsonify({"filled": filled, "moved": moved}), 200
 
 
 @app.route("/report/keycap-robot-arm", methods=["POST"])

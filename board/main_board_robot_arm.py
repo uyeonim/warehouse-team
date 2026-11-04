@@ -1433,6 +1433,28 @@ def check_hard_reset(data):
     log("RESET", "플랫폼 하드리셋(reset 표시) - 픽업 기록 비움, 재고는 키캡 Flask 초기화 뒤 다시 읽음")
 
 
+STOCK_RESYNC_SEC = 30   # 쉬는 동안 이 간격으로 보드 Flask 재고를 다시 읽음 (reset_stock.bat·숫자 정정을 재시작 없이 반영)
+_last_stock_resync = time.time()
+
+
+def resync_stock_if_idle():
+    """주문 처리 사이(큐 비었고 못 보낸 보고 없음)에만. 재고를 바꾸는 건 이 프로그램 보고·restock·사람의 정정뿐이라
+    쉬는 동안 Flask 값과 다르면 사람이 바꾼 것 -> 따라감. 못 보낸 보고가 있으면 Flask가 옛 값이라 건드리지 않음"""
+    global local_stock, _last_stock_resync
+    if job_queue or _pending_reports or time.time() - _last_stock_resync < STOCK_RESYNC_SEC:
+        return
+    _last_stock_resync = time.time()
+    try:
+        resp = requests.get(f"{FLASK_BASE_URL}/stock/board", timeout=REPORT_TIMEOUT)
+        resp.raise_for_status()
+        fresh = {c: int(resp.json().get(c, 0)) for c in BOARD_COLORS}
+    except Exception:
+        return   # Flask 일시 장애 - 다음 주기에 다시
+    if fresh != local_stock:
+        log("STOCK", f"보드 Flask 재고가 바뀜 (사람이 초기화·정정) -> 따라감: {local_stock} -> {fresh}")
+        local_stock = fresh
+
+
 def reload_stock_if_due():
     global local_stock
     if not _stock_reload_at or time.time() < _stock_reload_at[0]:
@@ -1582,6 +1604,7 @@ def main():
             link_watchdog(loop)   # 주문 처리 사이: 연결 확인 / 끊겼으면 재연결
             flush_pending_reports()   # 못 보낸 보고 재전송
             reload_stock_if_due()     # 하드리셋 뒤 재고 다시 읽기
+            resync_stock_if_idle()    # 쉬는 동안 사람이 바꾼 재고 따라가기
             try:
                 data = snapshot_queue.get(timeout=1)
                 handle_snapshot(loop, arm_api, box_api, data)
