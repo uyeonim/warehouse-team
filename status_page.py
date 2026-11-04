@@ -443,15 +443,12 @@ JS = """
   if (saved) go(saved);
 })();
 (function(){
-  // 고장 칸 "복구": 칸 이름을 직접 입력해야 보냄 (관람객 폰에서 잘못 눌러도 안 나가게)
+  // 고장 칸 "복구": 확인 창에서 "확인"을 눌러야 보냄 (잘못 눌러도 바로 안 나가게)
   document.querySelectorAll('.rail .fix').forEach(function(b){
     b.addEventListener('click', function(){
       var rail = b.getAttribute('data-rail');
-      var typed = window.prompt(rail + ' 칸의 고장 표시를 풉니다 (아두이노에 복구 명령).\\n' +
-        '실패했던 주문을 다시 배출하지는 않습니다 - 다시 배출하려면 플랫폼에서 fault 해제.\\n' +
-        '진행하려면 ' + rail + ' 를 입력하세요.');
-      if (typed === null) return;
-      if (typed.trim() !== rail) { window.alert('칸 이름이 달라서 취소했습니다.'); return; }
+      if (!window.confirm(rail + ' 칸의 고장 표시를 풀까요? (아두이노에 복구 명령)\\n' +
+        '실패했던 주문을 다시 배출하지는 않습니다 - 다시 배출하려면 플랫폼에서 fault 해제.')) return;
       b.disabled = true; b.textContent = '보내는 중';
       fetch('/repair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rail: rail }) })
         .then(function(r){ return r.json().then(function(j){ return { ok: r.ok, j: j }; }); })
