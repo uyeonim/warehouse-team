@@ -39,7 +39,7 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 ├─ status.bat                      상태판을 브라우저로 (바탕화면 '창고 점검')
 ├─ start_test.bat                  창고 시작 + 테스트 페이지(/test) 탭 (바탕화면 '창고 테스트')
 ├─ test_page.py                    테스트 페이지 - 주문 스냅샷을 손으로 cnt_process에 올림 (같은 공유기에서만)
-├─ reset_stock.bat                 재고·창고 풀 전부 초기화 (전시 총량표, 재부팅 필요 없음)
+├─ reset_stock.bat                 재고·창고 풀 전부 초기화 (전시 총량표, 재부팅 필요 없음) - 평소엔 테스트 페이지 '우리 재고만 초기화' 버튼
 ├─ setup_laptop.bat / setup/      새 노트북 한 번 설정 (관리자) + Redis 설정 원본 - 노트북_이전_가이드.md
 ├─ service/                        서버 3개 Windows 서비스 등록/해제 (NSSM, 관리자)
 ├─ requirements.txt                공용 가상환경 (Python 3.9)

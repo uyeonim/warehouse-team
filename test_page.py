@@ -8,6 +8,7 @@
 - 같은 공유기(노트북과 같은 /24 망)에서만 열림. 상태판 화면엔 링크 없음 (바탕화면 '창고 테스트'가 탭으로 열어 줌)
 - seq는 보내는 순간 서버가 "최신 + 1"로 붙임. 화면을 연 뒤 플랫폼이 새 스냅샷을 올렸으면 한 번 더 물어봄
 - 주문이 빈 스냅샷(= 플랫폼 하드리셋 신호)은 하드리셋 버튼으로만 나감
+- "우리 재고만 초기화"는 cnt_process에 안 올림 - 키캡 Flask /reset/hard (예전 바탕화면 '재고 초기화' = reset_stock.bat과 같음)
 비밀값(.env)은 읽기만 하고 화면·터미널에 안 냄
 """
 import ipaddress
@@ -18,11 +19,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import requests
+
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "board" / "tools"))
 _comm = None
 RAIL_RE = re.compile(r"^[EINSTFPJ]_[rybg]$")
 MAX_BODY = 64 * 1024
+KEYCAP_FLASK_URL = "http://127.0.0.1:5002"   # 우리 재고만 초기화 -> /reset/hard
 
 
 def comm():
@@ -59,10 +63,13 @@ def _reply(handler, code, body, ctype="application/json; charset=utf-8"):
 def handle(handler, method):
     """/test 로 시작하는 요청 처리. 처리했으면 True"""
     path = handler.path.split("?")[0]
-    if path not in ("/test", "/test/", "/test/latest", "/test/send"):
+    if path not in ("/test", "/test/", "/test/latest", "/test/send", "/test/stock-reset"):
         return False
     if not allowed(handler):
         _reply(handler, 403, "<p>테스트 페이지는 창고 노트북과 같은 공유기에서만 열립니다.</p>", "text/html; charset=utf-8")
+        return True
+    if method == "POST" and path == "/test/stock-reset":   # Mobius·테스트 스크립트 필요 없음
+        _stock_reset(handler)
         return True
     try:
         m = comm()
@@ -83,6 +90,23 @@ def handle(handler, method):
     else:
         _reply(handler, 405, {"error": "지원 안 하는 요청"})
     return True
+
+
+def _stock_reset(handler):
+    """우리 재고만 전시 총량으로 (키캡 32칸·보드 4색·창고 풀, 아두이노 수량 동기화). 진행 중 주문·고장 칸은 그대로"""
+    try:
+        r = requests.post(f"{KEYCAP_FLASK_URL}/reset/hard", timeout=15)
+        body = r.json()
+    except Exception as e:
+        _reply(handler, 502, {"error": f"키캡 Flask 응답 없음 ({type(e).__name__}) - 창고 시작으로 켜져 있는지 확인"})
+        return
+    print(f"[테스트 페이지] 우리 재고만 초기화 -> {r.status_code} {body} (보낸 곳 {handler.client_address[0]})")
+    if r.status_code == 200:
+        _reply(handler, 200, {"ok": True, "arduino_sync": body.get("arduino_sync")})
+    elif r.status_code == 207:   # 재고는 초기화됐지만 Mobius 재고 업로드 일부 실패
+        _reply(handler, 200, {"ok": True, "arduino_sync": body.get("arduino_sync"), "failed": body.get("failed")})
+    else:
+        _reply(handler, 502, {"error": f"키캡 Flask 오류 {r.status_code}: {body}"})
 
 
 def _check_order(m, oid, o):
@@ -242,9 +266,12 @@ pre { margin:0; background:var(--steel); border-radius:6px; padding:10px; font-s
 .log .ok { color:var(--go); font-weight:700; }
 .log .bad { color:var(--stop); font-weight:700; }
 .zone { border:2px dashed var(--stop); }
+.resets { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+.resets > div { display:flex; flex-direction:column; gap:6px; align-items:flex-start; }
+.resets .sub { margin:0; font-size:13px; flex:1; }
 .note { font-size:12px; color:var(--soft); margin:8px 0 0; }
 .tag { font-size:11px; font-weight:800; padding:1px 6px; border-radius:3px; background:var(--caution-wash); margin-left:6px; }
-@media (max-width:860px) { .grid { grid-template-columns:1fr; } .slots { grid-template-columns:repeat(2, minmax(0,1fr)); } }
+@media (max-width:860px) { .grid, .resets { grid-template-columns:1fr; } .slots { grid-template-columns:repeat(2, minmax(0,1fr)); } }
 </style>
 </head>
 <body>
@@ -294,9 +321,21 @@ pre { margin:0; background:var(--steel); border-radius:6px; padding:10px; font-s
       </section>
 
       <section class="card zone">
-        <h2>하드리셋</h2>
-        <p class="sub" style="margin:0 0 10px">주문이 빈 스냅샷을 올립니다. 창고·키캡 쪽 진행 중 주문 기억과 재고가 전부 처음으로 돌아갑니다 (전시 시작 때 한 번 쓰는 신호).</p>
-        <button class="danger" id="reset">하드리셋 보내기</button>
+        <h2>초기화</h2>
+        <div class="resets">
+          <div>
+            <b>우리 재고만 초기화</b>
+            <p class="sub">우리 노트북 안에서만. 키캡 32칸·보드 4색·창고 풀을 전시 총량으로 되돌리고 아두이노 수량도 맞춥니다.
+              cnt_process에 안 올리고, 진행 중 주문과 고장 칸은 그대로. 플랫폼 서버가 없어도 됩니다.</p>
+            <button id="stockreset">우리 재고만 초기화</button>
+          </div>
+          <div>
+            <b>하드리셋 (모두에게)</b>
+            <p class="sub">주문이 빈 스냅샷을 cnt_process에 올립니다. 우리·키캡팀·플랫폼이 다 받아서 진행 중 주문 기억과 재고가 전부 처음으로
+              돌아갑니다 (전시 시작 때 한 번 쓰는 신호).</p>
+            <button class="danger" id="reset">하드리셋 보내기</button>
+          </div>
+        </div>
       </section>
     </div>
 
@@ -471,6 +510,19 @@ document.getElementById("send").onclick = function(){
 document.getElementById("reset").onclick = function(){
   if (!confirm("⚠ 하드리셋\n\n주문이 빈 스냅샷을 올립니다.\n창고·키캡 쪽 진행 중 주문 기억과 재고가 전부 처음으로 돌아갑니다.\n\n정말 보낼까요?")) return;
   post({reset:true}, "하드리셋 (orders 비움)");
+};
+document.getElementById("stockreset").onclick = function(){
+  var b = this;
+  if (!confirm("우리 재고만 초기화\n\n키캡 32칸·보드 4색·창고 풀을 전시 총량으로 되돌립니다.\ncnt_process에는 아무것도 안 올립니다. 진행 중 주문·고장 칸은 그대로입니다.\n\n초기화할까요?")) return;
+  b.disabled = true;
+  fetch("/test/stock-reset", {method:"POST"}).then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+    .then(function(x){
+      b.disabled = false;
+      if (!x.ok) { logIt(false, "우리 재고만 초기화 - " + (x.j.error || "실패")); alert("재고 초기화 실패: " + (x.j.error || "")); return; }
+      var note = (x.j.arduino_sync ? "" : " (아두이노 수량 동기화 실패 - MQTT 확인)") + (x.j.failed && x.j.failed.length ? " (Mobius 재고 업로드 일부 실패)" : "");
+      logIt(true, "우리 재고만 초기화" + note);
+    })
+    .catch(function(e){ b.disabled = false; logIt(false, "우리 재고만 초기화 - " + e); alert("재고 초기화 실패: " + e); });
 };
 drawNew(); draw(); load();
 </script>
