@@ -324,21 +324,37 @@ def set_keycap_restock(st):
     print(f"keycap_restock={slots}")
 
 
-def remove_order(st):
+def complete_order(st):
+    """플랫폼과 같은 방식 - 끝난 주문은 목록에서 빼지 않고 completed로 남김.
+    orders가 빈 스냅샷은 플랫폼에서 "하드리셋"(처음 한 번)에만 나오므로 r)로 따로 보냄"""
     if not st.order:
-        print("이미 주문 없음")
+        print("주문 없음")
         return
-    print(f"{st.order_id}를 orders에서 뺌 (완료/폐기 후 사라진 상태) - 1)로 새로 만들 수 있음")
+    st.order["status"] = "completed"
+    print(f"{st.order_id} -> completed (목록에 남음, 게이트 열림). 새 주문은 1)")
+
+
+def hard_reset(st):
+    """orders가 빈 스냅샷 = 플랫폼 하드리셋 신호. 진행 중 주문 기억·재고가 초기화될 수 있음"""
+    print("!! orders가 빈 스냅샷은 플랫폼 '하드리셋'(전시 시작 때 한 번) 신호입니다.")
+    if input("정말 하드리셋 스냅샷을 보낼까요? (reset 입력): ").strip().lower() != "reset":
+        print("취소")
+        return
     st.order = None
     st.order_id = None
+    st.board_restock, st.keycap_restock = [], []
+    send(st, allow_empty=True)
 
 
 def preview(st):
     print(json.dumps(st.snapshot(), ensure_ascii=False, indent=2))
 
 
-def send(st):
+def send(st, allow_empty=False):
     snap = st.snapshot()
+    if not snap["orders"] and not allow_empty:
+        print("orders가 비어 있음 - 빈 목록은 하드리셋 신호라 s)로는 안 보냄. 주문을 끝내려면 7), 하드리셋은 r)")
+        return
     print(json.dumps(snap, ensure_ascii=False, indent=2))
     if input("이 스냅샷을 cnt_process에 올릴까요? (y/n): ").strip().lower() != "y":
         print("취소")
@@ -376,14 +392,14 @@ def load_latest(st):
 MENU = """
  1) 새 주문          2) status 선택       n) 다음 단계로
  3) fault 걸기        4) fault 해제
- 5) board_restock    6) keycap_restock    7) 주문 빼기
- l) 최신 cnt_process 불러오기   p) 미리보기   s) 전송   q) 종료"""
+ 5) board_restock    6) keycap_restock    7) 주문 완료(completed)
+ l) 최신 cnt_process 불러오기   p) 미리보기   s) 전송   r) 하드리셋(빈 목록)   q) 종료"""
 
 ACTIONS = {
     "1": new_order, "2": set_status, "n": next_status,
     "3": set_fault, "4": clear_fault,
-    "5": set_board_restock, "6": set_keycap_restock, "7": remove_order,
-    "l": load_latest, "p": preview, "s": send,
+    "5": set_board_restock, "6": set_keycap_restock, "7": complete_order,
+    "l": load_latest, "p": preview, "s": send, "r": hard_reset,
 }
 
 
