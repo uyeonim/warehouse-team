@@ -42,6 +42,7 @@ from DobotRPC import RPCClient, DobotlinkAdapter
 from DobotRPC.Utils import loggers as _dobot_loggers
 from runtime_config import PROFILE  # .env (기본) 또는 .env.local (WAREHOUSE_ENV_FILE) 을 읽음
 from usb_serial import list_ports, resolve_port
+import tray_stock
 
 _dobot_loggers.set_use_file(False)  # 실행할 때마다 폴더에 DobotRPC_날짜.log 가 쌓이지 않게 (화면 출력은 그대로)
 
@@ -136,12 +137,15 @@ SETS = {
 # 트레이 로봇팔 — 빈 트레이를 쌓아둔 곳에서 집어 벨트에 올림 (status=assigned 때)
 # SETS 와 따로 둠 → 키캡 단계에서는 이 팔이 움직이지 않음.
 # 좌표는 파일에서 읽음: 지금은 LAYOUT=design 의 도면 추정값. 실물 트레이가 오면 read_pose.py tray 로 찍을 것
-# (둘 다 없으면 None → 트레이 팔은 움직이지 않고 실패 보고). 여러 개 쌓였을 때 높이 변화는 아직 없음
+# (둘 다 없으면 None → 트레이 팔은 움직이지 않고 실패 보고).
+# 여러 더미·층으로 쌓으면 pose_tray.json "stacks" → 남은 개수로 집을 자리 계산 (tray_stock.py)
 TRAY = {
     "port": _port("TRAY", "COM8"),
-    "pickup_slots": {1: None},   # 빈 트레이 쌓아둔 곳
+    "pickup_slots": {1: None},   # 빈 트레이 쌓아둔 곳 (stacks 가 있으면 매번 남은 개수로 바꿔 넣음)
     "place_slots": {1: None},    # 벨트 위 놓는 곳
     "keycaps": [("빈 트레이", 1, 1)],  # arm_set 가 쓰는 형식 (이름, 슬롯, 번호)
+    # 놓은 뒤 방금 집은 자리 위로 빠지는 높이. 50이면 5층(z 약 105)에서 z 155 → JUMP 한계(zLimit 150) 넘음 (2026-11-08)
+    "away_lift_z": 20.0,
 }
 
 
@@ -168,6 +172,9 @@ if LAYOUT == "design":
         load_poses(_cfg, f"{_name}_design")
 for _name, _cfg in {**SETS, "tray": TRAY}.items():  # 실물에서 찍은 좌표가 있으면 그게 최우선
     load_poses(_cfg, _name)
+if tray_stock.enabled() and not TRAY["pickup_slots"][1]:  # 더미만 찍었어도 트레이 팔을 쓰는 것으로 봄
+    TRAY["pickup_slots"][1] = tray_stock.STACKS[0][0]
+TRAY["travel_z"] = tray_stock.travel_z()
 
 
 def log(tag, msg):
@@ -258,6 +265,32 @@ async def ptp(arm_api, port, pose, is_queued=False, mode=PTP_MODE_JUMP):
     x, y, z, r = pose
     return await safe_call(arm_api.SetPTPCmd(portName=port, ptpMode=mode,
                                               x=x, y=y, z=z, r=r, isQueued=is_queued))
+
+
+JUMP_HEIGHT = 20.0   # Dobot 기본 JUMP 들어올림 높이 (2026-11-08 R4 실측: jumpHeight 20, zLimit 150)
+JUMP_Z_LIMIT = 150.0
+
+
+async def set_jump_height(arm_api, port, height):
+    """JUMP 때 들어올리는 높이. 정점은 zLimit(150)을 넘지 않음."""
+    return await safe_call(arm_api.SetPTPJumpParams(portName=port, jumpHeight=height,
+                                                    zLimit=JUMP_Z_LIMIT, isQueued=False))
+
+
+TRAVEL_MIN_LIFT = 10.0  # 목표가 이미 travel_z 근처일 때도 이만큼은 들고 감
+
+
+async def use_travel_height(arm_api, port, cfg, target, min_lift=TRAVEL_MIN_LIFT):
+    """travel_z 가 있는 팔(트레이 팔)은 target 으로 가는 JUMP 의 정점을 travel_z 로.
+    JUMP 정점 = 출발·도착 중 높은 쪽 + jumpHeight (zLimit 150 까지) 로 보고 높이를 맞춤.
+    - 기본 20mm 만 들면 벨트(낮은 곳)에서 돌아갈 때 더미 옆면을 침 (2026-11-08)
+    - 출발 높이만 보고 크게 들면 5층 위로 빠질 때 정점이 150 에 걸려 0x12 → MOVJ 재시도가 놓은 트레이를 침 (2026-11-08)"""
+    travel_z = cfg.get("travel_z")
+    if not travel_z:
+        return
+    pose = await safe_call(arm_api.GetPose(portName=port, isQueued=False))
+    z = pose["z"] if isinstance(pose, dict) else travel_z
+    await set_jump_height(arm_api, port, max(min_lift, travel_z - max(z, target[2])))
 
 
 async def wait_until_arrived(arm_api, port, target_pose, tolerance=3.0, timeout=8.0):
@@ -383,8 +416,12 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
         # 1) 집기 — 각자 자기 벨트라서 두 팔이 동시에 해도 됨
         # 두 번째부터는 이미 그 슬롯 바로 위에 떠 있으므로 곧장 아래로 내림
         # 단, 앞에서 트레이 자리를 못 빠졌으면 엉뚱한 곳에 있으므로 직선(MOVL) 말고 JUMP 로 (2026-11-02 시연: 직선 이동이 관절 한계에 걸림)
-        moved, pick_arrived, pose = await move_to(arm_api, port, cfg['pickup_slots'][slot_no],
-                                                  mode=PTP_MODE_MOVL if i > 0 and left else PTP_MODE_JUMP)
+        pick_mode = PTP_MODE_MOVL if i > 0 and left else PTP_MODE_JUMP
+        if pick_mode == PTP_MODE_JUMP:
+            await use_travel_height(arm_api, port, cfg, cfg['pickup_slots'][slot_no])
+        # 트레이 팔은 MOVJ 재시도 안 함 — 들지 않고 관절째 돌아서 더미·놓은 트레이를 침 (2026-11-08)
+        moved, pick_arrived, pose = await move_to(arm_api, port, cfg['pickup_slots'][slot_no], mode=pick_mode,
+                                                  fallback=not cfg.get("travel_z"))
         log(port, f"  슬롯 이동 명령: {moved}")
         log(port, f"  슬롯 실제 도착: {pick_arrived} (현재 좌표: {pose})")
         if pick_arrived and zone and zone["blocked_by"] == port:
@@ -411,6 +448,8 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
                 log(port, "  !! 집는 자리에 못 갔음 → 트레이로 가지 않음 (다른 팔 차례를 막지 않게)")
             else:
                 # 키캡을 들고 가는 구간은 JUMP 만 (MOVJ 로 바꾸면 경로가 달라 엉뚱한 곳에서 놓게 됨)
+                # 트레이 팔: 옆 더미 위를 넘어가게. 5층에서 20mm 만 들면 아래 트레이에 살짝 닿음 → 최소 30mm (2026-11-08)
+                await use_travel_height(arm_api, port, cfg, cfg['place_slots'][slot_no], min_lift=30.0)
                 moved, place_arrived, pose = await move_to(arm_api, port, cfg['place_slots'][slot_no],
                                                            fallback=False)
                 log(port, f"  place 이동 명령: {moved}")
@@ -419,6 +458,7 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
                     # 못 갔는데 그 자리에서 그리퍼를 열면 키캡이 어딘지 모를 곳에 떨어짐
                     # → 집었던 벨트 자리로 되돌려 놓음 (사람이 찾기 쉽게)
                     log(port, "  !! 놓는 자리에 못 감 → 집었던 벨트 자리로 되돌려 놓음")
+                    await use_travel_height(arm_api, port, cfg, cfg['pickup_slots'][slot_no])
                     _, back, pose = await move_to(arm_api, port, cfg['pickup_slots'][slot_no], fallback=False)
                     log(port, f"  되돌리기: {back}" + ("" if back else f" (현재 좌표: {pose} — 이 근처에 떨어짐)"))
                     await gripper(arm_api, port, on=False)
@@ -446,8 +486,9 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
                         log(port, f"  몸 쪽으로 당기기: {ok_pull}" + ("" if ok_pull else f" (현재 좌표: {pose})"))
                 next_slot = keycaps[i + 1][1] if i + 1 < len(keycaps) else keycaps[0][1]
                 nx, ny, nz, nr = cfg['pickup_slots'][next_slot]
-                away = (nx, ny, nz + LIFT_Z_OFFSET, nr)
-                _, left, pose = await move_to(arm_api, port, away)  # JUMP
+                away = (nx, ny, nz + cfg.get("away_lift_z", LIFT_Z_OFFSET), nr)
+                await use_travel_height(arm_api, port, cfg, away)
+                _, left, pose = await move_to(arm_api, port, away, fallback=not cfg.get("travel_z"))  # JUMP
                 log(port, f"  트레이 자리에서 빠짐: {left}" + ("" if left else f" (현재 좌표: {pose})"))
                 if not left and zone:
                     zone["blocked_by"] = port  # 못 빠졌으면 다른 팔이 들어오지 않게 막음
@@ -465,6 +506,8 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
 
     await gripper(arm_api, port, on=False)
     await safe_call(arm_api.SetEndEffectorGripper(portName=port, enable=False, on=False, isQueued=False))
+    if cfg.get("travel_z"):
+        await set_jump_height(arm_api, port, JUMP_HEIGHT)  # 다른 프로그램(DobotLab 등)이 쓰는 기본값으로 되돌림
     await clear_alarms_now(arm_api, port, "단계 끝 정리")  # 그리퍼 여닫을 때 생기는 잔류 알람까지 정리
 
     log(port, "완료")
@@ -538,6 +581,8 @@ def connect(cfgs=None):
         res = _loop.run_until_complete(safe_call(_arm_api.ConnectDobot(portName=cfg["port"])))
         log("INIT", f"{cfg['port']} ({key}): {res}")
         _connected[cfg["port"]] = cfg
+        if cfg.get("travel_z"):  # 지난번에 도중에 꺼져 JUMP 높이가 크게 남아 있었어도 기본값으로
+            _loop.run_until_complete(set_jump_height(_arm_api, cfg["port"], JUMP_HEIGHT))
 
 
 def keepalive():
@@ -579,6 +624,8 @@ def disconnect():
     for cfg in _connected.values():
         if "conveyor_index" in cfg:  # Ctrl+C 로 벨트 도중 끊겨도 벨트는 세움
             _loop.run_until_complete(conveyor(_box_api, cfg["port"], cfg["conveyor_index"], False, 0))
+        if cfg.get("travel_z"):  # Ctrl+C 로 도중에 끊겨도 JUMP 높이는 기본값으로 (DobotLab 등에서 쓸 때 안 튀게)
+            _loop.run_until_complete(set_jump_height(_arm_api, cfg["port"], JUMP_HEIGHT))
         _loop.run_until_complete(safe_call(_arm_api.DisconnectDobot(portName=cfg["port"])))
     _connected.clear()
 
@@ -589,15 +636,34 @@ def run_keycap_conveyor(order_id):
     return _loop.run_until_complete(all_belts(_arm_api, _box_api))
 
 
-def run_tray_arm(order_id):
+def run_tray_arm(order_id, after_fault=False):
     """assigned 때 호출. 트레이 팔이 빈 트레이를 집어 벨트에 올림. 성공 여부 반환.
-    좌표는 pose_tray.json (찍은 값) 또는 pose_tray_design.json (LAYOUT=design). 없으면 움직이지 않고 실패."""
+    좌표는 pose_tray.json (찍은 값) 또는 pose_tray_design.json (LAYOUT=design). 없으면 움직이지 않고 실패.
+    더미(stacks)가 있으면 남은 개수로 집을 더미·층을 정하고, 성공하면 하나 뺌. 0개면 움직이지 않고 실패
+    → 플랫폼 fault(tray_load_failed) → 사람이 다 채우고 fault 해제 → after_fault=True 로 다시 불림 → 가득 찬 것으로 봄.
+    (개수가 실제보다 적으면 트레이가 있는 높이보다 낮게 내려가 박음 → 채웠는데 0 으로 남는 경우를 코드에서 막음)"""
+    count = None
+    if tray_stock.enabled():
+        count = tray_stock.get()
+        if count <= 0 and after_fault:
+            tray_stock.put(tray_stock.TOTAL)
+            count = tray_stock.TOTAL
+            log(TRAY["port"], f"트레이 다 쓴 fault 가 해제됨 → 사람이 채운 것으로 보고 {count}개로 시작")
+        if count <= 0:
+            log(TRAY["port"], f"!! {tray_stock.describe(count)} → 실패 처리")
+            return False
+        stack_no, floor, TRAY["pickup_slots"][1] = tray_stock.pick_pose(count)
+        log(TRAY["port"], f"빈 트레이 {count}/{tray_stock.TOTAL} 남음 → 더미{stack_no} {floor}층 집기")
     if not (TRAY["pickup_slots"][1] and TRAY["place_slots"][1]):
         log(TRAY["port"], "트레이 좌표가 아직 없음 (pose_tray.json) → 실패 처리")
         return False
     ensure_connected({"tray": TRAY})
-    res = _loop.run_until_complete(arm_set(_arm_api, TRAY))
-    return bool(res.get(1))
+    ok = bool(_loop.run_until_complete(arm_set(_arm_api, TRAY)).get(1))
+    if count is not None:
+        if ok:
+            tray_stock.put(count - 1)  # 벨트에 놓고 빠진 것까지 확인됐을 때만 뺌 (못 집었으면 그 자리에 그대로 있음)
+        log(TRAY["port"], tray_stock.describe())
+    return ok
 
 
 def run_keycap_arms(order_id, on_result=None):
