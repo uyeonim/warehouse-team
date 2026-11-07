@@ -48,6 +48,9 @@ if (-not (Test-Path $Python)) {
     }
 }
 if (Test-Path $Python) {
+    # DobotRPC 가 쓰는 demjson 은 setuptools 58 이상에서 설치 실패(use_2to3 오류, 2026-11-04 새 venv 에서 확인) -> 먼저 깔아 둠
+    & $Python -m pip install --disable-pip-version-check -q "setuptools<58" wheel
+    & $Python -m pip install --disable-pip-version-check -q --no-build-isolation demjson
     & $Python -m pip install --disable-pip-version-check -q -r (Join-Path $Repo 'requirements.txt')
     if ($LASTEXITCODE -eq 0) { Ok 'requirements.txt 설치' } else { Todo 'pip 설치 실패 - 인터넷 연결 확인 후 다시 실행' }
 }

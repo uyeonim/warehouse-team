@@ -55,6 +55,8 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 1. Python 3.9 가상환경
    ```powershell
    py -3.9 -m venv venv
+   .\venv\Scripts\python.exe -m pip install "setuptools<58" wheel                  # DobotRPC 의 demjson 이 최신 setuptools 에서 설치 실패
+   .\venv\Scripts\python.exe -m pip install --no-build-isolation demjson
    .\venv\Scripts\python.exe -m pip install -r requirements.txt
    ```
 2. 설정 파일: `board/.env.example` → `board/.env`, `keycap_flask/.env.example` → `keycap_flask/.env`,

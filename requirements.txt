@@ -1,6 +1,9 @@
 # Shared venv for the warehouse laptop (Python 3.9 - required by DobotRPC)
 #   py -3.9 -m venv venv
+#   .\venv\Scripts\python.exe -m pip install "setuptools<58" wheel
+#   .\venv\Scripts\python.exe -m pip install --no-build-isolation demjson
 #   .\venv\Scripts\python.exe -m pip install -r requirements.txt
+#   (demjson, used by DobotRPC, fails to build with setuptools>=58: "use_2to3 is invalid")
 # Versions pinned to the set tested on site (2026-11-02).
 # (keep this file ASCII - pip on Korean Windows reads it as cp949)
 DobotRPC==4.8.8
