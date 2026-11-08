@@ -56,13 +56,21 @@ else:
 # 로깅 설정: print() 대신 이걸 씀 — gunicorn 환경에서
 # 버퍼링 없이 즉시 flush됨 (PYTHONUNBUFFERED 이슈 회피)
 # ============================================================
+# [11/09] 화면 + logs/flask_날짜.log 에도 같이 기록 (보드·게이트웨이 로그와 같은 방식, 시연 기록용)
+#  같은 날 다시 켜면 같은 파일에 이어서 씀. 줄마다 바로 기록돼서 창을 강제로 닫아도 남음
+_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_log_dir, exist_ok=True)
+LOG_FILE = os.path.join(_log_dir, f"flask_{time.strftime('%Y-%m-%d')}.log")
+with open(LOG_FILE, "a", encoding="utf-8") as _f:
+    _f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} 시작 =====\n")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    stream=sys.stdout,
+    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(LOG_FILE, encoding="utf-8")],
     force=True,  # gunicorn이 이미 만들어둔 핸들러 무시하고 강제 재설정
 )
 logger = logging.getLogger("warehouse")
+logger.info(f"로그 파일: {LOG_FILE}")
 
 MQTT_HOST = os.getenv("MQTT_HOST", "192.168.0.100")  # Mosquitto는 플랫폼 서버에 있음 (창고 PC의 localhost 아님)
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
@@ -135,7 +143,7 @@ def publish(topic: str, payload: str, retain: bool = True) -> bool:
         info.wait_for_publish(timeout=5)
         return info.is_published()
     except Exception as e:
-        print("MQTT 오류:", e)
+        logger.info(f"MQTT 오류: {e}")
         return False
     finally:
         c.loop_stop()
@@ -173,10 +181,10 @@ def post_cin_to_mobius(cnt_path: str, content: dict) -> bool:
         resp = requests.post(url, headers=headers, json=body, timeout=5)
         ok = 200 <= resp.status_code < 300
         if not ok:
-            print(f"[Mobius] CIN 생성 실패 ({resp.status_code}):", resp.text)
+            logger.info(f"[Mobius] CIN 생성 실패 ({resp.status_code}): {resp.text}")
         return ok
     except Exception as e:
-        print("[Mobius] 요청 오류:", e)
+        logger.info(f"[Mobius] 요청 오류: {e}")
         return False
 
 
@@ -408,7 +416,7 @@ def report_keycap_status():
     cnt_path = f"cnt_warehouse/cnt_keycap_status/cnt_{letter_color}"
 
     ok = post_cin_to_mobius(cnt_path, content)
-    print(f"[report/keycap-status] {cnt_path} {'성공' if ok else '실패'}:", content)
+    logger.info(f"[report/keycap-status] {cnt_path} {'성공' if ok else '실패'}: {content}")
 
     if not ok:
         return jsonify({"error": "mobius CIN 생성 실패"}), 502
@@ -430,7 +438,7 @@ def report_keycap_dispense():
     content = {"order_id": order_id, "keycap": keycap}
 
     ok = post_cin_to_mobius("cnt_warehouse/cnt_keycap_dispense", content)
-    print(f"[report/keycap-dispense] {'성공' if ok else '실패'}:", content)
+    logger.info(f"[report/keycap-dispense] {'성공' if ok else '실패'}: {content}")
 
     if not ok:
         return jsonify({"error": "mobius CIN 생성 실패"}), 502
@@ -496,7 +504,7 @@ def report_board_status():
     cnt_path = f"cnt_warehouse/cnt_board_status/cnt_{color}"
 
     ok = post_cin_to_mobius(cnt_path, content)
-    print(f"[report/board-status] {cnt_path} {'성공' if ok else '실패'}:", content)
+    logger.info(f"[report/board-status] {cnt_path} {'성공' if ok else '실패'}: {content}")
 
     if not ok:
         return jsonify({"error": "mobius CIN 생성 실패"}), 502
@@ -558,7 +566,7 @@ def restock_board(color):
     content = {"order_id": None, "count": filled, "status": status}
     ok = post_cin_to_mobius(f"cnt_warehouse/cnt_board_status/cnt_{color}", content)
 
-    print(f"[restock] board_{color}: {filled}개 (pool에서 {moved}개, pool 남음 {pool_left}, status={status}, 모비우스 업로드 {'성공' if ok else '실패'})")
+    logger.info(f"[restock] board_{color}: {filled}개 (pool에서 {moved}개, pool 남음 {pool_left}, status={status}, 모비우스 업로드 {'성공' if ok else '실패'})")
     return jsonify({"filled": filled, "moved": moved, "status": status, "mobius_ok": ok}), 200
 
 
@@ -641,7 +649,7 @@ def restock_letter_color(letter, color):
     # 건드리지 않고 지금 stock만 돌려줌 (_auto_hard_reset 참고)
     if redis.exists("reset:restock_window"):
         stock = int(redis.get(f"stock:{letter_color}") or 0)
-        print(f"[restock] {letter_color}: 하드리셋 직후 수량 맞추기 -> {stock}개 (pool 그대로)")
+        logger.info(f"[restock] {letter_color}: 하드리셋 직후 수량 맞추기 -> {stock}개 (pool 그대로)")
         return jsonify({"filled": stock, "status": get_last_status(f"status:{letter_color}"), "mobius_ok": True}), 200
 
     data = request.get_json(force=True, silent=True) or {}
@@ -670,7 +678,7 @@ def restock_letter_color(letter, color):
         content["reason"] = redis.get(f"reason:{letter_color}") or ""
     ok = post_cin_to_mobius(f"cnt_warehouse/cnt_keycap_status/cnt_{letter_color}", content)
 
-    print(f"[restock] {letter_color}: {filled}개 (pool에서 {moved}개, pool 남음 {pool_left}, status={status}, 모비우스 업로드 {'성공' if ok else '실패'})")
+    logger.info(f"[restock] {letter_color}: {filled}개 (pool에서 {moved}개, pool 남음 {pool_left}, status={status}, 모비우스 업로드 {'성공' if ok else '실패'})")
     return jsonify({"filled": filled, "moved": moved, "status": status, "mobius_ok": ok}), 200
 
 
@@ -716,7 +724,7 @@ def lock_gate(board):
         return jsonify({"error": "order_id는 필수"}), 400
 
     redis.set(_gate_key(board), order_id)
-    print(f"[gate] {board} 잠금: {order_id}")
+    logger.info(f"[gate] {board} 잠금: {order_id}")
     return jsonify({"result": "ok"}), 200
 
 
@@ -729,7 +737,7 @@ def clear_gate(board):
         abort(404)
 
     redis.delete(_gate_key(board))
-    print(f"[gate] {board} 해제")
+    logger.info(f"[gate] {board} 해제")
     return jsonify({"result": "ok"}), 200
 
 
@@ -853,7 +861,7 @@ def reset_mobius():
         results[f"board_{color}"] = ok
 
     failed = [k for k, ok in results.items() if not ok]
-    print(f"[reset/mobius] 동기화 완료, 실패: {failed if failed else '없음'}")
+    logger.info(f"[reset/mobius] 동기화 완료, 실패: {failed if failed else '없음'}")
     return jsonify({"result": "ok" if not failed else "partial_fail", "failed": failed}), (200 if not failed else 207)
 
 
@@ -865,7 +873,7 @@ def reset_hard():
         _do_hard_reset()
     synced = _sync_arduinos(_all_keycap_letter_colors())
     failed = _upload_reset_to_mobius()
-    print(f"[reset/hard] 하드 리셋 완료, 아두이노 동기화 {'전송' if synced else '실패'}, "
+    logger.info(f"[reset/hard] 하드 리셋 완료, 아두이노 동기화 {'전송' if synced else '실패'}, "
           f"모비우스 업로드 실패: {failed if failed else '없음'}")
     return jsonify({"result": "ok" if not failed else "partial_fail", "failed": failed, "arduino_sync": synced}), \
         (200 if not failed else 207)
