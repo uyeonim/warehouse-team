@@ -118,7 +118,7 @@ BOARD_POOL_TOTAL = 330  # 색상별 전체 재고 총량(카트리지 포함) �
 KEYCAP_TOTAL_PER_COLOR = {"E": 190, "I": 170, "N": 160, "S": 200, "T": 170, "F": 200, "P": 180, "J": 180}
 # [11/09] 빈 트레이 - 더미 3개 × 5층. 다 쓰면 사람이 모아서 다시 쌓음 (pool 없음). 게이트웨이 tray_stock.TOTAL과 같게
 TRAY_TOTAL = 15
-TRAY_STATUS_PATH = "cnt_warehouse/cnt_tray_status"   # 플랫폼에 원래 없음 - 처음 올릴 때 키캡 Flask가 만듦 (_ensure_tray_cnt)
+TRAY_STATUS_PATH = "cnt_warehouse/cnt_tray_status"   # 플랫폼에 컨테이너가 아직 없음 - 만들어 주면 그때부터 올라감
 
 app = Flask(__name__)
 
@@ -892,42 +892,13 @@ def reset_hard():
 #    POST /report/tray-used 로 하나 뺌 (덮어쓰지 않고 빼기 - 집는 동안 누가 채워도 안 꼬이게)
 #  - 채우기·정정은 /stock/set (상태판). 하드리셋 때 TRAY_TOTAL로
 #  - Mobius cnt_warehouse/cnt_tray_status 에도 {order_id, count, status} 로 올림. 플랫폼에 컨테이너가 아직
-#    없으면 처음 올릴 때 만듦. 실패해도 Redis는 그대로 씀 (키캡·보드는 Mobius 실패면 Redis도 안 바꾸지만 트레이는 우리만 씀)
+#    없어서 실패해도 Redis는 그대로 씀 (키캡·보드는 Mobius 실패면 Redis도 안 바꾸지만 트레이는 우리만 씀)
 # ============================================================
-_tray_cnt_ready = False
-
-
-def _ensure_tray_cnt():
-    """[11/09] cnt_warehouse 밑에 cnt_tray_status 컨테이너를 우리가 만듦 (플랫폼에 원래 없음).
-    201 = 만듦, 409 = 이미 있음 -> 둘 다 준비 끝. 다른 응답이면 다음 업로드 때 다시 시도"""
-    global _tray_cnt_ready
-    parent, rn = TRAY_STATUS_PATH.rsplit("/", 1)
-    headers = {"Accept": "application/json", "X-M2M-RI": str(uuid.uuid4()), "X-M2M-RVI": "3",
-               "X-M2M-Origin": ORIGIN, "Content-Type": "application/json;ty=3"}
-    if COSS_API_KEY:
-        headers.update({"X-API-KEY": COSS_API_KEY, "X-AUTH-CUSTOM-LECTURE": COSS_LECTURE,
-                        "X-AUTH-CUSTOM-CREATOR": COSS_CREATOR})
-    try:
-        resp = requests.post(f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/{parent}", headers=headers,
-                             json={"m2m:cnt": {"rn": rn}}, timeout=5)
-    except Exception as e:
-        logger.info(f"[tray] 컨테이너 만들기 요청 오류: {e}")
-        return False
-    if resp.status_code in (201, 409):
-        _tray_cnt_ready = True
-        logger.info(f"[tray] {TRAY_STATUS_PATH} 컨테이너 " + ("만듦" if resp.status_code == 201 else "이미 있음"))
-        return True
-    logger.info(f"[tray] 컨테이너 만들기 실패 ({resp.status_code}): {resp.text}")
-    return False
-
-
 def _upload_tray(order_id, count):
-    content = {"order_id": order_id, "count": count, "status": "empty" if count <= 0 else "idle"}
-    ok = post_cin_to_mobius(TRAY_STATUS_PATH, content)
-    if not ok and not _tray_cnt_ready and _ensure_tray_cnt():   # 컨테이너가 없어서 실패했으면 만들고 한 번 더
-        ok = post_cin_to_mobius(TRAY_STATUS_PATH, content)
+    ok = post_cin_to_mobius(TRAY_STATUS_PATH, {"order_id": order_id, "count": count,
+                                                "status": "empty" if count <= 0 else "idle"})
     if not ok:
-        logger.info(f"[tray] 모비우스 업로드 실패 ({TRAY_STATUS_PATH}) - Redis·상태판은 그대로 동작")
+        logger.info(f"[tray] 모비우스 업로드 실패 ({TRAY_STATUS_PATH} - 플랫폼에 컨테이너가 있는지 확인)")
     return ok
 
 
