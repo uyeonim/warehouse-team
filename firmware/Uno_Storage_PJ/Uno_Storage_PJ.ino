@@ -704,7 +704,7 @@ const bool IR_INSTALLED[2][4] = {
 };
 
 // ---- 카트리지 최대 용량 (restock 시 이 값까지 채움, 전체 풀 부족하면 서버가 그보다 적게 응답) ----
-#define MAX_CAPACITY 30
+#define MAX_CAPACITY 40   // 11/09 실물 40개 (서버 RAIL_CAPACITY와 같게, 펌웨어에서는 안 씀)
 
 // ---- disable 사유 문자열 (report 시 reason 필드에 실려 나감) ----
 const char* REASON_CARTRIDGE_FAILED = "keycap_cartridge_failed"; // 끼임/서보모터 고장 (IR 판정 실패)

@@ -83,7 +83,7 @@ def run():
         import tray_stock  # 빈 트레이 남은 개수도 같이 기록 (hb:keycap_tray 의 tray_left / tray_total)
         hb = Heartbeat('keycap_tray', os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/0'),
                        'rehearsal' if os.environ.get('WAREHOUSE_REHEARSAL') == '1' else 'real',
-                       extra=lambda: {'tray_left': tray_stock.get(), 'tray_total': tray_stock.TOTAL}
+                       extra=lambda: {'tray_left': tray_stock.cached(), 'tray_total': tray_stock.TOTAL}
                        if tray_stock.enabled() else {}).start()
         if tray_stock.enabled():
             print(tray_stock.describe())

@@ -47,12 +47,14 @@ KEYCAP_FLASK_URL = "http://127.0.0.1:5002"   # 고장 칸 복구 버튼이 부�
 RACK = [("EI", "E", "I"), ("NS", "N", "S"), ("TF", "T", "F"), ("PJ", "P", "J")]   # 아두이노 보드 = 실물 랙 배치
 KEYCAP_ROWS = [(board, letter) for board, *letters in RACK for letter in letters]
 RAIL_COLORS = [("r", "핑크"), ("y", "옐로우"), ("b", "블루"), ("g", "그린")]
-CELL_WORD = {"empty": "비었음", "disable": "고장", "busy": "배출 중"}   # 칸 안 글자는 이 셋만 (평소엔 숫자만)
+CELL_WORD = {"empty": "비었음", "disable": "고장", "busy": "배출 중"}
+TRAY_LOW = 3   # [11/09] 빈 트레이가 이만큼 이하면 노랑 + 맨 위 안내   # 칸 안 글자는 이 셋만 (평소엔 숫자만)
 
 
 def _rails():
     """{"E_r": (status, 카트리지 개수, 창고 pool), ..., "board_r": (...)} - 못 읽으면 None"""
-    keys = [f"{letter}_{c}" for _, letter in KEYCAP_ROWS for c, _ in RAIL_COLORS] + [f"board_{c}" for c, _ in RAIL_COLORS]
+    keys = ([f"{letter}_{c}" for _, letter in KEYCAP_ROWS for c, _ in RAIL_COLORS] + [f"board_{c}" for c, _ in RAIL_COLORS]
+            + ["tray"])   # [11/09] 빈 트레이 (키캡 Flask stock:tray, pool 없음)
     num = lambda v: None if v is None else int(v)
     try:
         r = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=2)
@@ -74,7 +76,8 @@ def _original_totals():
     found = {}
     for node in tree.body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            if node.targets[0].id in ("KEYCAP_TOTAL_PER_COLOR", "BOARD_POOL_TOTAL"):
+            if node.targets[0].id in ("KEYCAP_TOTAL_PER_COLOR", "BOARD_POOL_TOTAL", "RAIL_CAPACITY",
+                                      "BOARD_CARTRIDGE_CAPACITY", "TRAY_TOTAL"):
                 try:
                     found[node.targets[0].id] = ast.literal_eval(node.value)
                 except ValueError:
@@ -82,6 +85,10 @@ def _original_totals():
     totals = dict(found.get("KEYCAP_TOTAL_PER_COLOR") or {})
     if "BOARD_POOL_TOTAL" in found:
         totals["board"] = found["BOARD_POOL_TOTAL"]
+    # [11/09] 카트리지 용량·빈 트레이 총수도 같은 곳에서 (키캡 30 -> 40 처럼 바뀌어도 한 곳만 고치게)
+    totals["rail_cap"] = found.get("RAIL_CAPACITY", 40)
+    totals["board_cap"] = found.get("BOARD_CARTRIDGE_CAPACITY", 20)
+    totals["tray"] = found.get("TRAY_TOTAL", 15)
     return totals
 
 
@@ -528,6 +535,12 @@ button:focus-visible, summary:focus-visible { outline:3px solid var(--go); outli
        padding:4px 10px; min-height:28px; cursor:pointer; }
 .fix:disabled { opacity:.5; cursor:default; }
 .boardcard { margin-top:10px; }
+.cards2 { display:grid; grid-template-columns:4fr 1fr; gap:10px; }
+.traycard .bcols, .traycard .brow { grid-template-columns:1fr; }
+.cell.edit { cursor:pointer; }
+.cell.edit:hover, .cell.edit:focus-visible { outline:2px solid var(--ink); outline-offset:-2px; }
+.cell.low { background:var(--caution-wash); box-shadow:inset 0 0 0 2px var(--caution); }
+.cell.low small { color:var(--ink); }
 .boardcard .bcols, .boardcard .brow { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:6px; }
 .boardcard .bcols { margin-bottom:4px; }
 .cname { display:flex; align-items:center; justify-content:center; gap:5px; font-size:12px; font-weight:700; color:var(--soft); }
@@ -649,6 +662,27 @@ JS = """
   d.addEventListener('toggle', function(){ try { sessionStorage.setItem('okOpen', d.open ? '1' : '0'); } catch(e) {} });
 })();
 (function(){
+  // [11/09] 재고 칸을 누르면 실제 센 개수 입력 -> /stock-set. 입력 창을 보는 동안은 새로 고침을 멈춤
+  function ask(c){
+    var key = c.getAttribute('data-key'), now = c.getAttribute('data-now'), cap = +c.getAttribute('data-cap');
+    clearTimeout(window.__refresh);
+    var name = key === 'tray' ? '빈 트레이' : key;
+    var v = window.prompt(name + ' 실제 개수 (지금 기록 ' + now + '개, 0~' + cap + ')\\n' +
+      (key === 'tray' ? '다 쌓았으면 ' + cap + ' 입력' : '창고 전체 재고도 차이만큼 같이 바뀝니다'), key === 'tray' ? String(cap) : now);
+    if (v === null || v.trim() === '') { window.__refresh = setTimeout(function(){ location.reload(); }, 1000); return; }
+    var n = Number(v.trim());
+    if (!Number.isInteger(n) || n < 0 || n > cap) { window.alert('0~' + cap + ' 사이 숫자만'); location.reload(); return; }
+    fetch('/stock-set', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: key, count: n }) })
+      .then(function(r){ return r.json().then(function(j){ return { ok: r.ok, j: j }; }); })
+      .then(function(x){ if (!x.ok) window.alert('못 바꿈: ' + (x.j.error || JSON.stringify(x.j))); location.reload(); })
+      .catch(function(err){ window.alert('못 바꿈: ' + err); location.reload(); });
+  }
+  document.querySelectorAll('.cell.edit').forEach(function(c){
+    c.addEventListener('click', function(){ ask(c); });
+    c.addEventListener('keydown', function(ev){ if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); ask(c); } });
+  });
+})();
+(function(){
   // 고장 칸 "복구": 확인 창에서 "확인"을 눌러야 보냄 (잘못 눌러도 바로 안 나가게)
   var sent = {}; try { sent = JSON.parse(sessionStorage.getItem('repairSent') || '{}') || {}; } catch(e) {}
   document.querySelectorAll('.fix').forEach(function(b){
@@ -731,9 +765,15 @@ def _render_stock(rails):
     if rails is None:
         return '<section class="stock"><h2>재고</h2><p class="empty">Redis를 못 읽어서 재고를 볼 수 없습니다.</p></section>'
     totals = _original_totals()
+    rail_cap, board_cap, tray_cap = totals["rail_cap"], totals["board_cap"], totals["tray"]
+
+    def cart_cap(key):
+        return tray_cap if key == "tray" else (board_cap if key.startswith("board_") else rail_cap)
 
     def cell(key, view, cap):
         status, count, pool = rails[key]
+        if key == "tray" and count is None:
+            count = tray_cap   # 키캡 Flask와 같게: 한 번도 안 쓴 것 = 다 쌓여 있음
         have = count or 0
         value = have if view == "cart" else have + (pool or 0)
         if view == "cart":
@@ -743,7 +783,13 @@ def _render_stock(rails):
         ratio = max(0.0, min(1.0, value / cap)) if cap else 0
         label = "-" if count is None else str(value)
         word = f"<small>{CELL_WORD[st]}</small>" if st else ""
-        return (f'<div class="cell {st}" title="{e(key)} {label}/{cap}"><span class="lvl" style="height:{ratio * 100:.0f}%"></span>'
+        if key == "tray" and st == "" and 0 < have <= TRAY_LOW:
+            st, word = "low", "<small>곧 없음</small>"
+        # [11/09] 카트리지 보기에서 칸을 누르면 실제 개수로 맞춤 (data-cap = 넣을 수 있는 최대)
+        edit = (f' data-key="{e(key)}" data-now="{have}" data-cap="{cart_cap(key)}" role="button" tabindex="0"'
+                if view == "cart" and st != "busy" else "")
+        return (f'<div class="cell {st}{" edit" if edit else ""}" title="{e(key)} {label}/{cap}"{edit}>'
+                f'<span class="lvl" style="height:{ratio * 100:.0f}%"></span>'
                 f'<b class="num">{e(label)}</b>{word}</div>')
 
     def view_html(view):
@@ -758,19 +804,23 @@ def _render_stock(rails):
                        '<div class="cols"><span></span>' +
                        "".join(f'<span class="dot {c}" title="{n}"></span>' for c, n in RAIL_COLORS) + "</div>")
             for L in letters:
-                cap = 30 if view == "cart" else totals.get(L, 0)
+                cap = rail_cap if view == "cart" else totals.get(L, 0)
                 out.append(f'<div class="row"><i>{L}</i>' + "".join(cell(f"{L}_{c}", view, cap) for c, _ in RAIL_COLORS) + "</div>")
             for k in bad:
                 out.append(f'<div class="bd-alert"><span>{k} 고장</span>'
                            f'<button type="button" class="fix" data-rail="{k}">복구</button></div>')
             out.append("</section>")
         out.append("</div>")
-        cap = 20 if view == "cart" else totals.get("board", 0)
-        out.append('<section class="bd boardcard" aria-label="보드 스택"><div class="bd-head"><b>보드 스택</b>'
-                   f'<span>{"카트리지 20개" if view == "cart" else f"전시 총량 {cap}개"}</span></div><div class="bcols">' +
+        cap = board_cap if view == "cart" else totals.get("board", 0)
+        out.append('<div class="cards2"><section class="bd boardcard" aria-label="보드 스택"><div class="bd-head"><b>보드 스택</b>'
+                   f'<span>{f"카트리지 {board_cap}개" if view == "cart" else f"전시 총량 {cap}개"}</span></div><div class="bcols">' +
                    "".join(f'<span class="cname"><span class="dot {c}"></span>{n}</span>' for c, n in RAIL_COLORS) +
-                   '</div><div class="brow">' + "".join(cell(f"board_{c}", view, cap) for c, _ in RAIL_COLORS) + "</div></section>")
-        legend = ("숫자 = 카트리지에 남은 개수, 배경 = 남은 양 (키캡 30, 보드 20). 초록 = 지금 뽑는 칸, 고장 칸은 고친 뒤 복구."
+                   '</div><div class="brow">' + "".join(cell(f"board_{c}", view, cap) for c, _ in RAIL_COLORS) + "</div></section>"
+                   '<section class="bd boardcard traycard" aria-label="빈 트레이"><div class="bd-head"><b>빈 트레이</b>'
+                   f'<span>{tray_cap}개 중</span></div><div class="bcols"><span class="cname">더미 3 × 5층</span></div>'
+                   f'<div class="brow">{cell("tray", view, tray_cap)}</div></section></div>')
+        legend = (f"숫자 = 카트리지에 남은 개수, 배경 = 남은 양 (키캡 {rail_cap}, 보드 {board_cap}, 트레이 {tray_cap}). "
+                  "초록 = 지금 뽑는 칸, 고장 칸은 고친 뒤 복구. 칸을 누르면 실제 센 개수로 맞춤 (창고 전체 재고도 차이만큼 같이 바뀜)."
                   if view == "cart" else
                   "숫자 = 창고까지 합친 남은 개수, 배경 = 전시 총량 대비 (키캡은 글자별, 보드 330). 총량은 키캡 Flask 코드에서 읽음.")
         out.append(f'<p class="legend">{legend}</p>')
@@ -842,14 +892,24 @@ def _render(result, error):
     if broken:   # 점검(check_all) 항목은 아니지만 주문이 멈추는 원인이라 "확인할 것"에 같이 올림
         rail_issue = ("!!", 0, "카트리지 칸", f"{', '.join(broken)} 고장 - 이 칸이 든 주문은 키캡 단계에서 멈춤")
         warn = warn + [rail_issue]
+    tray = (rails or {}).get("tray")
+    tray_left = tray[1] if tray and tray[1] is not None else None
+    tray_issue = None
+    if tray_left is not None and tray_left <= TRAY_LOW:   # 0이면 트레이 팔이 기다림 (fault 없음) - 사람이 채워야 움직임
+        tray_issue = ("!!", 0, "빈 트레이", "빈 트레이 다 씀 - 트레이 팔이 기다리는 중" if tray_left <= 0
+                      else f"빈 트레이 {tray_left}개 남음")
+        warn = warn + [tray_issue]
     total = len(bad) + len(warn)
     if bad:
         cls = "bad"
         say, sub = _headline(bad[0], total)
     elif warn:
         cls = "warn"
-        first = rail_issue if rail_issue else warn[0]
-        if first is rail_issue:
+        first = rail_issue or (tray_issue if tray_left is not None and tray_left <= 0 else None) or warn[0]
+        if first is tray_issue:
+            say = tray_issue[3] + (f" 외 {total - 1}건" if total > 1 else "")
+            sub = "빈 트레이를 더미 3개 × 5층으로 다 쌓고, 재고의 빈 트레이 칸을 눌러 개수를 입력하세요."
+        elif first is rail_issue:
             say = f"{broken[0]} 카트리지 고장" + (f" 외 {total - 1}건" if total > 1 or len(broken) > 1 else "")
             sub = "이 칸이 든 주문은 키캡 단계에서 멈춥니다. 센서를 확인하고 재고에서 복구를 누르세요."
         else:
@@ -874,7 +934,7 @@ def _render(result, error):
     parts.append('</ul></details>')
     err = f" 마지막 점검에서 오류가 났습니다: {e(error)}" if error else ""
     parts.append(f'<footer>{PAGE_REFRESH_SEC}초마다 새로 고칩니다. 조작은 원격 데스크톱으로, 위험하면 로봇 전원 스위치를 끕니다.'
-                 f' 이 화면에서 할 수 있는 조작은 고장 칸 복구뿐입니다.{err}</footer>')
+                 f' 이 화면에서 할 수 있는 조작은 고장 칸 복구와 재고 숫자 맞추기뿐입니다.{err}</footer>')
     parts.append(f'</main><script>{JS}</script></body></html>')
     return "".join(parts)
 
@@ -912,7 +972,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if test_page.handle(self, "POST"):   # /test/send - 테스트 페이지에서 스냅샷 올리기
             return
-        # 상태판 화면에서 유일한 조작: 고장 칸 복구 -> 키캡 Flask /repair/<칸> (아두이노에 MQTT 복구 명령, 칸 상태만 되돌림)
+        if self.path == "/stock-set":
+            self._stock_set()
+            return
+        # 상태판 화면의 조작: 고장 칸 복구 -> 키캡 Flask /repair/<칸> (아두이노에 MQTT 복구 명령, 칸 상태만 되돌림)
         if self.path != "/repair":
             self.send_response(404)
             self.end_headers()
@@ -929,6 +992,28 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 r = requests.post(f"{KEYCAP_FLASK_URL}/repair/{rail}", timeout=8)
                 code, body = r.status_code, r.json()
+            except Exception as e:
+                code, body = 502, {"error": f"키캡 Flask 응답 없음 ({type(e).__name__})"}
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _stock_set(self):
+        """[11/09] 재고 칸 숫자 맞추기 -> 키캡 Flask /stock/set (같은 공유기에서만)"""
+        if not test_page.allowed(self):
+            code, body = 403, {"error": "같은 공유기에서만"}
+        else:
+            try:
+                length = min(int(self.headers.get("Content-Length") or 0), 1024)
+                req = json.loads(self.rfile.read(length) or b"{}")
+                r = requests.post(f"{KEYCAP_FLASK_URL}/stock/set",
+                                  json={"key": req.get("key"), "count": req.get("count")}, timeout=15)
+                code, body = r.status_code, r.json()
+            except (ValueError, AttributeError):
+                code, body = 400, {"error": "요청 형식"}
             except Exception as e:
                 code, body = 502, {"error": f"키캡 Flask 응답 없음 ({type(e).__name__})"}
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")

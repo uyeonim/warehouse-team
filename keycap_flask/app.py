@@ -105,7 +105,7 @@ BOARD_LETTERS = {
     "PJ": ["P", "J"],
 }
 COLORS = ["r", "y", "b", "g"]  # r=핑크, y=옐로우, b=블루, g=그린
-RAIL_CAPACITY = 30  # 카트리지(stock) 최대 장전 개수, 아두이노 MAX_CAPACITY와 동일
+RAIL_CAPACITY = 40  # 카트리지(stock) 최대 장전 개수, 아두이노 MAX_CAPACITY와 동일 (11/09 실물 40개, 예전 30)
 
 # 보드(피지컬 보드 상품) 재고 상수 — 알파벳 축 구분 없이 색상으로만 관리
 # 모비우스 cnt_board_status 밑 컨테이너가 cnt_r/cnt_y/cnt_b/cnt_g로 확인되어
@@ -116,6 +116,9 @@ BOARD_CARTRIDGE_CAPACITY = 20  # 카트리지에 실제로 장전되는 재고
 #   보드 66×5 = 330/색 (예전 300), 키캡은 글자별 (문자 키캡 ★·꽃 등은 카트리지 칸이 없어 제외)
 BOARD_POOL_TOTAL = 330  # 색상별 전체 재고 총량(카트리지 포함) — 창고 pool = 이 값 - 카트리지분
 KEYCAP_TOTAL_PER_COLOR = {"E": 190, "I": 170, "N": 160, "S": 200, "T": 170, "F": 200, "P": 180, "J": 180}
+# [11/09] 빈 트레이 - 더미 3개 × 5층. 다 쓰면 사람이 모아서 다시 쌓음 (pool 없음). 게이트웨이 tray_stock.TOTAL과 같게
+TRAY_TOTAL = 15
+TRAY_STATUS_PATH = "cnt_warehouse/cnt_tray_status"   # 플랫폼에 컨테이너가 아직 없음 - 만들어 주면 그때부터 올라감
 
 app = Flask(__name__)
 
@@ -647,7 +650,8 @@ def restock_letter_color(letter, color):
     # 올라가는 문제가 있었음.
     # [11/04] 하드리셋 직후: 아두이노 RAM 수량 맞추기용 호출 - pool·status·모비우스는 리셋에서 이미 처리했으니
     # 건드리지 않고 지금 stock만 돌려줌 (_auto_hard_reset 참고)
-    if redis.exists("reset:restock_window"):
+    # [11/09] 수량 맞추기(_sync_arduinos)로 온 호출도 같음 - 칸별 표시는 한 번 쓰면 지움
+    if redis.exists("reset:restock_window") or redis.delete(f"sync:{letter_color}"):
         stock = int(redis.get(f"stock:{letter_color}") or 0)
         logger.info(f"[restock] {letter_color}: 하드리셋 직후 수량 맞추기 -> {stock}개 (pool 그대로)")
         return jsonify({"filled": stock, "status": get_last_status(f"status:{letter_color}"), "mobius_ok": True}), 200
@@ -782,6 +786,8 @@ def _do_hard_reset():
     for color in BOARD_COLORS:
         redis.set(f"stock:board_{color}", BOARD_CARTRIDGE_CAPACITY)
         redis.set(f"pool:board_{color}", BOARD_POOL_TOTAL - BOARD_CARTRIDGE_CAPACITY)
+    redis.set("stock:tray", TRAY_TOTAL)   # [11/09] 빈 트레이도 가득으로 (실물도 다 쌓아 두고 누를 것)
+    redis.set("status:tray", "idle")
     for board in BOARD_LETTERS:
         redis.delete(f"queue:{board}")
         redis.delete(f"gate:{board}")
@@ -800,6 +806,7 @@ def _upload_reset_to_mobius():
     for color in BOARD_COLORS:
         content = {"order_id": None, "count": BOARD_CARTRIDGE_CAPACITY, "status": None}
         results[f"board_{color}"] = post_cin_to_mobius(f"cnt_warehouse/cnt_board_status/cnt_{color}", content)
+    _upload_tray(None, TRAY_TOTAL)   # 플랫폼에 컨테이너가 생기기 전엔 늘 실패라 실패 목록에는 안 넣음
     return [k for k, ok in results.items() if not ok]
 
 
@@ -879,6 +886,99 @@ def reset_hard():
         (200 if not failed else 207)
 
 
+# ============================================================
+# [11/09] 빈 트레이 재고 (Redis stock:tray / status:tray)
+#  - 게이트웨이(트레이 팔)가 집기 전에 GET /stock/tray 로 개수를 읽어 더미·층을 정하고, 놓은 뒤
+#    POST /report/tray-used 로 하나 뺌 (덮어쓰지 않고 빼기 - 집는 동안 누가 채워도 안 꼬이게)
+#  - 채우기·정정은 /stock/set (상태판). 하드리셋 때 TRAY_TOTAL로
+#  - Mobius cnt_warehouse/cnt_tray_status 에도 {order_id, count, status} 로 올림. 플랫폼에 컨테이너가 아직
+#    없어서 실패해도 Redis는 그대로 씀 (키캡·보드는 Mobius 실패면 Redis도 안 바꾸지만 트레이는 우리만 씀)
+# ============================================================
+def _upload_tray(order_id, count):
+    ok = post_cin_to_mobius(TRAY_STATUS_PATH, {"order_id": order_id, "count": count,
+                                                "status": "empty" if count <= 0 else "idle"})
+    if not ok:
+        logger.info(f"[tray] 모비우스 업로드 실패 ({TRAY_STATUS_PATH} - 플랫폼에 컨테이너가 있는지 확인)")
+    return ok
+
+
+def _tray_count():
+    value = redis.get("stock:tray")
+    return TRAY_TOTAL if value is None else int(value)   # 처음 설치 = 다 쌓여 있음
+
+
+@app.route("/stock/tray", methods=["GET"])
+def get_stock_tray():
+    return jsonify({"count": _tray_count(), "total": TRAY_TOTAL}), 200
+
+
+@app.route("/report/tray-used", methods=["POST"])
+def report_tray_used():
+    """게이트웨이: 빈 트레이를 벨트에 놓았음. body {"order_id", "n": 1} (못 보냈던 것까지 모아서 n개)"""
+    data = request.get_json(force=True, silent=True) or {}
+    n = data.get("n", 1)
+    if not isinstance(n, int) or not 1 <= n <= TRAY_TOTAL:
+        return jsonify({"error": f"n은 1~{TRAY_TOTAL}"}), 400
+    if redis.get("stock:tray") is None:
+        redis.set("stock:tray", TRAY_TOTAL)
+    count = max(0, redis.decrby("stock:tray", n))
+    redis.set("stock:tray", count)   # 0 밑으로 안 내려가게
+    redis.set("status:tray", "empty" if count <= 0 else "idle")
+    ok = _upload_tray(data.get("order_id"), count)
+    logger.info(f"[tray] {data.get('order_id')} 빈 트레이 {n}개 씀 -> {count}/{TRAY_TOTAL}")
+    return jsonify({"result": "ok", "count": count, "mobius_ok": ok}), 200
+
+
+@app.route("/stock/set", methods=["POST"])
+def stock_set():
+    """[11/09] 사람이 센 실제 개수로 카트리지 숫자를 맞춤 (상태판에서 칸을 눌러 입력).
+    body {"key": "E_r" | "board_r" | "tray", "count": 28}
+    - 창고 pool은 그대로 -> 전체 재고(카트리지 + pool)도 차이만큼 같이 줄거나 늚 (기록 30, 실제 28 -> 전체 -2)
+    - 키캡: 아두이노 RAM도 같은 수로 맞춤 (_sync_arduinos). 보드: 보드 main이 쉬는 동안 30초 안에 따라감
+    - 배출 중(busy)인 칸은 거절 - 끝난 뒤 그 칸의 보고가 고친 숫자를 덮어씀"""
+    data = request.get_json(force=True, silent=True) or {}
+    key, count = data.get("key"), data.get("count")
+    if key in _all_keycap_letter_colors():
+        cap, path = RAIL_CAPACITY, f"cnt_warehouse/cnt_keycap_status/cnt_{key}"
+    elif key in [f"board_{c}" for c in BOARD_COLORS]:
+        cap, path = BOARD_CARTRIDGE_CAPACITY, f"cnt_warehouse/cnt_board_status/cnt_{key[-1]}"
+    elif key == "tray":
+        cap, path = TRAY_TOTAL, None
+    else:
+        return jsonify({"error": f"없는 칸: {key}"}), 400
+    if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= cap:
+        return jsonify({"error": f"개수는 0~{cap}"}), 400
+
+    before = _tray_count() if key == "tray" else int(redis.get(f"stock:{key}") or 0)
+    if path is None:
+        redis.set("stock:tray", count)
+        redis.set("status:tray", "empty" if count <= 0 else "idle")
+        ok = _upload_tray(None, count)
+        logger.info(f"[stock/set] tray {before} -> {count}개 (사람이 맞춤)")
+        return jsonify({"result": "ok", "before": before, "count": count, "mobius_ok": ok}), 200
+
+    status = get_last_status(f"status:{key}")
+    if status == "busy":
+        return jsonify({"error": f"{key} 배출 중 - 끝난 뒤 다시"}), 409
+    if status != "disable":   # 고장 칸은 고장 그대로 (복구는 따로)
+        status = "empty" if count <= 0 else "idle"
+    content = {"order_id": None, "count": count, "status": status}
+    if status == "disable":
+        content["reason"] = redis.get(f"reason:{key}") or ""
+    ok = post_cin_to_mobius(path, content)
+    if not ok:   # 키캡·보드는 플랫폼도 이 숫자로 판단하므로 어긋난 채로 두지 않음
+        return jsonify({"error": "mobius CIN 생성 실패 - 안 바꿈"}), 502
+    redis.set(f"stock:{key}", count)
+    redis.set(f"status:{key}", status)
+    synced = None
+    if key in _all_keycap_letter_colors():
+        synced = _sync_arduinos([key])
+    pool = redis.get(f"pool:{key}")
+    logger.info(f"[stock/set] {key} {before} -> {count}개 (사람이 맞춤, pool {pool} 그대로)"
+                + ("" if synced is None else f", 아두이노 {'전송' if synced else '전송 실패'}"))
+    return jsonify({"result": "ok", "before": before, "count": count, "arduino_sync": synced}), 200
+
+
 @app.route("/sync/keycap", methods=["POST"])
 def sync_keycap():
     """아두이노 RAM 수량을 지금 Redis 값으로 맞춤 (재부팅 대신). body {"rails": ["E_r", ...]} 없으면 32칸 전부.
@@ -925,7 +1025,9 @@ def _sync_arduinos(rails):
     except Exception as e:
         logger.warning(f"[sync] 최신 cnt_process 못 읽음 - 빈 주문 목록으로 보냄 ({e})")
         latest = {"orders": {}}
-    redis.set("reset:restock_window", 1, ex=RESET_RESTOCK_WINDOW_SEC)
+    # [11/09] 칸별 표시 - 예전엔 전체 창(reset:restock_window)을 열어서 2분 동안 다른 칸의 진짜 재보충도 pool을 안 뺐음
+    for rail in rails:
+        redis.set(f"sync:{rail}", 1, ex=RESET_RESTOCK_WINDOW_SEC)
     snap = dict(latest, seq=f"{latest.get('seq')}-sync{int(time.time())}", keycap_restock=list(rails))
     payload = json.dumps(snap, ensure_ascii=False)
     with _relay_lock:   # 다른 스냅샷 전송과 순서가 섞이지 않게

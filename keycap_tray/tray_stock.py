@@ -17,16 +17,21 @@ pose_tray.json
                                    기본 20mm 만 들면 벨트(낮은 곳)에서 출발할 때 5층 트레이 옆면을 침.
                                    150 은 329mm 벨트 자리 쪽에서 0x12 로 거부, 125 는 성공 (2026-11-08)
 
-남은 개수는 runtime/tray_stock.json 에 저장 (게이트웨이를 다시 켜도 이어서 셈)
+[11/09] 남은 개수의 원본은 키캡 Flask(5002)의 Redis stock:tray - 상태판에서 보고·채우고·맞춤
+  - 집기 전에 GET /stock/tray 로 읽고, 놓은 뒤 POST /report/tray-used 로 하나 뺌 (덮어쓰지 않고 빼기)
+  - Flask가 안 되면 runtime/tray_stock.json (마지막으로 안 값) 으로 계속 돌고, 못 보낸 개수는 모아 뒀다가 다음에 보냄
+  - 0개면 팔을 움직이지 않고 기다림 (WaitForRefill) - 플랫폼에 "트레이 없음" fault 가 없어서 fault 를 안 냄
   python tray_stock.py          지금 개수·다음 집을 자리 보기
   python tray_stock.py full     다 채웠을 때 (더미 수 × 층 수)
-  python tray_stock.py set 7    직접 맞추기
+  python tray_stock.py set 7    직접 맞추기 (상태판에서 해도 같음)
 """
 
 import json
 import os
 import sys
 import time
+
+import requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 POSE_FILE = os.path.join(HERE, "pose_tray.json")
@@ -83,21 +88,88 @@ def pick_pose(count):
     return stack_no + 1, floor, STACKS[stack_no][FLOORS - floor]
 
 
-def get():
-    """저장된 남은 개수. 파일이 없으면 가득 찬 것으로 봄 (처음 켤 때)."""
+KEYCAP_FLASK_URL = os.environ.get("KEYCAP_FLASK_URL", "http://127.0.0.1:5002").rstrip("/")
+
+
+class WaitForRefill(Exception):
+    """빈 트레이 0개 - 팔을 움직이지 않고, 채워질 때까지 같은 주문을 다시 시도"""
+
+
+def _read_file():
     try:
         with open(STOCK_FILE, encoding="utf-8") as f:
-            return max(0, min(TOTAL, int(json.load(f)["count"])))
+            saved = json.load(f)
+        return max(0, min(TOTAL, int(saved["count"]))), int(saved.get("unsent", 0))
     except (OSError, ValueError, KeyError, TypeError):
-        return TOTAL
+        return TOTAL, 0
 
 
-def put(count):
+def _write_file(count, unsent=0):
     os.makedirs(os.path.dirname(STOCK_FILE), exist_ok=True)
     tmp = STOCK_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"count": count, "total": TOTAL, "updated": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
+        json.dump({"count": count, "total": TOTAL, "unsent": unsent,
+                   "updated": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
     os.replace(tmp, STOCK_FILE)  # 쓰다가 꺼져도 파일이 깨지지 않게
+
+
+_warned = False
+
+
+def _flask_down(error):
+    global _warned
+    if not _warned:
+        print(f"!! 트레이 개수: 키캡 Flask({KEYCAP_FLASK_URL}) 안 됨 - 파일 값으로 계속, 다시 되면 맞춤: {error}")
+        _warned = True
+
+
+def get():
+    """남은 개수. Flask(Redis) 값 - 못 보낸 사용 개수가 있으면 먼저 보냄. Flask가 안 되면 파일 값"""
+    global _warned
+    count, unsent = _read_file()
+    try:
+        if unsent:
+            r = requests.post(f"{KEYCAP_FLASK_URL}/report/tray-used", json={"order_id": None, "n": unsent}, timeout=3)
+            r.raise_for_status()
+            _write_file(int(r.json()["count"]))   # 바로 지움 - 아래 읽기가 실패해도 두 번 빼지 않게
+            print(f"트레이 개수: 못 보냈던 {unsent}개 사용 기록 보냄")
+        r = requests.get(f"{KEYCAP_FLASK_URL}/stock/tray", timeout=3)
+        r.raise_for_status()
+        count = max(0, min(TOTAL, int(r.json()["count"])))
+    except Exception as error:
+        _flask_down(error)
+        return count
+    _warned = False
+    _write_file(count)
+    return count
+
+
+def cached():
+    """마지막으로 안 값 (네트워크 안 씀 - heartbeat 용)"""
+    return _read_file()[0]
+
+
+def used(order_id):
+    """빈 트레이 하나를 벨트에 놓았음 -> Flask에서 하나 뺌. 못 보내면 파일에 모아 둠"""
+    count, unsent = _read_file()
+    count = max(0, count - 1)
+    try:
+        r = requests.post(f"{KEYCAP_FLASK_URL}/report/tray-used", json={"order_id": order_id, "n": unsent + 1}, timeout=3)
+        r.raise_for_status()
+        _write_file(int(r.json()["count"]))
+    except Exception as error:
+        _flask_down(error)
+        _write_file(count, unsent + 1)
+
+
+def put(count):
+    """사람이 맞춤 (python tray_stock.py full / set N). Flask가 안 되면 파일만"""
+    try:
+        r = requests.post(f"{KEYCAP_FLASK_URL}/stock/set", json={"key": "tray", "count": count}, timeout=5)
+        r.raise_for_status()
+    except Exception as error:
+        _flask_down(error)
+    _write_file(count)
 
 
 def describe(count=None):
@@ -105,7 +177,7 @@ def describe(count=None):
     if not enabled():
         return "트레이 더미 설정 없음 (pose_tray.json stacks)"
     if count <= 0:
-        return f"트레이 0/{TOTAL} — 다 씀. {TOTAL}개 다 채운 뒤 플랫폼 fault 해제 (게이트웨이 없이 시험할 때는 python tray_stock.py full)"
+        return f"트레이 0/{TOTAL} — 다 씀. {TOTAL}개 다 쌓은 뒤 상태판에서 트레이 칸을 눌러 {TOTAL} 입력 (또는 python tray_stock.py full)"
     stack_no, floor, pose = pick_pose(count)
     return f"트레이 {count}/{TOTAL} 남음 — 다음: 더미{stack_no} {floor}층 {pose}"
 
