@@ -174,7 +174,8 @@ def load_empty_tray(order_id):
     """빈 트레이를 쌓아둔 곳에서 집어 벨트에 올림 (status=assigned)."""
     if hw:
         print("    [장비·Dobot] 트레이 로봇팔: 빈 트레이 집어서 벨트에 올리기")
-        return hw.run_tray_arm(order_id)
+        # fault(tray_load_failed) 해제 뒤 다시 부를 때는 알려줌 → 트레이를 다 써서 난 fault 였으면 채운 것으로 봄
+        return hw.run_tray_arm(order_id, after_fault=order_id in fault_seen)
     print("    [장비·가짜] 트레이 로봇팔: 빈 트레이 투입")
     return True
 

@@ -80,8 +80,13 @@ def run():
         from heartbeat import Heartbeat
         inbox = SnapshotInbox()
         # 상태 기록 (Redis hb:keycap_tray, check_all.py가 읽음). Redis가 꺼져 있어도 동작엔 영향 없음
+        import tray_stock  # 빈 트레이 남은 개수도 같이 기록 (hb:keycap_tray 의 tray_left / tray_total)
         hb = Heartbeat('keycap_tray', os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/0'),
-                       'rehearsal' if os.environ.get('WAREHOUSE_REHEARSAL') == '1' else 'real').start()
+                       'rehearsal' if os.environ.get('WAREHOUSE_REHEARSAL') == '1' else 'real',
+                       extra=lambda: {'tray_left': tray_stock.get(), 'tray_total': tray_stock.TOTAL}
+                       if tray_stock.enabled() else {}).start()
+        if tray_stock.enabled():
+            print(tray_stock.describe())
         inbox.on_accept = hb.snapshot_received
 
         def process(snap):
@@ -96,7 +101,8 @@ def run():
         process_path = os.environ.get('PROCESS_PATH', 'cnt_process').strip('/')
         print(f"로컬 R1/R2/R4 작업자: {cfg['MOBIUS_URL']} 읽기 → {cfg['BOARD_API_URL']} 보고")
         print('5000/5001/5002 서버 및 Redis는 기존 담당 프로그램이 운영합니다.')
-        print('좌표는 기존 시험 배치입니다. 전시 설치 후 재교시가 필요합니다.')
+        print('좌표: 키캡 팔 = 실물에서 찍은 값(pose_set1/2.json), 트레이 팔 = pose_tray.json 이 있으면 실물 값, '
+              '없으면 도면 추정값(LAYOUT=design). 참고사항 3장')
         next_read = 0.0
         pending = None
         server = None

@@ -25,7 +25,8 @@ ENV_FILES = {
                      ["COSS_BASE_URL", "AE_NAME", "ORIGIN", "REDIS_URL", "MQTT_HOST", "MQTT_PORT"]),
     "keycap_tray": (ROOT / "keycap_tray" / ".env.local",
                     ["WAREHOUSE_PROFILE", "MOBIUS_URL", "MOBIUS_CB", "MOBIUS_AE_RN", "MOBIUS_AEI", "BOARD_API_URL",
-                     "NOTIFY_PORT", "NOTIFY_BASE_URL", "SET1_PORT", "SET2_PORT", "TRAY_PORT", "LAYOUT"]),
+                     "NOTIFY_PORT", "NOTIFY_BASE_URL", "SET1_PORT", "SET2_PORT", "TRAY_PORT", "LAYOUT",
+                     "PLACE_LIFT"]),   # PLACE_LIFT 가 빠지면 코드 기본값 1(놓은 뒤 들기·당기기)로 조용히 돌아가 키캡 단계가 약 10초 느려짐
 }
 # 한 번 점검한 결과 - run_checks()가 매번 비우고 채움. 명령창(check_all.bat)과 상태판(status_page.py)이 같이 씀
 counts = {"OK": 0, "!!": 0, "XX": 0}

@@ -37,6 +37,8 @@
 | `warehouse_server.py` | status별 처리, 보고, fault 복구 |
 | `local_gateway.py` · `local_feed.py` · `local_transport.py` | 전시장 로컬망: 주문 받기(Mobius 알림 직접 수신+조회), 보드 Flask로 보고 |
 | `make_sub.py` | 전시장 로컬 Mobius에 구독 등록 (`sub_warehouse_keycap_robotarm` → `NOTIFY_BASE_URL`) |
+| `usb_serial.py` | 로봇 USB 시리얼 → 지금 COM 번호 찾기 (보드와 같은 파일) |
+| `heartbeat.py` · `log_tee.py` | 상태를 Redis `hb:keycap_tray`에 기록(상태판·`check_all`이 읽음) / 화면 출력을 `logs/gateway_날짜.log`에도 저장 |
 | `runtime_config.py` | `.env.local`(전시장) 읽기 |
 | `worker_lock.py` | 같은 로봇을 두 프로그램이 동시에 못 움직이게 |
 | `demo.py` | 통신 없는 실물 시연·점검·홈 |
@@ -50,7 +52,9 @@
 
 - Python: 저장소 루트의 공용 가상환경 `venv` (Python 3.9, 루트 `requirements.txt`)
 - DobotLink 실행. DobotLab은 포트를 잡으므로 **연결을 끊고** 실행
-- 로봇 USB: 세트1 COM6, 세트2 COM7, 트레이 COM8 (`.env`의 `SET1_PORT` 등으로 변경 가능)
+- 로봇 USB: `.env.local`의 `SET1_SERIAL`·`SET2_SERIAL`·`TRAY_SERIAL`(USB 시리얼)로 찾아요. 꽂는 구멍·COM 번호와 상관없어요. 시리얼은 `check_all.bat`의 "로봇 USB" 항목에서 확인해요
+  - 시리얼이 하나라도 안 보이면 게이트웨이·`demo.py`가 **아예 안 켜져요** (엉뚱한 팔이 다른 팔 좌표로 움직이는 것 방지)
+  - 시리얼을 비워 두면 `SET1_PORT`(COM6)·`SET2_PORT`(COM7)·`TRAY_PORT`(COM8) 번호를 그대로 써요 (USB를 다시 꽂으면 바뀔 수 있어 위험)
 - 설정: `.env.local.example` → `.env.local`. AE 값은 팀 담당자에게 받아요
 
 ## 실행
@@ -63,7 +67,7 @@
 # 2-a) 통신 없이 시연: 트레이 → 벨트 → 키캡 4개 (tray / belts / arms 로 단계별도 가능)
 & '..\venv\Scripts\python.exe' demo.py run
 
-# 2-b) 전시장 실전
+# 2-b) 전시장 실전 - 평소엔 저장소 루트의 start_all.bat 이 켬. 직접 켤 때만 아래
 & '..\venv\Scripts\python.exe' local_gateway.py --env .env.local --check   # 설정 검사만
 & '..\venv\Scripts\python.exe' local_gateway.py --env .env.local
 
@@ -92,5 +96,5 @@
 
 - 실물 트레이가 오면 트레이 팔 좌표 찍기, 여러 개 쌓였을 때 높이 바뀌는 처리
 - 디스펜서·카메라·높이 단차를 설치한 뒤 좌표를 다시 확인하고, 필요한 구간에만 중간 좌표 넣기
-- 전시장: `.env.local`의 AE 값, 보드팀 최신 서버와 보고 형식 대조, 서버 재시작 시 seq 초기화 대응 (참고사항 2장)
+- 전시장 통합 시험: 트레이 팔과 트레이 벨트 section0 순서 확인 (참고사항 9장 12번)
 - 알람 분류 알림(화면·소리·기록 파일, 플랫폼 `reason`) — 참고사항 7·9장
