@@ -118,7 +118,7 @@ BOARD_POOL_TOTAL = 330  # 색상별 전체 재고 총량(카트리지 포함) �
 KEYCAP_TOTAL_PER_COLOR = {"E": 190, "I": 170, "N": 160, "S": 200, "T": 170, "F": 200, "P": 180, "J": 180}
 # [11/09] 빈 트레이 - 더미 3개 × 5층. 다 쓰면 사람이 모아서 다시 쌓음 (pool 없음). 게이트웨이 tray_stock.TOTAL과 같게
 TRAY_TOTAL = 15
-TRAY_STATUS_PATH = "cnt_warehouse/cnt_tray_status"   # 플랫폼에 컨테이너가 아직 없음 - 만들어 주면 그때부터 올라감
+TRAY_STATUS_PATH = "cnt_warehouse/cnt_tray_status"   # 11/09 우리가 직접 만듦 (mni 50, 보드 재고 컨테이너와 같은 설정)
 
 app = Flask(__name__)
 
@@ -892,7 +892,7 @@ def reset_hard():
 #    POST /report/tray-used 로 하나 뺌 (덮어쓰지 않고 빼기 - 집는 동안 누가 채워도 안 꼬이게)
 #  - 채우기·정정은 /stock/set (상태판). 하드리셋 때 TRAY_TOTAL로
 #  - Mobius cnt_warehouse/cnt_tray_status 에도 {order_id, count, status} 로 올림. 플랫폼에 컨테이너가 아직
-#    없어서 실패해도 Redis는 그대로 씀 (키캡·보드는 Mobius 실패면 Redis도 안 바꾸지만 트레이는 우리만 씀)
+#    11/09 직접 만듦. 업로드가 실패해도 Redis는 그대로 씀 (키캡·보드는 Mobius 실패면 Redis도 안 바꾸지만 트레이는 우리만 씀)
 # ============================================================
 def _upload_tray(order_id, count):
     ok = post_cin_to_mobius(TRAY_STATUS_PATH, {"order_id": order_id, "count": count,
