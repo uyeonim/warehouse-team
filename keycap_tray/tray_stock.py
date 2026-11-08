@@ -20,7 +20,8 @@ pose_tray.json
 [11/09] 남은 개수의 원본은 키캡 Flask(5002)의 Redis stock:tray - 상태판에서 보고·채우고·맞춤
   - 집기 전에 GET /stock/tray 로 읽고, 놓은 뒤 POST /report/tray-used 로 하나 뺌 (덮어쓰지 않고 빼기)
   - Flask가 안 되면 runtime/tray_stock.json (마지막으로 안 값) 으로 계속 돌고, 못 보낸 개수는 모아 뒀다가 다음에 보냄
-  - 0개면 팔을 움직이지 않고 기다림 (WaitForRefill) - 플랫폼에 "트레이 없음" fault 가 없어서 fault 를 안 냄
+  - 0개면 팔을 움직이지 않고 TrayEmpty -> failed + reason "empty" 보고 -> 플랫폼 fault tray_load_failed
+    사람이 다 쌓고 상태판에서 개수 입력 -> 관리자 페이지에서 fault 해제 -> 다시 집음
   python tray_stock.py          지금 개수·다음 집을 자리 보기
   python tray_stock.py full     다 채웠을 때 (더미 수 × 층 수)
   python tray_stock.py set 7    직접 맞추기 (상태판에서 해도 같음)
@@ -91,8 +92,8 @@ def pick_pose(count):
 KEYCAP_FLASK_URL = os.environ.get("KEYCAP_FLASK_URL", "http://127.0.0.1:5002").rstrip("/")
 
 
-class WaitForRefill(Exception):
-    """빈 트레이 0개 - 팔을 움직이지 않고, 채워질 때까지 같은 주문을 다시 시도"""
+class TrayEmpty(Exception):
+    """빈 트레이 0개 - 팔을 움직이지 않고 실패(reason: empty)로 보고"""
 
 
 def _read_file():
@@ -177,7 +178,7 @@ def describe(count=None):
     if not enabled():
         return "트레이 더미 설정 없음 (pose_tray.json stacks)"
     if count <= 0:
-        return f"트레이 0/{TOTAL} — 다 씀. {TOTAL}개 다 쌓은 뒤 상태판에서 트레이 칸을 눌러 {TOTAL} 입력 (또는 python tray_stock.py full)"
+        return f"트레이 0/{TOTAL} — 다 씀. {TOTAL}개 다 쌓은 뒤 상태판에서 트레이 칸을 눌러 {TOTAL} 입력 (또는 python tray_stock.py full) → fault 해제"
     stack_no, floor, pose = pick_pose(count)
     return f"트레이 {count}/{TOTAL} 남음 — 다음: 더미{stack_no} {floor}층 {pose}"
 

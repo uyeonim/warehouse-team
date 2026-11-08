@@ -55,7 +55,7 @@ import os
 from flask import Flask, jsonify, request
 
 from runtime_config import PROFILE  # .env 또는 .env.local
-import tray_stock  # [11/09] 빈 트레이 0개 대기 (WaitForRefill)
+import tray_stock  # [11/09] 빈 트레이 0개 (TrayEmpty)
 if PROFILE == "local":
     import local_transport as mobius  # 전시장: 결과를 보드 Flask(127.0.0.1:5000) /report/... 로 보냄
 else:
@@ -112,13 +112,13 @@ STAGE_REPORT = {"assigned": TRAY_ARM, "keycap_dispensed": KEYCAP_CONVEYOR, "keyc
 app = Flask(__name__)
 
 last_seq = None
-waiting_refill = set()  # [11/09] 빈 트레이 0개라 기다리는 주문 (안내를 한 번만 찍으려고)
 handled_by_order = {}  # order_id -> 보고까지 끝낸 (status, retry)
 conveyor_results = {}  # order_id -> 벨트 실행 결과. 보고 전송만 실패했을 때 재시도에서 장비를 다시 돌리지 않도록 보관
 fault_seen = set()     # fault 로 멈췄던 주문. 해제 뒤 keycap_reached 를 "사람이 고침"으로 처리하는 데 씀
 arm_reported = {}      # order_id -> {슬롯: 성공여부}. fault 해제 뒤 실패했던 키캡만 다시 보고하려고 기억
 forced_used = set()    # (order_id, FORCE_FAIL 이름) — 이미 일부러 실패시킨 것 (주문당 한 번만)
 arm_results = {}       # order_id -> {슬롯: 로봇팔 결과}. 로봇팔은 주문당 한 번만 움직이도록 보관
+tray_reasons = {}      # [11/09] order_id -> 트레이 실패 이유 ("empty" = 빈 트레이 0개). 보고에 reason 으로 붙임
 tray_results = {}      # order_id -> 트레이 투입 결과. 보고만 실패했을 때 트레이를 또 올리지 않도록 (fault 가 오면 지움 → 해제 후 재투입)
 
 
@@ -175,9 +175,8 @@ def read_board_color():
 def load_empty_tray(order_id):
     """빈 트레이를 쌓아둔 곳에서 집어 벨트에 올림 (status=assigned)."""
     if hw:
-        if order_id not in waiting_refill:   # 빈 트레이 기다리는 동안 5초마다 같은 줄이 안 쌓이게
-            print("    [장비·Dobot] 트레이 로봇팔: 빈 트레이 집어서 벨트에 올리기")
-        return hw.run_tray_arm(order_id)   # 빈 트레이 0개면 tray_stock.WaitForRefill (handle_order 가 기다림)
+        print("    [장비·Dobot] 트레이 로봇팔: 빈 트레이 집어서 벨트에 올리기")
+        return hw.run_tray_arm(order_id)   # 빈 트레이 0개면 tray_stock.TrayEmpty (on_assigned 가 reason=empty 로 보고)
     print("    [장비·가짜] 트레이 로봇팔: 빈 트레이 투입")
     return True
 
@@ -239,8 +238,19 @@ def on_assigned(order_id, order):
     if order_id in tray_results:
         print("    (트레이는 이미 올림 — 보고만 재시도)")
     else:
-        tray_results[order_id] = load_empty_tray(order_id)
-    report(TRAY_ARM, {"order_id": order_id, "status": result(tray_results[order_id])})
+        try:
+            tray_results[order_id] = load_empty_tray(order_id)
+            tray_reasons.pop(order_id, None)
+        except tray_stock.TrayEmpty as e:
+            # [11/09] 빈 트레이 0개: 팔은 안 움직이고 failed + reason "empty" -> 플랫폼 fault tray_load_failed.
+            # 사람이 다 쌓고 상태판에서 개수를 맞춘 뒤 fault 해제 -> 다시 집음 (아직 0이면 또 empty 로 실패)
+            print(f"    !! {e} → failed (reason: empty) 보고")
+            tray_results[order_id] = False
+            tray_reasons[order_id] = "empty"
+    con = {"order_id": order_id, "status": result(tray_results[order_id])}
+    if not tray_results[order_id] and order_id in tray_reasons:
+        con["reason"] = tray_reasons[order_id]
+    report(TRAY_ARM, con)
 
 
 def on_keycap_dispensed(order_id, order):
@@ -405,6 +415,7 @@ def handle_order(order_id, order):
         # 안 지우면 해제 후 on_assigned 는 "이미 올림 — 보고만" 으로 끝남
         if order.get("fault") == "tray_load_failed":
             tray_results.pop(order_id, None)
+            tray_reasons.pop(order_id, None)
         return True
 
     handler = HANDLERS.get(status)
@@ -418,22 +429,12 @@ def handle_order(order_id, order):
     if handled_by_order.get(order_id) == key:
         return True
 
-    if order_id not in waiting_refill:
-        print(f"[{status}] {order_id} → 창고 차례")
+    print(f"[{status}] {order_id} → 창고 차례")
     try:
         handler(order_id, order)
-    except tray_stock.WaitForRefill as e:
-        # [11/09] 빈 트레이 0개: 움직이지도 보고하지도 않고 다음 주기(5초)에 다시 - 상태판에서 채우면 이어서 집음
-        if order_id not in waiting_refill:
-            print(f"    !! {e} → 채울 때까지 기다림 (트레이 팔 안 움직임, fault 안 냄)")
-            waiting_refill.add(order_id)
-        return False
     except Exception as e:
         print(f"    ✗ 보고 전송 실패, 재시도 예정: {e}")
         return False
-    if order_id in waiting_refill:
-        print(f"    빈 트레이가 채워져서 {order_id} 이어서 함")
-        waiting_refill.discard(order_id)
     handled_by_order[order_id] = key
     fault_seen.discard(order_id)  # 한 단계 정상 처리했으면 fault 흔적은 지움
     return True
@@ -457,14 +458,13 @@ def _process_snapshot(snapshot):
     orders = snapshot.get("orders") or {}
     all_ok = all([handle_order(order_id, order) for order_id, order in orders.items()])
 
-    for memory in (handled_by_order, conveyor_results, arm_reported, arm_results, tray_results):  # 끝난 주문 정리
+    for memory in (handled_by_order, conveyor_results, arm_reported, arm_results, tray_results, tray_reasons):  # 끝난 주문 정리
         for order_id in list(memory):
             if order_id not in orders:
                 del memory[order_id]
     for order_id in list(fault_seen):
         if order_id not in orders:
             fault_seen.discard(order_id)
-    waiting_refill.intersection_update(orders)
     forced_used.difference_update({k for k in forced_used if k[0] not in orders})
 
     if all_ok:

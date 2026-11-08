@@ -895,8 +895,8 @@ def _render(result, error):
     tray = (rails or {}).get("tray")
     tray_left = tray[1] if tray and tray[1] is not None else None
     tray_issue = None
-    if tray_left is not None and tray_left <= TRAY_LOW:   # 0이면 트레이 팔이 기다림 (fault 없음) - 사람이 채워야 움직임
-        tray_issue = ("!!", 0, "빈 트레이", "빈 트레이 다 씀 - 트레이 팔이 기다리는 중" if tray_left <= 0
+    if tray_left is not None and tray_left <= TRAY_LOW:   # 0이면 트레이 팔이 failed(reason empty) -> fault
+        tray_issue = ("!!", 0, "빈 트레이", "빈 트레이 다 씀 - 다음 주문은 tray_load_failed" if tray_left <= 0
                       else f"빈 트레이 {tray_left}개 남음")
         warn = warn + [tray_issue]
     total = len(bad) + len(warn)
@@ -908,7 +908,7 @@ def _render(result, error):
         first = rail_issue or (tray_issue if tray_left is not None and tray_left <= 0 else None) or warn[0]
         if first is tray_issue:
             say = tray_issue[3] + (f" 외 {total - 1}건" if total > 1 else "")
-            sub = "빈 트레이를 더미 3개 × 5층으로 다 쌓고, 재고의 빈 트레이 칸을 눌러 개수를 입력하세요."
+            sub = "빈 트레이를 더미 3개 × 5층으로 다 쌓고, 재고의 빈 트레이 칸에 개수 입력 → 관리자 페이지에서 fault 해제."
         elif first is rail_issue:
             say = f"{broken[0]} 카트리지 고장" + (f" 외 {total - 1}건" if total > 1 or len(broken) > 1 else "")
             sub = "이 칸이 든 주문은 키캡 단계에서 멈춥니다. 센서를 확인하고 재고에서 복구를 누르세요."

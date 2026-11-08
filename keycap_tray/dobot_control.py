@@ -736,13 +736,13 @@ def run_tray_arm(order_id):
     """assigned 때 호출. 트레이 팔이 빈 트레이를 집어 벨트에 올림. 성공 여부 반환.
     좌표는 pose_tray.json (찍은 값) 또는 pose_tray_design.json (LAYOUT=design). 없으면 움직이지 않고 실패.
     더미(stacks)가 있으면 남은 개수로 집을 더미·층을 정하고, 성공하면 하나 뺌.
-    [11/09] 0개면 움직이지 않고 tray_stock.WaitForRefill - 실패 보고(fault) 안 함. 상태판에서 채우면 다음 시도에 집음
+    [11/09] 0개면 움직이지 않고 tray_stock.TrayEmpty -> failed + reason "empty" (tray_load_failed). 채우고 fault 해제하면 다시 집음
     (예전: 0개 -> tray_load_failed -> fault 해제 때 가득 찬 것으로 봄. 원격 채우기가 생겨서 뺌)"""
     count = None
     if tray_stock.enabled():
         count = tray_stock.get()
         if count <= 0:
-            raise tray_stock.WaitForRefill(tray_stock.describe(count))
+            raise tray_stock.TrayEmpty(tray_stock.describe(count))
         stack_no, floor, TRAY["pickup_slots"][1] = tray_stock.pick_pose(count)
         log(TRAY["port"], f"빈 트레이 {count}/{tray_stock.TOTAL} 남음 → 더미{stack_no} {floor}층 집기")
     if not (TRAY["pickup_slots"][1] and TRAY["place_slots"][1]):

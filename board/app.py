@@ -121,6 +121,9 @@ def report_tray_robot_arm():
         return jsonify({"error": "order_id, status(done/failed)는 필수"}), 400
 
     content = {"order_id": order_id, "status": status}
+    # [11/09] 실패 이유를 그대로 넘김 (예: "empty" = 빈 트레이 다 씀). 플랫폼은 그대로 tray_load_failed
+    if status == "failed" and isinstance(data.get("reason"), str) and data["reason"]:
+        content["reason"] = data["reason"]
     ok = post_cin_to_mobius("cnt_robot_arm/cnt_tray_robot_arm", content)
     print(f"[report/tray-robot-arm] {'성공' if ok else '실패'}:", content)
 
