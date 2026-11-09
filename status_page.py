@@ -66,6 +66,17 @@ def _rails():
     return {k: (s or "idle", num(n), num(p)) for k, s, n, p in zip(keys, statuses, counts, pools)}
 
 
+def _ir_states():
+    """[11/10] {"E_r": True(켬)/False(끔)} - 키캡 Flask가 쓰는 Redis ir:{칸}. 못 읽으면 {} (전부 켬으로 봄)"""
+    keys = [f"{letter}_{c}" for _, letter in KEYCAP_ROWS for c, _ in RAIL_COLORS]
+    try:
+        r = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=2)
+        values = r.mget([f"ir:{k}" for k in keys])
+    except Exception:
+        return {}
+    return {k: v != "off" for k, v in zip(keys, values)}
+
+
 def _original_totals():
     """전시 총 재고표 {"E": 190, ..., "board": 330} - 키캡 Flask 코드의 KEYCAP_TOTAL_PER_COLOR / BOARD_POOL_TOTAL을
     import 없이 읽음 (import하면 MQTT 조회 스레드 등이 같이 뜸). 숫자를 두 곳에 적지 않으려고. 못 읽으면 {}"""
@@ -185,8 +196,11 @@ def _station_states(facts, rails=None):
                 worst.append(("bad", "MQTT 브로커 접속 안 됨"))
             keycap = [v for k, v in (rails or {}).items() if not k.startswith("board_")]
             broken = sum(1 for v in keycap if v[0] == "disable")
+            ir_off = sum(1 for on in _ir_states().values() if not on)   # [11/10]
             if broken:   # 그 칸이 든 주문만 막힘 -> 노랑 (나머지 주문은 돎)
                 worst.append(("warn", f"고장 {broken}칸"))
+            elif ir_off:
+                worst.append(("warn", f"센서 꺼짐 {ir_off}칸"))
             elif any(v[0] == "busy" for v in keycap):
                 lamp, note = "busy", "배출 중"
         else:
@@ -547,6 +561,15 @@ button:focus-visible, summary:focus-visible { outline:3px solid var(--go); outli
 .boardcard .cell { height:50px; }
 .boardcard .cell b { font-size:20px; }
 .legend { font-size:12px; color:var(--soft); margin:8px 0 0; }
+/* [11/10] 센서 판정 켜기/끄기 */
+.irs { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:4px; margin-top:8px;
+       border-top:1px solid var(--rule); padding-top:6px; }
+.irs-t { grid-column:1 / -1; font-size:12px; color:var(--soft); font-weight:700; }
+.irbtn { font:inherit; font-size:11px; font-weight:700; border:0; border-radius:4px; padding:3px 2px;
+         min-height:26px; cursor:pointer; background:var(--go-wash); color:var(--go); }
+.irbtn.off { background:var(--caution-wash); color:var(--ink); box-shadow:inset 0 0 0 2px var(--caution); }
+.irbtn:disabled { opacity:.5; cursor:default; }
+.cell.iroff { box-shadow:inset 0 0 0 2px var(--caution); }
 
 /* 아래 - 확인할 것·최근 작업 | 카메라 */
 .lower { display:grid; grid-template-columns:minmax(0, 1.35fr) minmax(0, 1fr); gap:22px; align-items:start; }
@@ -711,6 +734,24 @@ JS = """
     });
   });
 })();
+(function(){
+  // [11/10] 센서 판정 켜기/끄기 - 확인 창에서 "확인"을 눌러야 보냄
+  document.querySelectorAll('.irbtn').forEach(function(b){
+    b.addEventListener('click', function(){
+      var rail = b.getAttribute('data-rail'), on = b.getAttribute('data-on') === '1';
+      clearTimeout(window.__refresh);
+      var msg = on ? rail + ' 센서 판정을 끌까요?\\n끄면 이 칸은 키캡이 안 나가도 성공으로 처리됩니다.'
+                   : rail + ' 센서 판정을 다시 켤까요?\\n다음 배출부터 센서로 성공/실패를 판정합니다.';
+      if (!window.confirm(msg)) { window.__refresh = setTimeout(function(){ location.reload(); }, 3000); return; }
+      b.disabled = true; b.textContent = '보내는 중';
+      fetch('/ir-set', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                         body: JSON.stringify({ rail: rail, on: !on }) })
+        .then(function(r){ return r.json().then(function(j){ return { ok: r.ok, j: j }; }); })
+        .then(function(x){ if (!x.ok) window.alert('못 바꿈: ' + (x.j.error || JSON.stringify(x.j))); location.reload(); })
+        .catch(function(err){ window.alert('못 바꿈: ' + err); location.reload(); });
+    });
+  });
+})();
 """
 
 
@@ -766,6 +807,7 @@ def _render_stock(rails):
         return '<section class="stock"><h2>재고</h2><p class="empty">Redis를 못 읽어서 재고를 볼 수 없습니다.</p></section>'
     totals = _original_totals()
     rail_cap, board_cap, tray_cap = totals["rail_cap"], totals["board_cap"], totals["tray"]
+    irs = _ir_states()   # [11/10] 센서 판정 켜짐/꺼짐
 
     def cart_cap(key):
         return tray_cap if key == "tray" else (board_cap if key.startswith("board_") else rail_cap)
@@ -785,10 +827,13 @@ def _render_stock(rails):
         word = f"<small>{CELL_WORD[st]}</small>" if st else ""
         if key == "tray" and st == "" and 0 < have <= TRAY_LOW:
             st, word = "low", "<small>곧 없음</small>"
+        iroff = view == "cart" and key in irs and not irs[key]   # [11/10]
+        if iroff and not word:
+            word = "<small>센서 꺼짐</small>"
         # [11/09] 카트리지 보기에서 칸을 누르면 실제 개수로 맞춤 (data-cap = 넣을 수 있는 최대)
         edit = (f' data-key="{e(key)}" data-now="{have}" data-cap="{cart_cap(key)}" role="button" tabindex="0"'
                 if view == "cart" and st != "busy" else "")
-        return (f'<div class="cell {st}{" edit" if edit else ""}" title="{e(key)} {label}/{cap}"{edit}>'
+        return (f'<div class="cell {st}{" iroff" if iroff else ""}{" edit" if edit else ""}" title="{e(key)} {label}/{cap}"{edit}>'
                 f'<span class="lvl" style="height:{ratio * 100:.0f}%"></span>'
                 f'<b class="num">{e(label)}</b>{word}</div>')
 
@@ -806,6 +851,16 @@ def _render_stock(rails):
             for L in letters:
                 cap = rail_cap if view == "cart" else totals.get(L, 0)
                 out.append(f'<div class="row"><i>{L}</i>' + "".join(cell(f"{L}_{c}", view, cap) for c, _ in RAIL_COLORS) + "</div>")
+            if view == "cart":   # [11/10] 칸마다 센서 판정 켜기/끄기 버튼 (재고 칸과 같은 순서)
+                out.append('<div class="irs"><span class="irs-t">센서 판정</span>')
+                for L in letters:
+                    for c, _ in RAIL_COLORS:
+                        k = f"{L}_{c}"
+                        on = irs.get(k, True)
+                        out.append(f'<button type="button" class="irbtn{"" if on else " off"}" data-rail="{k}" '
+                                   f'data-on="{1 if on else 0}" title="{k} 센서 판정 {"켜짐" if on else "꺼짐"}">'
+                                   f'{k} {"켬" if on else "끔"}</button>')
+                out.append("</div>")
             for k in bad:
                 out.append(f'<div class="bd-alert"><span>{k} 고장</span>'
                            f'<button type="button" class="fix" data-rail="{k}">복구</button></div>')
@@ -892,6 +947,11 @@ def _render(result, error):
     if broken:   # 점검(check_all) 항목은 아니지만 주문이 멈추는 원인이라 "확인할 것"에 같이 올림
         rail_issue = ("!!", 0, "카트리지 칸", f"{', '.join(broken)} 고장 - 이 칸이 든 주문은 키캡 단계에서 멈춤")
         warn = warn + [rail_issue]
+    ir_off = [k for k, on in _ir_states().items() if not on]   # [11/10]
+    ir_issue = None
+    if ir_off:
+        ir_issue = ("!!", 0, "카트리지 센서", f"{', '.join(ir_off)} 센서 판정 꺼짐 - 이 칸은 키캡이 안 나가도 성공으로 처리됨")
+        warn = warn + [ir_issue]
     tray = (rails or {}).get("tray")
     tray_left = tray[1] if tray and tray[1] is not None else None
     tray_issue = None
@@ -912,6 +972,9 @@ def _render(result, error):
         elif first is rail_issue:
             say = f"{broken[0]} 카트리지 고장" + (f" 외 {total - 1}건" if total > 1 or len(broken) > 1 else "")
             sub = "이 칸이 든 주문은 키캡 단계에서 멈춥니다. 센서를 확인하고 재고에서 복구를 누르세요."
+        elif first is ir_issue:
+            say = f"센서 꺼진 칸 {len(ir_off)}개" + (f" 외 {total - 1}건" if total > 1 else "")
+            sub = "이 칸은 키캡이 안 나가도 성공으로 처리됩니다. 센서를 고친 뒤 재고 아래 센서 버튼으로 다시 켜세요."
         else:
             say, sub = _headline(first, total)
     else:
@@ -934,7 +997,7 @@ def _render(result, error):
     parts.append('</ul></details>')
     err = f" 마지막 점검에서 오류가 났습니다: {e(error)}" if error else ""
     parts.append(f'<footer>{PAGE_REFRESH_SEC}초마다 새로 고칩니다. 조작은 원격 데스크톱으로, 위험하면 로봇 전원 스위치를 끕니다.'
-                 f' 이 화면에서 할 수 있는 조작은 고장 칸 복구와 재고 숫자 맞추기뿐입니다.{err}</footer>')
+                 f' 이 화면에서 할 수 있는 조작은 고장 칸 복구, 재고 숫자 맞추기, 센서 판정 켜기/끄기뿐입니다.{err}</footer>')
     parts.append(f'</main><script>{JS}</script></body></html>')
     return "".join(parts)
 
@@ -975,6 +1038,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/stock-set":
             self._stock_set()
             return
+        if self.path == "/ir-set":   # [11/10]
+            self._ir_set()
+            return
         # 상태판 화면의 조작: 고장 칸 복구 -> 키캡 Flask /repair/<칸> (아두이노에 MQTT 복구 명령, 칸 상태만 되돌림)
         if self.path != "/repair":
             self.send_response(404)
@@ -1012,6 +1078,32 @@ class Handler(BaseHTTPRequestHandler):
                 r = requests.post(f"{KEYCAP_FLASK_URL}/stock/set",
                                   json={"key": req.get("key"), "count": req.get("count")}, timeout=15)
                 code, body = r.status_code, r.json()
+            except (ValueError, AttributeError):
+                code, body = 400, {"error": "요청 형식"}
+            except Exception as e:
+                code, body = 502, {"error": f"키캡 Flask 응답 없음 ({type(e).__name__})"}
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _ir_set(self):
+        """[11/10] 레일 센서 판정 켜기/끄기 -> 키캡 Flask /ir/<칸> (같은 공유기에서만)"""
+        if not test_page.allowed(self):
+            code, body = 403, {"error": "같은 공유기에서만"}
+        else:
+            try:
+                length = min(int(self.headers.get("Content-Length") or 0), 1024)
+                req = json.loads(self.rfile.read(length) or b"{}")
+                rail, on = req.get("rail"), req.get("on")
+                valid = {f"{letter}_{c}" for _, letter in KEYCAP_ROWS for c, _ in RAIL_COLORS}
+                if rail not in valid or not isinstance(on, bool):
+                    code, body = 400, {"error": "칸 또는 on 값이 잘못됨"}
+                else:
+                    r = requests.post(f"{KEYCAP_FLASK_URL}/ir/{rail}", json={"on": on}, timeout=8)
+                    code, body = r.status_code, r.json()
             except (ValueError, AttributeError):
                 code, body = 400, {"error": "요청 형식"}
             except Exception as e:

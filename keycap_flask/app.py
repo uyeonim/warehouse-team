@@ -1014,6 +1014,75 @@ def repair_rail(rail):
     return jsonify({"result": "sent" if ok else "mqtt_fail", "cmd": cmd}), (200 if ok else 502)
 
 
+# ============================================================
+# [11/10] 레일별 IR 센서 판정 켜기/끄기 (상태판 -> 여기 -> MQTT retain -> 아두이노, 재부팅 없이)
+#  - Redis ir:{칸} = "on"/"off" (키가 없으면 켬)
+#  - 보드 8칸 전체 상태를 sjuiot/warehouse/ir/{보드} 에 retain으로 발행
+#    (REPAIR는 명령이라 retain 금지지만, 이건 "현재 설정"이라 retain이 맞음 - 재부팅/재접속 시 바로 다시 받음)
+#  - 꺼진 칸은 아두이노가 판정 없이 항상 성공 처리 (배출 중인 칸은 다음 배출부터 적용, 펌웨어 11/10~)
+# ============================================================
+IR_TOPIC_PREFIX = "sjuiot/warehouse/ir/"
+
+
+def _board_of(rail):
+    for board, letters in BOARD_LETTERS.items():
+        if rail[:1] in letters:
+            return board
+    return None
+
+
+def _ir_state(rails):
+    values = redis.mget(*[f"ir:{r}" for r in rails])
+    return {r: v != "off" for r, v in zip(rails, values)}
+
+
+def _publish_ir(board):
+    rails = [f"{letter}_{color}" for letter in BOARD_LETTERS[board] for color in COLORS]
+    state = _ir_state(rails)
+    ok = publish(IR_TOPIC_PREFIX + board, json.dumps(state), retain=True)
+    return ok, state
+
+
+@app.route("/ir", methods=["GET"])
+def get_ir():
+    """32칸 센서 판정 상태 {"E_r": true, ...}"""
+    return jsonify(_ir_state(_all_keycap_letter_colors())), 200
+
+
+@app.route("/ir/<rail>", methods=["POST"])
+def set_ir(rail):
+    """body {"on": true|false}. MQTT 전송이 실패하면 Redis도 원래대로 되돌림 (아두이노와 어긋나지 않게)"""
+    if rail not in _all_keycap_letter_colors():
+        return jsonify({"error": f"없는 칸: {rail}"}), 400
+    on = (request.get_json(force=True, silent=True) or {}).get("on")
+    if not isinstance(on, bool):
+        return jsonify({"error": "on은 true/false"}), 400
+    before = redis.get(f"ir:{rail}")
+    redis.set(f"ir:{rail}", "on" if on else "off")
+    board = _board_of(rail)
+    ok, state = _publish_ir(board)
+    if not ok:
+        if before is None:
+            redis.delete(f"ir:{rail}")
+        else:
+            redis.set(f"ir:{rail}", before)
+    logger.info(f"[ir] {rail} 센서 판정 {'켬' if on else '끔'} -> {board} 전송 {'성공' if ok else '실패(되돌림)'}")
+    return jsonify({"result": "ok" if ok else "mqtt_fail", "rail": rail, "on": on, "board_state": state}), \
+        (200 if ok else 502)
+
+
+def _publish_ir_all_at_start():
+    """Flask 켤 때 4개 보드 설정을 한 번씩 다시 발행 - 브로커가 재시작돼서 retain이 날아갔어도 Redis 기준으로 복구"""
+    time.sleep(3)
+    for board in BOARD_LETTERS:
+        ok, state = _publish_ir(board)
+        off = [k for k, v in state.items() if not v]
+        logger.info(f"[ir] 시작 시 {board} 센서 설정 발행 {'성공' if ok else '실패'} (꺼진 칸: {off if off else '없음'})")
+
+
+threading.Thread(target=_publish_ir_all_at_start, daemon=True, name="ir-publish").start()
+
+
 def _sync_arduinos(rails):
     """아두이노 RAM의 칸 수량을 Redis stock으로 맞추게 함 - 펌웨어 수정 없이 기존 restock 기능을 빌림.
     최신 cnt_process에 keycap_restock=rails를 실어 seq만 바꿔(아두이노는 seq가 직전과 같으면 무시) MQTT로 보내면
