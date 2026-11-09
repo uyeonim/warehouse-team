@@ -6,6 +6,7 @@ iPad·휴대폰·리눅스 PC 브라우저로 같은 공유기 안에서 봄. �
 - 라인: 장비 램프 9개 + 진행 중 주문 칩 (cnt_process를 5초마다 읽음). 장비마다 진행 중 1개는 큰 칩,
   같은 단계에서 기다리는 주문은 작은 줄("대기 n"), fault 주문은 빨간 칩. 휴대폰은 칩 하나 + "+ 대기 n, 고장 n"
 - 재고: 아두이노 보드 4묶음(EI·NS·TF·PJ) x 8칸 숫자 칸 + 보드 스택. 카트리지 / 전체 재고 탭. 고장 칸 복구 버튼
+- [11/10] 아두이노 4대 연결: 펌웨어가 2분마다 보내는 자기 핑(MQTT)을 같이 들어서, 5분 넘게 없으면 그 보드 빨강
 - 아래: 확인할 것, 최근 작업(오늘 로그), 마지막 카메라 사진, 정상 항목(접힘)
 - check_all.py 점검을 REFRESH_SEC마다 돌림. 조작은 고장 칸 복구 버튼 하나뿐 (나머지는 원격 데스크톱으로)
 - 전시장엔 인터넷이 없어서 외부 글꼴·라이브러리 안 씀 (기기 기본 한글 글꼴)
@@ -75,6 +76,78 @@ def _ir_states():
     except Exception:
         return {}
     return {k: v != "off" for k, v in zip(keys, values)}
+
+
+# [11/10] 아두이노 4대 연결 확인. 펌웨어가 2분마다 자기 핑 토픽(sjuiot/warehouse/ping/{보드})에 보내는 걸
+# 같이 들음 (펌웨어 수정 없음). 듣기만 하고 아무것도 안 보내서 아두이노의 자기 핑 확인에는 영향 없음
+BOARDS = [board for board, *_ in RACK]
+ARDUINO_PING_TOPIC = "sjuiot/warehouse/ping/+"
+ARDUINO_STALE_SEC = 300   # 핑 주기 120초 x 2 + 여유. 이보다 오래 핑이 없으면 "응답 없음"
+_arduino_seen = {}        # "EI" -> 마지막 핑 받은 시각
+_arduino_since = None     # 브로커에 붙어 듣기 시작한 시각. None = 못 붙음 -> 판단 안 함 (MQTT 문제는 점검 항목이 따로 잡음)
+
+
+def _arduino_loop():
+    global _arduino_since
+    import paho.mqtt.client as mqtt
+    env = dotenv_values(ROOT / "keycap_flask" / ".env")   # 키캡 Flask와 같은 브로커
+    host, port = env.get("MQTT_HOST"), int(env.get("MQTT_PORT") or 1883)
+    if not host:
+        return
+    try:   # paho 2.x는 callback_api_version 필수, 1.x는 없음
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id="status_page_ping")
+    except AttributeError:
+        c = mqtt.Client(client_id="status_page_ping")
+    if env.get("MQTT_USER"):
+        c.username_pw_set(env["MQTT_USER"], env.get("MQTT_PASS") or "")
+
+    def on_connect(client, userdata, flags, rc):
+        global _arduino_since
+        if rc == 0:
+            client.subscribe(ARDUINO_PING_TOPIC, qos=0)
+            with _lock:
+                _arduino_since = time.time()
+
+    def on_disconnect(client, userdata, rc):
+        global _arduino_since
+        with _lock:
+            _arduino_since = None
+
+    def on_message(client, userdata, msg):
+        board = msg.topic.rsplit("/", 1)[-1]
+        if board in BOARDS:
+            with _lock:
+                _arduino_seen[board] = time.time()
+
+    c.on_connect, c.on_disconnect, c.on_message = on_connect, on_disconnect, on_message
+    c.reconnect_delay_set(2, 30)
+    while True:   # 브로커가 안 켜져 있어도 계속 다시 시도 (끊기면 loop_forever가 알아서 재접속)
+        try:
+            c.connect(host, port, keepalive=30)
+            c.loop_forever(retry_first_connection=True)
+        except Exception:
+            with _lock:
+                _arduino_since = None
+            time.sleep(10)
+
+
+def _arduino_states(now=None):
+    """{"EI": (상태, 마지막 핑 몇 초 전)} 상태 = ok / lost(응답 없음) / unknown(브로커 못 붙음·막 켜서 첫 핑 기다림)"""
+    now = now or time.time()
+    with _lock:
+        since, seen = _arduino_since, dict(_arduino_seen)
+    out = {}
+    for board in BOARDS:
+        t = seen.get(board)
+        if since is None:
+            out[board] = ("unknown", None)
+        elif t and now - t <= ARDUINO_STALE_SEC:
+            out[board] = ("ok", int(now - t))
+        elif now - since <= ARDUINO_STALE_SEC:
+            out[board] = ("unknown", None)
+        else:
+            out[board] = ("lost", int(now - t) if t else None)
+    return out
 
 
 def _original_totals():
@@ -190,10 +263,13 @@ def _station_states(facts, rails=None):
         lamp, note = "ok", "대기"
         worst = []   # (램프, 문구)
         if st["program"] is None:   # 키캡 카트리지 = 아두이노 4대. 우리가 아는 건 키캡 Flask와 MQTT 브로커, 칸 상태까지
+            lost = [b for b, (s, _) in _arduino_states().items() if s == "lost"]   # [11/10]
             if not ports.get("5002"):
                 worst.append(("bad", "키캡 Flask 꺼짐"))
             elif not facts.get("mqtt"):
                 worst.append(("bad", "MQTT 브로커 접속 안 됨"))
+            elif lost:
+                worst.append(("bad", f"아두이노 {'·'.join(lost)} 응답 없음"))
             keycap = [v for k, v in (rails or {}).items() if not k.startswith("board_")]
             broken = sum(1 for v in keycap if v[0] == "disable")
             ir_off = sum(1 for on in _ir_states().values() if not on)   # [11/10]
@@ -808,6 +884,7 @@ def _render_stock(rails):
     totals = _original_totals()
     rail_cap, board_cap, tray_cap = totals["rail_cap"], totals["board_cap"], totals["tray"]
     irs = _ir_states()   # [11/10] 센서 판정 켜짐/꺼짐
+    arduinos = _arduino_states()   # [11/10] 아두이노 연결
 
     def cart_cap(key):
         return tray_cap if key == "tray" else (board_cap if key.startswith("board_") else rail_cap)
@@ -845,6 +922,11 @@ def _render_stock(rails):
             busy = view == "cart" and any(rails[k][0] == "busy" for k in keys)
             head = f"고장 {len(bad)}칸" if bad else ("배출 중" if busy else "정상")
             cls = " has-bad" if bad else (" has-busy" if busy else "")
+            ard, ago = arduinos[board]
+            if ard == "lost":   # [11/10] 아두이노가 꺼졌거나 와이파이 끊김 - 칸 숫자는 마지막으로 안 값
+                head, cls = "아두이노 응답 없음" + (f" {ago // 60}분" if ago else ""), " has-bad"
+            elif ard == "unknown" and not bad and not busy:
+                head = "연결 확인 중"
             out.append(f'<section class="bd{cls}" aria-label="{board} 보드"><div class="bd-head"><b>{board}</b><span>{head}</span></div>'
                        '<div class="cols"><span></span>' +
                        "".join(f'<span class="dot {c}" title="{n}"></span>' for c, n in RAIL_COLORS) + "</div>")
@@ -952,6 +1034,12 @@ def _render(result, error):
     if ir_off:
         ir_issue = ("!!", 0, "카트리지 센서", f"{', '.join(ir_off)} 센서 판정 꺼짐 - 이 칸은 키캡이 안 나가도 성공으로 처리됨")
         warn = warn + [ir_issue]
+    lost = {b: a for b, (s, a) in _arduino_states(now).items() if s == "lost"}   # [11/10]
+    ard_issue = None
+    if lost:
+        ago = ", ".join(f"{b}({a // 60}분 전 마지막)" if a else f"{b}(핑 없음)" for b, a in lost.items())
+        ard_issue = ("XX", 0, "키캡 아두이노", f"아두이노 {ago} 응답 없음 - 이 보드 칸이 든 주문은 키캡 단계에서 멈춤")
+        bad = bad + [ard_issue]
     tray = (rails or {}).get("tray")
     tray_left = tray[1] if tray and tray[1] is not None else None
     tray_issue = None
@@ -962,7 +1050,11 @@ def _render(result, error):
     total = len(bad) + len(warn)
     if bad:
         cls = "bad"
-        say, sub = _headline(bad[0], total)
+        if bad[0] is ard_issue:
+            say = f"아두이노 {'·'.join(lost)} 응답 없음" + (f" 외 {total - 1}건" if total > 1 else "")
+            sub = "그 보드의 전원(USB·어댑터)과 와이파이를 확인하세요. 다시 붙으면 1분 안에 정상으로 돌아옵니다."
+        else:
+            say, sub = _headline(bad[0], total)
     elif warn:
         cls = "warn"
         first = rail_issue or (tray_issue if tray_left is not None and tray_left <= 0 else None) or warn[0]
@@ -1011,7 +1103,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/", "/index.html"):
             body, ctype = _render(result, error).encode("utf-8"), "text/html; charset=utf-8"
         elif self.path == "/status.json":
-            body = json.dumps({"result": result, "error": error, "process": process}, ensure_ascii=False).encode("utf-8")
+            body = json.dumps({"result": result, "error": error, "process": process,
+                               "arduinos": _arduino_states()}, ensure_ascii=False).encode("utf-8")
             ctype = "application/json; charset=utf-8"
         elif self.path.split("?")[0] == "/camera/latest.jpg":
             # 카메라 폴더의 오늘 마지막 사진만 내보냄 (경로를 요청에서 받지 않음)
@@ -1122,6 +1215,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     threading.Thread(target=_check_loop, daemon=True).start()
     threading.Thread(target=_process_loop, daemon=True).start()
+    threading.Thread(target=_arduino_loop, daemon=True).start()   # [11/10]
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"창고 상태판: http://<이 노트북 IP>:{PORT}  (같은 공유기에서 브라우저로)  - Ctrl+C로 종료")
     try:
