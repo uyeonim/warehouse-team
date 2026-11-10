@@ -94,9 +94,7 @@
 ### 아직 모르는 것 (통합 시험에서 볼 것)
 
 1. 전시장 Mobius에서 `cnt_tray_robot_arm/la`를 실제로 읽는 부분
-2. `tray_load_failed`를 푼 직후 주문이 `assigned`에 남아 있는지
-   - 남아 있으면 게이트웨이가 트레이를 다시 올려서 문제없어요.
-   - 이미 `keycap_dispensed`로 넘어가 있으면 게이트웨이가 트레이를 다시 안 올려요. 그러면 section0은 안 돌고 주문이 시간 초과로 끝나요.
+2. ~~`tray_load_failed`를 푼 직후 주문이 `assigned`에 남아 있는지~~ → 11/11 시뮬레이션과 10/8 실제 기록으로 확인: 주문은 보통 이미 `keycap_dispensed`예요. 그래서 트레이를 다시 올리도록 고쳤어요(`수정_요약.md` 3번).
 3. `section0: failed`를 플랫폼이 어떤 fault로 띄우는지 (`tray_00_belt_jammed`는 코드에 임시 이름이라고 적혀 있음)
 4. 실제 대기 시간: 보드 main 로그의 `트레이 팔 완료 보고 확인 (N초 기다림)`
 

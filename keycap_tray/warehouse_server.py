@@ -245,14 +245,11 @@ def on_assigned(order_id, order):
         # 트레이는 이미 벨트에 놓여 있고 팔만 못 빠졌던 것. fault 해제 = 사람이 팔을 비켜 줌 → 또 올리면 두 장이 됨
         print("    (트레이는 벨트에 놓여 있음 — 다시 올리지 않고 done 보고)")
         tray_results[order_id] = True
-        tray_state.pop(order_id, None)
     else:
         try:
             tray_results[order_id] = load_empty_tray(order_id)
             tray_reasons.pop(order_id, None)
-            if tray_results[order_id]:
-                tray_state.pop(order_id, None)
-            elif TRAY_FAULT_FIX:
+            if not tray_results[order_id] and TRAY_FAULT_FIX:
                 tray_state[order_id] = "on_belt" if hw and hw.TRAY.get("last_placed") else "failed"
         except tray_stock.TrayEmpty as e:
             # [11/09] 빈 트레이 0개: 팔은 안 움직이고 failed + reason "empty" -> 플랫폼 fault tray_load_failed.
@@ -266,6 +263,10 @@ def on_assigned(order_id, order):
     if not tray_results[order_id] and order_id in tray_reasons:
         con["reason"] = tray_reasons[order_id]
     report(TRAY_ARM, con)
+    if tray_results[order_id]:
+        # done 보고까지 나간 뒤에 지움. 보고 전송이 실패해 다시 올 때 on_keycap_dispensed 가 여기를 다시 불러
+        # "보고만 재시도" 하게 하려고 (먼저 지우면 done 이 영영 안 나가 보드 main 이 section0 을 안 돌림)
+        tray_state.pop(order_id, None)
 
 
 def on_keycap_dispensed(order_id, order):

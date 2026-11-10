@@ -426,6 +426,7 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
     port = cfg["port"]
     results = {}
     what = cfg.get("label")  # 트레이 팔이면 "빈 트레이" (로그 문구용). 키캡 팔은 None
+    cfg["last_placed"] = False  # 이번에 놓는 자리에 실제로 놓았는지 (못 빠져서 실패해도 물건은 이미 거기 있음)
     if not port:  # USB 가 안 보이는 팔 → 움직이지 않고 실패로 (2026-11-10: 예전엔 오류로 보고가 안 나가 fault 없이 주문이 넘어감)
         log(port, "!! 팔이 연결돼 있지 않음 (USB/전원 확인) → 실패 처리")
         for _, _, keycap_no in cfg["keycaps"]:
@@ -437,7 +438,6 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
     # 집으러 내려가기 전에 반드시 열어 둠 (닫힌 채로 내려가면 키캡을 못 잡음)
     log(port, f"그리퍼 열기: {await gripper(arm_api, port, on=False)}")
     keycaps = cfg["keycaps"]
-    cfg["last_placed"] = False  # 이번에 놓는 자리에 실제로 놓았는지 (못 빠져서 실패해도 물건은 이미 거기 있음)
     left = True  # 직전 키캡 뒤 트레이 자리에서 빠졌는지
     for i, (letter, slot_no, keycap_no) in enumerate(keycaps):
         log(port, f"{what} → 벨트" if what else f"키캡 '{letter}' (슬롯 {slot_no}) → place")
@@ -757,6 +757,7 @@ def run_tray_arm(order_id):
     [11/09] 0개면 움직이지 않고 tray_stock.TrayEmpty -> failed + reason "empty" (tray_load_failed). 채우고 fault 해제하면 다시 집음
     (예전: 0개 -> tray_load_failed -> fault 해제 때 가득 찬 것으로 봄. 원격 채우기가 생겨서 뺌)"""
     count = None
+    TRAY["last_placed"] = False  # 팔을 움직이기 전에 끝나는 경우(0개·좌표 없음)에 지난 주문 값이 남지 않게
     if tray_stock.enabled():
         count = tray_stock.get()
         if count <= 0:
