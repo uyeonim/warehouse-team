@@ -21,6 +21,7 @@ Dobot 좌표 다시 찍기 (로봇을 움직이지 않음 — 좌표 읽기만)
 import asyncio
 import json
 import os
+import shutil
 import sys
 import time
 
@@ -93,85 +94,6 @@ def stopwatch_belt(loop, box_api, arm_api, cfg, speed_mm_s=None):
     if times:
         print("\n잰 시간: " + ", ".join(f"{t:.1f}" for t in times) + " 초"
               f"  (Enter 반응만큼 0.2~0.3초 길게 나올 수 있음)")
-
-
-TRAY_POSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_tray.json")
-
-
-def tray_points(saved):
-    """[11/11] 트레이 팔 찍을 자리: 더미 1·2·3 맨 위층(5층) + 벨트 위 놓는 곳. (키, 설명, 기존 좌표)"""
-    stacks = saved.get("stacks") or []
-    old_stack = lambda i: (stacks[i] if i < len(stacks) and stacks[i] and not isinstance(stacks[i][0], list)
-                           else (stacks[i][0] if i < len(stacks) and stacks[i] else None))
-    place = (saved.get("place_slots") or {}).get("1")
-    return ([(("stack", i), f"더미 {i + 1} 맨 위층(5층) 트레이 집는 곳 (더미 5층까지 다 쌓은 상태로)", old_stack(i))
-             for i in range(3)] +
-            [(("place", 1), "트레이 놓는 곳 (벨트 위)", place)])
-
-
-def merge_tray(saved, taken):
-    """[11/11] 찍은 값만 바꾸고 나머지 키(pitch, travel_z, _note ...)는 그대로. 반환: 새 dict"""
-    out = dict(saved)
-    stacks = [list(s) if s and not isinstance(s[0], list) else (list(s[0]) if s else None)
-              for s in (saved.get("stacks") or [])]
-    stacks += [None] * (3 - len(stacks))
-    for (kind, i), pose in taken.items():
-        if kind == "stack":
-            stacks[i] = list(pose)
-    if all(stacks):
-        out["stacks"] = stacks
-        out["pickup_slots"] = {"1": stacks[0]}   # 더미1 맨 위층 (실제로 집을 자리는 남은 개수로 tray_stock 이 계산)
-    if ("place", 1) in taken:
-        out["place_slots"] = {"1": list(taken[("place", 1)])}
-    if taken:
-        out["_note"] = (f"{time.strftime('%Y-%m-%d')} read_pose.py tray 로 다시 찍음 (더미 맨 위층·놓는 곳). "
-                        + str(saved.get("_note", "")))[:600]
-    return out
-
-
-def teach_tray(loop, arm_api, port):
-    try:
-        with open(TRAY_POSE_FILE, encoding="utf-8") as f:
-            saved = json.load(f)
-    except (OSError, ValueError):
-        saved = {}
-    print(f"트레이 팔 좌표 찍기 - 더미 3개 맨 위층 + 놓는 곳. pitch {saved.get('pitch', '없음')}, "
-          f"travel_z {saved.get('travel_z', '없음')} 는 그대로 둠")
-    taken = {}
-    try:
-        for key, label, old in tray_points(saved):
-            while True:
-                ans = input(f"\n[{label}] 팔을 옮긴 뒤 Enter (건너뛰기 s)  기존={old or '없음'}: ").strip().lower()
-                if ans == "s":
-                    print("  → 기존 좌표 유지")
-                    break
-                pose = loop.run_until_complete(get_pose(arm_api, port))
-                if pose is None:
-                    print("  !! 좌표를 못 읽음 — 연결 확인 후 다시 Enter")
-                    continue
-                taken[key] = pose
-                print(f"  → 저장: {pose}")
-                break
-    except (KeyboardInterrupt, EOFError):
-        print("\n중단 — 저장하지 않음")
-        return
-    finally:
-        loop.run_until_complete(dc.safe_call(arm_api.DisconnectDobot(portName=port)))
-    if not taken:
-        print("\n바뀐 좌표 없음 - 저장 안 함")
-        return
-    new = merge_tray(saved, taken)
-    if os.path.exists(TRAY_POSE_FILE):
-        backup = TRAY_POSE_FILE + time.strftime(".bak-%Y%m%d-%H%M%S")
-        os.replace(TRAY_POSE_FILE, backup)
-        print(f"\n예전 파일 백업: {os.path.basename(backup)}")
-    with open(TRAY_POSE_FILE, "w", encoding="utf-8") as f:
-        json.dump(new, f, ensure_ascii=False, indent=2)
-    print(f"===== 트레이 팔 새 좌표 (저장: pose_tray.json) =====")
-    for i, s in enumerate(new.get("stacks") or []):
-        print(f"  더미 {i + 1} 맨 위층 = {s}")
-    print(f"  놓는 곳 = {(new.get('place_slots') or {}).get('1')}")
-    print("  남은 개수는 상태판 빈 트레이 칸에서 맞추기 (집을 층은 남은 개수로 계산)")
 
 
 def main():
@@ -263,11 +185,7 @@ def main():
                  speed_mm_s=float(sys.argv[4]) if len(sys.argv) > 4 else None)
         return
 
-    if set_key == "tray":   # [11/11] 더미 3개 + 놓는 곳. pose_tray.json 의 pitch·travel_z 등은 그대로 둠
-        teach_tray(loop, arm_api, port)
-        return
-
-    new = {"pickup_slots": dict(cfg["pickup_slots"]), "place_slots": dict(cfg["place_slots"])}
+    new ={"pickup_slots": dict(cfg["pickup_slots"]), "place_slots": dict(cfg["place_slots"])}
     points = TRAY_POINTS if set_key == "tray" else POINTS
     # 트레이 더미(pose_tray.json stacks)를 쓰는 중이면 더미마다 맨 위(5층) 손잡이 + 놓는 곳을 찍음.
     # 아래층은 tray_stock.py 가 pitch 로 계산. (예전엔 집는 곳 하나만 찍고 파일을 통째로 새로 써서
@@ -313,6 +231,10 @@ def main():
         new["pickup_slots"][1] = new["stacks"][1]  # 더미를 쓸 때 집는 곳은 매번 남은 개수로 정함. 여기는 더미1 맨 위로 맞춰만 둠
     for group in ("pickup_slots", "place_slots"):
         saved[group] = {str(k): v for k, v in new[group].items()}
+    if os.path.exists(path):   # [11/11] 덮어쓰기 전에 예전 파일 백업 (pose_<이름>.json.bak-날짜시간, git 무시)
+        backup = path + time.strftime(".bak-%Y%m%d-%H%M%S")
+        shutil.copy2(path, backup)
+        print(f"\n예전 파일 백업: {os.path.basename(backup)}")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(saved, f, indent=2, ensure_ascii=False)
     print(f"\n===== {set_key} 새 좌표 (저장: {os.path.basename(path)}) =====")
