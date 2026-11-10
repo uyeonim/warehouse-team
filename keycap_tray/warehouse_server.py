@@ -75,6 +75,9 @@ else:
 
 REPORT_ROOT = os.environ.get("REPORT_ROOT", "").strip("/")
 REACT_ASSIGNED = _flag("REACT_ASSIGNED")
+# [11/11] 트레이 실패 fault 가 풀린 뒤의 처리 (다시 올리기 / 놓았으면 개수 빼기). 0 이면 예전 동작 그대로
+#   (.env.local TRAY_FAULT_FIX, 기본 1. dobot_control.py 도 같은 값을 읽음. 설명: 수정_요약.md)
+TRAY_FAULT_FIX = _flag("TRAY_FAULT_FIX", "1")
 FAKE_UNBUILT = _flag("FAKE_UNBUILT", "0" if PROFILE == "local" else "1")  # 아래 장비별 설정을 비워두면 이 값을 따름
 FAKE_TRAY_CONVEYOR = _flag("FAKE_TRAY_CONVEYOR", "1" if FAKE_UNBUILT else "0")
 # section0 = 트레이를 투입 지점에서 키캡 받는 중앙 자리로 옮기는 구간 (2026-10-08 명세 추가)
@@ -249,7 +252,7 @@ def on_assigned(order_id, order):
             tray_reasons.pop(order_id, None)
             if tray_results[order_id]:
                 tray_state.pop(order_id, None)
-            else:
+            elif TRAY_FAULT_FIX:
                 tray_state[order_id] = "on_belt" if hw and hw.TRAY.get("last_placed") else "failed"
         except tray_stock.TrayEmpty as e:
             # [11/09] 빈 트레이 0개: 팔은 안 움직이고 failed + reason "empty" -> 플랫폼 fault tray_load_failed.
@@ -257,7 +260,8 @@ def on_assigned(order_id, order):
             print(f"    !! {e} → failed (reason: empty) 보고")
             tray_results[order_id] = False
             tray_reasons[order_id] = "empty"
-            tray_state[order_id] = "failed"
+            if TRAY_FAULT_FIX:
+                tray_state[order_id] = "failed"
     con = {"order_id": order_id, "status": result(tray_results[order_id])}
     if not tray_results[order_id] and order_id in tray_reasons:
         con["reason"] = tray_reasons[order_id]
@@ -268,7 +272,7 @@ def on_keycap_dispensed(order_id, order):
     # 트레이 팔 실패(tray_load_failed)가 풀렸는데 주문은 이미 이 단계인 경우 (키캡 배출이 트레이 팔보다 먼저 끝남).
     # assigned 로 돌아오지 않으므로 여기서 트레이를 다시 올림. 안 하면 트레이 없이 키캡·보드가 벨트에 놓임
     # (10/8 실제 기록: status=keycap_dispensed 에 fault=tray_load_failed)
-    if REACT_ASSIGNED and order_id in fault_seen and order_id in tray_state:
+    if TRAY_FAULT_FIX and REACT_ASSIGNED and order_id in fault_seen and order_id in tray_state:
         print("    (트레이 투입 실패가 해제됨 → 키캡 벨트 전에 트레이부터 다시 올림)")
         on_assigned(order_id, order)
         if not tray_results.get(order_id):
@@ -392,7 +396,7 @@ def settings_fault_summary():
 
 
 def settings_summary():
-    return (f"반응 설정: assigned={REACT_ASSIGNED}, 가짜 보고 트레이벨트section1={FAKE_TRAY_CONVEYOR} "
+    return (f"반응 설정: assigned={REACT_ASSIGNED}, 트레이fault뒤처리(TRAY_FAULT_FIX)={TRAY_FAULT_FIX}, 가짜 보고 트레이벨트section1={FAKE_TRAY_CONVEYOR} "
             f"section2={FAKE_TRAY_SECTION2} 보드로봇팔={FAKE_BOARD_ARM} 보드배출={FAKE_BOARD_DISPENSE}")
 
 

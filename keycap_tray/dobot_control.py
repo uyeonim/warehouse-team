@@ -77,6 +77,9 @@ RETREAT_RADIUS = 300.0    # 놓은 자리가 이보다 멀면, 벨트로 가기 
 #   0 = 안 함, 놓고 바로 JUMP (JUMP 가 출발할 때 스스로 20mm 들어 올림). 놓은 뒤 "움찔" 없음
 #   ※ 0 에서 빠질 때 명령 무시·알람이 반복되면 1 로 되돌릴 것 (참고사항 10장)
 PLACE_LIFT = os.environ.get("PLACE_LIFT", "1").strip() != "0"
+# [11/11] 트레이를 벨트에 놓았으면 팔이 못 빠져 실패여도 개수를 뺄지 (.env.local TRAY_FAULT_FIX, 기본 1)
+#   0 = 예전 동작 (성공일 때만 뺌). warehouse_server.py 의 같은 이름 스위치와 한 묶음
+TRAY_FAULT_FIX = os.environ.get("TRAY_FAULT_FIX", "1").strip() != "0"
 CALL_TIMEOUT = 5
 
 # 두 팔이 트레이 자리를 번갈아 쓸지 (.env ARMS_TAKE_TURNS, 기본 1)
@@ -766,7 +769,7 @@ def run_tray_arm(order_id):
     ensure_connected({"tray": TRAY})
     ok = bool(_loop.run_until_complete(arm_set(_arm_api, TRAY)).get(1))
     if count is not None:
-        if ok or TRAY.get("last_placed"):
+        if ok or (TRAY_FAULT_FIX and TRAY.get("last_placed")):
             # 벨트에 놓았으면 뺌. 놓은 뒤 팔이 못 빠져 실패(ok=False)여도 트레이는 더미에서 이미 나갔음 -
             # 안 빼면 다음 주문이 같은 (빈) 자리를 집고 성공으로 보고함
             tray_stock.used(order_id)
