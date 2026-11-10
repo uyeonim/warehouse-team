@@ -11,6 +11,7 @@ logs/
 runtime/
 board_camera_capture_log/
 DobotRPC_*.log
+*.bak-*
 
 # 빌드/캐시
 *.o
