@@ -434,6 +434,7 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
     # 집으러 내려가기 전에 반드시 열어 둠 (닫힌 채로 내려가면 키캡을 못 잡음)
     log(port, f"그리퍼 열기: {await gripper(arm_api, port, on=False)}")
     keycaps = cfg["keycaps"]
+    cfg["last_placed"] = False  # 이번에 놓는 자리에 실제로 놓았는지 (못 빠져서 실패해도 물건은 이미 거기 있음)
     left = True  # 직전 키캡 뒤 트레이 자리에서 빠졌는지
     for i, (letter, slot_no, keycap_no) in enumerate(keycaps):
         log(port, f"{what} → 벨트" if what else f"키캡 '{letter}' (슬롯 {slot_no}) → place")
@@ -490,6 +491,7 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
                     released = "SKIP"  # 놓는 자리에 못 놨으므로 실패
                 else:
                     released = await gripper(arm_api, port, on=False)
+                    cfg["last_placed"] = is_ok(released)
                     log(port, f"  놓기: {released}")
                     await asyncio.sleep(RELEASE_SETTLE_DELAY)
 
@@ -764,8 +766,10 @@ def run_tray_arm(order_id):
     ensure_connected({"tray": TRAY})
     ok = bool(_loop.run_until_complete(arm_set(_arm_api, TRAY)).get(1))
     if count is not None:
-        if ok:
-            tray_stock.used(order_id)  # 벨트에 놓고 빠진 것까지 확인됐을 때만 뺌 (못 집었으면 그 자리에 그대로 있음)
+        if ok or TRAY.get("last_placed"):
+            # 벨트에 놓았으면 뺌. 놓은 뒤 팔이 못 빠져 실패(ok=False)여도 트레이는 더미에서 이미 나갔음 -
+            # 안 빼면 다음 주문이 같은 (빈) 자리를 집고 성공으로 보고함
+            tray_stock.used(order_id)
         log(TRAY["port"], tray_stock.describe(tray_stock.cached()))
     return ok
 

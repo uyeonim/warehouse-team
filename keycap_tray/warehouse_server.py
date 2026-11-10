@@ -118,6 +118,7 @@ fault_seen = set()     # fault 로 멈췄던 주문. 해제 뒤 keycap_reached �
 arm_reported = {}      # order_id -> {슬롯: 성공여부}. fault 해제 뒤 실패했던 키캡만 다시 보고하려고 기억
 forced_used = set()    # (order_id, FORCE_FAIL 이름) — 이미 일부러 실패시킨 것 (주문당 한 번만)
 arm_results = {}       # order_id -> {슬롯: 로봇팔 결과}. 로봇팔은 주문당 한 번만 움직이도록 보관
+tray_state = {}        # order_id -> "failed"(벨트에 없음) / "on_belt"(놓았지만 팔이 못 빠져 실패). 성공하면 지움
 tray_reasons = {}      # [11/09] order_id -> 트레이 실패 이유 ("empty" = 빈 트레이 0개). 보고에 reason 으로 붙임
 tray_results = {}      # order_id -> 트레이 투입 결과. 보고만 실패했을 때 트레이를 또 올리지 않도록 (fault 가 오면 지움 → 해제 후 재투입)
 
@@ -237,16 +238,26 @@ def place_board(order_id, board):
 def on_assigned(order_id, order):
     if order_id in tray_results:
         print("    (트레이는 이미 올림 — 보고만 재시도)")
+    elif tray_state.get(order_id) == "on_belt":
+        # 트레이는 이미 벨트에 놓여 있고 팔만 못 빠졌던 것. fault 해제 = 사람이 팔을 비켜 줌 → 또 올리면 두 장이 됨
+        print("    (트레이는 벨트에 놓여 있음 — 다시 올리지 않고 done 보고)")
+        tray_results[order_id] = True
+        tray_state.pop(order_id, None)
     else:
         try:
             tray_results[order_id] = load_empty_tray(order_id)
             tray_reasons.pop(order_id, None)
+            if tray_results[order_id]:
+                tray_state.pop(order_id, None)
+            else:
+                tray_state[order_id] = "on_belt" if hw and hw.TRAY.get("last_placed") else "failed"
         except tray_stock.TrayEmpty as e:
             # [11/09] 빈 트레이 0개: 팔은 안 움직이고 failed + reason "empty" -> 플랫폼 fault tray_load_failed.
             # 사람이 다 쌓고 상태판에서 개수를 맞춘 뒤 fault 해제 -> 다시 집음 (아직 0이면 또 empty 로 실패)
             print(f"    !! {e} → failed (reason: empty) 보고")
             tray_results[order_id] = False
             tray_reasons[order_id] = "empty"
+            tray_state[order_id] = "failed"
     con = {"order_id": order_id, "status": result(tray_results[order_id])}
     if not tray_results[order_id] and order_id in tray_reasons:
         con["reason"] = tray_reasons[order_id]
@@ -254,6 +265,14 @@ def on_assigned(order_id, order):
 
 
 def on_keycap_dispensed(order_id, order):
+    # 트레이 팔 실패(tray_load_failed)가 풀렸는데 주문은 이미 이 단계인 경우 (키캡 배출이 트레이 팔보다 먼저 끝남).
+    # assigned 로 돌아오지 않으므로 여기서 트레이를 다시 올림. 안 하면 트레이 없이 키캡·보드가 벨트에 놓임
+    # (10/8 실제 기록: status=keycap_dispensed 에 fault=tray_load_failed)
+    if REACT_ASSIGNED and order_id in fault_seen and order_id in tray_state:
+        print("    (트레이 투입 실패가 해제됨 → 키캡 벨트 전에 트레이부터 다시 올림)")
+        on_assigned(order_id, order)
+        if not tray_results.get(order_id):
+            return    # 또 실패 → failed 보고가 나갔으니 fault 가 다시 걸림. 키캡 벨트는 안 돌림
     if order_id in conveyor_results:
         print("    (장비는 이미 실행함 — 보고만 재시도)")
     else:
@@ -458,7 +477,7 @@ def _process_snapshot(snapshot):
     orders = snapshot.get("orders") or {}
     all_ok = all([handle_order(order_id, order) for order_id, order in orders.items()])
 
-    for memory in (handled_by_order, conveyor_results, arm_reported, arm_results, tray_results, tray_reasons):  # 끝난 주문 정리
+    for memory in (handled_by_order, conveyor_results, arm_reported, arm_results, tray_results, tray_reasons, tray_state):  # 끝난 주문 정리
         for order_id in list(memory):
             if order_id not in orders:
                 del memory[order_id]
