@@ -81,10 +81,17 @@ def run():
         inbox = SnapshotInbox()
         # 상태 기록 (Redis hb:keycap_tray, check_all.py가 읽음). Redis가 꺼져 있어도 동작엔 영향 없음
         import tray_stock  # 빈 트레이 남은 개수도 같이 기록 (hb:keycap_tray 의 tray_left / tray_total)
+        # [11/10] tray_arm: assigned 때 빈 트레이를 올리고 cnt_tray_robot_arm 에 보고하는 설정인지 (REACT_ASSIGNED).
+        # 보드 main 이 이걸 보고, 켜져 있으면 section0 전에 그 보고(done)를 기다림 - 놓는 중에 벨트가 돌지 않게
+        def hb_extra():
+            extra = {'tray_arm': bool(ws.REACT_ASSIGNED)}
+            if tray_stock.enabled():
+                extra.update(tray_left=tray_stock.cached(), tray_total=tray_stock.TOTAL)
+            return extra
+
         hb = Heartbeat('keycap_tray', os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/0'),
                        'rehearsal' if os.environ.get('WAREHOUSE_REHEARSAL') == '1' else 'real',
-                       extra=lambda: {'tray_left': tray_stock.cached(), 'tray_total': tray_stock.TOTAL}
-                       if tray_stock.enabled() else {}).start()
+                       extra=hb_extra).start()
         if tray_stock.enabled():
             print(tray_stock.describe())
         inbox.on_accept = hb.snapshot_received

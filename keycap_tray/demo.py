@@ -6,6 +6,7 @@
   python demo.py home    한 대씩 홈 복귀 → 집기 자리 위로 비킴 (팔 움직임)
   python demo.py run     트레이 팔 → 키캡 벨트 2대 → 키캡 팔 2대 (단계별 시간 출력)
   python demo.py tray | belts | arms   그 단계만
+  (tray 는 빈 트레이 개수를 실제로 하나 줄임 — 0개면 움직이지 않음. 개수는 상태판 또는 python tray_stock.py)
 
 ※ 단독 시연에서는 트레이 벨트(section0, 보드팀 담당)가 안 움직이므로,
   실물 트레이로 할 때는 키캡 단계 전에 트레이를 손으로 중앙(키캡 넣는 자리)에 옮길 것.
@@ -77,8 +78,9 @@ def home():
         wait_still(p)
         x, y, z, r = cfg["pickup_slots"][1]
         # 홈 높이(z 150)에서 JUMP 하면 더 올라가려다 0x12 알람 → 빈손이라 MOVJ 로 비킴
+        # 트레이 팔은 더미 맨 위(z 약 105)라 +50 이면 z 155 로 한계를 넘음 → away_lift_z(20) 만큼만 (2026-11-10)
         _, ok, _ = dc._loop.run_until_complete(
-            dc.move_to(dc._arm_api, p, (x, y, z + dc.LIFT_Z_OFFSET, r), mode=dc.PTP_MODE_MOVJ))
+            dc.move_to(dc._arm_api, p, (x, y, z + cfg.get("away_lift_z", dc.LIFT_Z_OFFSET), r), mode=dc.PTP_MODE_MOVJ))
         dc.log("HOME", f"{name} 집기 자리 위로 비킴: {ok}")
     check()
 
@@ -86,7 +88,11 @@ def home():
 def run(mode):
     total = time.time()
     if mode in ("run", "tray"):
-        stage("트레이 팔 (assigned)", lambda: dc.run_tray_arm("demo"))
+        # 실제 운영과 같은 함수라 빈 트레이 개수(상태판 재고)도 하나 줄어듦. 시연 뒤 실물과 다르면 상태판에서 맞출 것
+        try:
+            stage("트레이 팔 (assigned)", lambda: dc.run_tray_arm("demo"))
+        except dc.tray_stock.TrayEmpty as e:
+            dc.log("DEMO", f"트레이 팔 안 움직임 — {e}")
     if mode in ("run", "belts"):
         belts = stage("키캡 벨트 (keycap_dispensed)", lambda: dc.run_keycap_conveyor("demo"))
         if mode == "run" and not all(belts.values()):

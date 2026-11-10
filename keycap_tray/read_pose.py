@@ -268,9 +268,20 @@ def main():
         return
 
     new = {"pickup_slots": dict(cfg["pickup_slots"]), "place_slots": dict(cfg["place_slots"])}
+    points = TRAY_POINTS if set_key == "tray" else POINTS
+    # 트레이 더미(pose_tray.json stacks)를 쓰는 중이면 더미마다 맨 위(5층) 손잡이 + 놓는 곳을 찍음.
+    # 아래층은 tray_stock.py 가 pitch 로 계산. (예전엔 집는 곳 하나만 찍고 파일을 통째로 새로 써서
+    # stacks·pitch·travel_z 가 지워졌음 → 15개 기능이 꺼짐, 2026-11-10)
+    stacks = dc.tray_stock.STACKS if set_key == "tray" else []
+    if stacks:
+        floors = dc.tray_stock.FLOORS
+        new["stacks"] = {i + 1: stack[0] for i, stack in enumerate(stacks)}
+        points = [("stacks", i + 1, f"더미{i + 1} 맨 위({floors}층) 손잡이 — {floors}개 다 쌓은 상태에서")
+                  for i in range(len(stacks))] + [TRAY_POINTS[1]]
+    before = {g: dict(d) for g, d in new.items()}
     try:
-        for group, slot, label in (TRAY_POINTS if set_key == "tray" else POINTS):
-            old = cfg[group][slot] or "아직 없음"
+        for group, slot, label in points:
+            old = new[group][slot] or "아직 없음"
             while True:
                 ans = input(f"\n[{label}] 로봇팔을 옮긴 뒤 Enter (건너뛰기 s)  기존={old}: ").strip().lower()
                 if ans == "s":
@@ -290,12 +301,24 @@ def main():
         loop.run_until_complete(dc.safe_call(arm_api.DisconnectDobot(portName=port)))
 
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"pose_{set_key}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({g: {str(k): v for k, v in d.items()} for g, d in new.items()}, f, indent=2)
-    print(f"\n===== {set_key} 새 좌표 (저장: {os.path.basename(path)}) =====")
+    try:  # 파일에 있던 다른 값(_note, pitch, travel_z 등)은 그대로 두고 찍은 좌표만 바꿈
+        with open(path, encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        saved = {}
+    if stacks:
+        for i in range(len(stacks)):  # 새로 찍은 더미만 바꿈 (건너뛴 더미는 층마다 찍어 둔 값이 있어도 그대로)
+            if new["stacks"][i + 1] != before["stacks"][i + 1]:
+                saved["stacks"][i] = list(new["stacks"][i + 1])
+        new["pickup_slots"][1] = new["stacks"][1]  # 더미를 쓸 때 집는 곳은 매번 남은 개수로 정함. 여기는 더미1 맨 위로 맞춰만 둠
     for group in ("pickup_slots", "place_slots"):
+        saved[group] = {str(k): v for k, v in new[group].items()}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(saved, f, indent=2, ensure_ascii=False)
+    print(f"\n===== {set_key} 새 좌표 (저장: {os.path.basename(path)}) =====")
+    for group in (("stacks", "place_slots") if stacks else ("pickup_slots", "place_slots")):
         for slot in sorted(new[group]):
-            mark = "" if new[group][slot] == cfg[group][slot] else "   ← 바뀜"
+            mark = "" if new[group][slot] == before[group][slot] else "   ← 바뀜"
             print(f"  {group}[{slot}] = {new[group][slot]}{mark}")
 
 

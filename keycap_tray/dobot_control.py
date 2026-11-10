@@ -77,6 +77,9 @@ RETREAT_RADIUS = 300.0    # 놓은 자리가 이보다 멀면, 벨트로 가기 
 #   0 = 안 함, 놓고 바로 JUMP (JUMP 가 출발할 때 스스로 20mm 들어 올림). 놓은 뒤 "움찔" 없음
 #   ※ 0 에서 빠질 때 명령 무시·알람이 반복되면 1 로 되돌릴 것 (참고사항 10장)
 PLACE_LIFT = os.environ.get("PLACE_LIFT", "1").strip() != "0"
+# [11/11] 트레이를 벨트에 놓았으면 팔이 못 빠져 실패여도 개수를 뺄지 (.env.local TRAY_FAULT_FIX, 기본 1)
+#   0 = 예전 동작 (성공일 때만 뺌). warehouse_server.py 의 같은 이름 스위치와 한 묶음
+TRAY_FAULT_FIX = os.environ.get("TRAY_FAULT_FIX", "1").strip() != "0"
 CALL_TIMEOUT = 5
 
 # 두 팔이 트레이 자리를 번갈아 쓸지 (.env ARMS_TAKE_TURNS, 기본 1)
@@ -152,6 +155,7 @@ TRAY = {
     "pickup_slots": {1: None},   # 빈 트레이 쌓아둔 곳 (stacks 가 있으면 매번 남은 개수로 바꿔 넣음)
     "place_slots": {1: None},    # 벨트 위 놓는 곳
     "keycaps": [("빈 트레이", 1, 1)],  # arm_set 가 쓰는 형식 (이름, 슬롯, 번호)
+    "label": "빈 트레이",  # 로그에 키캡 대신 찍을 이름
     # 놓은 뒤 방금 집은 자리 위로 빠지는 높이. 50이면 5층(z 약 105)에서 z 155 → JUMP 한계(zLimit 150) 넘음 (2026-11-08)
     "away_lift_z": 20.0,
 }
@@ -191,7 +195,8 @@ TRAY["travel_z"] = tray_stock.travel_z()
 
 
 def log(tag, msg):
-    print(f"[{time.strftime('%H:%M:%S')}] [{tag:<6}] {msg}")
+    # tag 는 보통 COM 포트. 팔 USB 가 안 보이면 포트가 None → 그대로 찍으면 TypeError 로 보고까지 막힘 (2026-11-10)
+    print(f"[{time.strftime('%H:%M:%S')}] [{(tag or '팔없음'):<6}] {msg}")
 
 
 # ---------------------------------------------------------------
@@ -391,6 +396,9 @@ async def belt_set(arm_api, box_api, cfg):
     벨트에 도착 센서가 없으므로 "모터 명령이 정상으로 끝났나"로만 판단."""
     port = cfg["port"]
     numbers = [no for _, _, no in cfg["keycaps"]]
+    if not port:  # USB 가 안 보이는 팔 → 움직이지 않고 실패로 (보고가 나가야 fault 가 뜨고, 고친 뒤 해제하면 다시 함)
+        log(port, "!! 팔이 연결돼 있지 않음 (USB/전원 확인) → 벨트 실패 처리")
+        return {no: False for no in numbers}
 
     log(port, "그리퍼 오픈 상태로 시작")
     log(port, f"  결과: {await gripper(arm_api, port, on=False)}")
@@ -418,13 +426,22 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
     on_result(keycap번호, 성공여부): 키캡 하나 끝날 때마다 바로 호출 (그때그때 보고용)."""
     port = cfg["port"]
     results = {}
+    what = cfg.get("label")  # 트레이 팔이면 "빈 트레이" (로그 문구용). 키캡 팔은 None
+    cfg["last_placed"] = False  # 이번에 놓는 자리에 실제로 놓았는지 (못 빠져서 실패해도 물건은 이미 거기 있음)
+    if not port:  # USB 가 안 보이는 팔 → 움직이지 않고 실패로 (2026-11-10: 예전엔 오류로 보고가 안 나가 fault 없이 주문이 넘어감)
+        log(port, "!! 팔이 연결돼 있지 않음 (USB/전원 확인) → 실패 처리")
+        for _, _, keycap_no in cfg["keycaps"]:
+            results[keycap_no] = False
+            if on_result:
+                on_result(keycap_no, False)
+        return results
     lift = cfg.get("final_lift_z", PLACE_LIFT_Z)
     # 집으러 내려가기 전에 반드시 열어 둠 (닫힌 채로 내려가면 키캡을 못 잡음)
     log(port, f"그리퍼 열기: {await gripper(arm_api, port, on=False)}")
     keycaps = cfg["keycaps"]
     left = True  # 직전 키캡 뒤 트레이 자리에서 빠졌는지
     for i, (letter, slot_no, keycap_no) in enumerate(keycaps):
-        log(port, f"키캡 '{letter}' (슬롯 {slot_no}) → place")
+        log(port, f"{what} → 벨트" if what else f"키캡 '{letter}' (슬롯 {slot_no}) → place")
 
         # 1) 집기 — 각자 자기 벨트라서 두 팔이 동시에 해도 됨
         # 두 번째부터는 이미 그 슬롯 바로 위에 떠 있으므로 곧장 아래로 내림
@@ -478,6 +495,7 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
                     released = "SKIP"  # 놓는 자리에 못 놨으므로 실패
                 else:
                     released = await gripper(arm_api, port, on=False)
+                    cfg["last_placed"] = is_ok(released)
                     log(port, f"  놓기: {released}")
                     await asyncio.sleep(RELEASE_SETTLE_DELAY)
 
@@ -510,7 +528,7 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
         # 트레이 자리에서 못 빠졌으면 실패 — 팔이 트레이 위에 남은 채 done 을 보내면 다음 단계(트레이 벨트)가 출발해 부딪힘
         ok = bool(pick_arrived and place_arrived and is_ok(grabbed) and released != "SKIP" and is_ok(released) and left)
         results[keycap_no] = ok
-        log(port, f"  keycap{keycap_no} 결과: {'성공' if ok else '실패'}")
+        log(port, f"  {what or f'keycap{keycap_no}'} 결과: {'성공' if ok else '실패'}")
         if on_result:
             on_result(keycap_no, ok)  # 끝나는 대로 바로 보고 (4개 다 끝날 때까지 기다리지 않음)
 
@@ -740,6 +758,7 @@ def run_tray_arm(order_id):
     [11/09] 0개면 움직이지 않고 tray_stock.TrayEmpty -> failed + reason "empty" (tray_load_failed). 채우고 fault 해제하면 다시 집음
     (예전: 0개 -> tray_load_failed -> fault 해제 때 가득 찬 것으로 봄. 원격 채우기가 생겨서 뺌)"""
     count = None
+    TRAY["last_placed"] = False  # 팔을 움직이기 전에 끝나는 경우(0개·좌표 없음)에 지난 주문 값이 남지 않게
     if tray_stock.enabled():
         count = tray_stock.get()
         if count <= 0:
@@ -752,8 +771,10 @@ def run_tray_arm(order_id):
     ensure_connected({"tray": TRAY})
     ok = bool(_loop.run_until_complete(arm_set(_arm_api, TRAY)).get(1))
     if count is not None:
-        if ok:
-            tray_stock.used(order_id)  # 벨트에 놓고 빠진 것까지 확인됐을 때만 뺌 (못 집었으면 그 자리에 그대로 있음)
+        if ok or (TRAY_FAULT_FIX and TRAY.get("last_placed")):
+            # 벨트에 놓았으면 뺌. 놓은 뒤 팔이 못 빠져 실패(ok=False)여도 트레이는 더미에서 이미 나갔음 -
+            # 안 빼면 다음 주문이 같은 (빈) 자리를 집고 성공으로 보고함
+            tray_stock.used(order_id)
         log(TRAY["port"], tray_stock.describe(tray_stock.cached()))
     return ok
 
