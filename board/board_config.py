@@ -142,9 +142,9 @@ POSITION_TOLERANCE_DEG = 2.0
 TRAY_CONVEYOR_STP_1 = 0
 TRAY_CONVEYOR_STP_2 = 1
 TRAY_CONVEYOR_SPEED_MM_S = 50
-TRAY_CONVEYOR_RUN_TIME_SECTION0 = 4.3    # keycap_dispensed -> 키캡 로봇암 앞까지 (초)
-TRAY_CONVEYOR_RUN_TIME_SECTION1 = 13.1   # keycap_packed -> 보드 로봇암 앞까지 (초)
-TRAY_CONVEYOR_RUN_TIME_SECTION2 = 5.1    # board_packed  -> 픽업대까지 (초)
+TRAY_CONVEYOR_RUN_TIME_SECTION0 = 7.5    # keycap_dispensed -> 키캡 로봇암 앞까지 (초) - 2026-11-11 재조립 뒤 실측 (전 4.3)
+TRAY_CONVEYOR_RUN_TIME_SECTION1 = 12.5   # keycap_packed -> 보드 로봇암 앞까지 (초) - 2026-11-11 실측 (전 13.1)
+TRAY_CONVEYOR_RUN_TIME_SECTION2 = 3.0    # board_packed  -> 픽업대까지 (초) - 2026-11-11 실측 (전 5.1)
 # 2026-11-03 실측 2.84 / 14.55 / 4.53초 (예전 3.2 / 12.5 / 6.5)
 # 2026-11-04 18:35 세 구간 재실측 4.34 / 13.08 / 5.06초 (스톱워치) -> 4.3 / 13.1 / 5.1. 18:28 측정(3.9 / 13.4)은 구간 이름을 바꿔 잰 것이라 버림
 

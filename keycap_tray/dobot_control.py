@@ -112,7 +112,8 @@ def _port(name, default):
 SETS = {
     "set1": {
         "port": _port("SET1", "COM6"),
-        "conveyor_index": 1,
+        "conveyor_index": 0,       # 2026-11-11 테이블 재조립 뒤 conveyor_check: 세트1 벨트는 STP1, + 방향이 반대로 돎
+        "conveyor_reverse": True,
         # 2026-10-08 가림막(끝막이) 설치 후 다시 찍음
         "pickup_slots": {
             1: (-111.7, -344.4, 32.3, -108.0),
@@ -127,7 +128,7 @@ SETS = {
     "set2": {
         "port": _port("SET2", "COM7"),
         "conveyor_index": 1,
-        "conveyor_reverse": True,  # 세트2 벨트는 반대 방향 (속도·시간은 같음). 2026-11-02 도면 배치에서도 정상
+        "conveyor_reverse": False,  # 2026-11-11 재조립 뒤 conveyor_check: 세트2 벨트는 STP2, + 방향이 정방향 (예전엔 True)
         # 2026-10-08 가림막(끝막이) 설치 후 찍은 시험 배치 좌표
         "pickup_slots": {
             1: (87.0, -327.3, 35.7, -75.2),
