@@ -97,6 +97,7 @@ restock 처리 (신규):
     7. 게이트 잠금 + 서버 큐에서 제거
   [트레이 컨베이어 - keycap_dispensed(section0) / keycap_packed(section1) / board_packed(section2)]
     8. 컨베이어(Magic Box) 해당 section 구간 구동 (게이트/큐 없음 - 직접 반응)
+       [11/10] section0만: 트레이 팔 완료 보고(cnt_tray_robot_arm done)를 확인한 뒤 구동 (wait_tray_arm_done)
     9. cnt_conveyor/cnt_tray_conveyor = {"order_id":..., "sectionN": "done"|"failed"}
   [fault 해제 재시도] - 위 픽업/컨베이어 실패 후 fault 걸렸다가 null 되면
     해당 동작만 큐/게이트 없이 즉시 재실행
@@ -207,6 +208,7 @@ from board_config import (
     POSITION_TOLERANCE_MM, POSITION_TOLERANCE_DEG,
     TRAY_CONVEYOR_STP_1, TRAY_CONVEYOR_STP_2, TRAY_CONVEYOR_SPEED_MM_S,
     TRAY_CONVEYOR_RUN_TIME_SECTION0, TRAY_CONVEYOR_RUN_TIME_SECTION1, TRAY_CONVEYOR_RUN_TIME_SECTION2,
+    TRAY_ARM_WAIT_SEC, TRAY_ARM_POLL_SEC,
     CAMERA_INDEX_PREFERENCE, CAMERA_ROI, CAMERA_PRESENCE_MIN_RATIO, CAMERA_SETTLE_DELAY,
     CAMERA_WARMUP_FRAMES, SAVE_CAMERA_IMAGE, SHOW_CAMERA_WINDOW, CAMERA_WINDOW_MS,
     CAMERA_IMAGE_DIR, COLOR_RANGES_HSV,
@@ -652,6 +654,64 @@ def fetch_latest_cin(cnt_path, quiet=False):
 def fetch_latest_board_robot_arm():
     """cnt_robot_arm/cnt_board_robot_arm 최신 보고 - 플랫폼이 board_packed 판단에 쓰는 원본."""
     return fetch_latest_cin("cnt_robot_arm/cnt_board_robot_arm")
+
+
+# ---- [11/10] section0 전에 트레이 팔 완료 확인 (설명은 board_config.py TRAY_ARM_WAIT_SEC) ----
+def tray_arm_expected():
+    """게이트웨이(키캡·트레이)가 켜져 있고 assigned 때 빈 트레이를 올리는 설정인지 - Redis hb:keycap_tray 의 tray_arm.
+    게이트웨이가 꺼져 있거나(트레이를 손으로 올리는 시험) 예전 게이트웨이거나 Redis를 못 읽으면 False -> 안 기다림"""
+    if TRAY_ARM_WAIT_SEC <= 0:
+        return False
+    try:
+        from redis import Redis
+        raw = Redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"), decode_responses=True,
+                             socket_timeout=2, socket_connect_timeout=2).get("hb:keycap_tray")
+        return bool(raw and json.loads(raw).get("tray_arm"))
+    except Exception:
+        return False
+
+
+def _fetch_tray_arm_report():
+    """cnt_robot_arm/cnt_tray_robot_arm 최신 보고 -> (읽기 성공 여부, con 또는 None).
+    fetch_latest_cin은 "못 읽음"과 "아직 보고 없음(404)"을 구분하지 않아서 따로 둠"""
+    if not all([COSS_BASE_URL, AE_NAME, COSS_ORIGIN]):
+        return False, None
+    url = f"{COSS_BASE_URL.rstrip('/')}/{AE_NAME}/cnt_robot_arm/cnt_tray_robot_arm/la"
+    try:
+        resp = requests.get(url, headers=_mobius_headers(), timeout=REPORT_TIMEOUT)
+        if resp.status_code == 404:
+            return True, None
+        if resp.status_code != 200:
+            return False, None
+        return True, parse_con(resp.json().get("m2m:cin", {}).get("con"))
+    except Exception:
+        return False, None
+
+
+def wait_tray_arm_done(loop, order_id):
+    """트레이 팔이 이 주문의 빈 트레이를 벨트에 놓고 빠졌다는 보고(done)를 TRAY_ARM_WAIT_SEC까지 기다림.
+    반환: "done" / "failed"(트레이 팔이 실패 보고 - 끝까지 done이 안 옴) / "timeout"(이 주문 보고가 없음)
+          / "unknown"(Mobius를 한 번도 못 읽음).
+    failed를 봐도 끝까지 기다림 - fault(tray_load_failed) 해제 직후엔 예전 failed가 남아 있고 곧 다시 놓은 done이 옴"""
+    started = time.time()
+    seen, read_ok, waiting_logged = None, False, False
+    while True:
+        ok, con = _fetch_tray_arm_report()
+        read_ok = read_ok or ok
+        if con and con.get("order_id") == order_id:
+            seen = con.get("status")
+            if seen == "done":
+                log("CONV", f"{order_id}: 트레이 팔 완료 보고 확인 ({time.time() - started:.1f}초 기다림)")
+                return "done"
+        if not waiting_logged:
+            log("CONV", f"{order_id}: 트레이 팔 완료 보고를 기다림 (최대 {TRAY_ARM_WAIT_SEC:g}초) - 놓는 중에 벨트가 돌지 않게")
+            waiting_logged = True
+        if time.time() - started >= TRAY_ARM_WAIT_SEC:
+            break
+        loop.run_until_complete(asyncio.sleep(TRAY_ARM_POLL_SEC))   # 이벤트루프로 쉼 - DobotLink 연결 유지
+    if seen == "failed":
+        return "failed"
+    return "timeout" if read_ok else "unknown"
 
 
 # ============================== DobotRPC 공용 헬퍼 ==============================
@@ -1293,16 +1353,38 @@ def process_board_job(loop, arm_api, box_api, order_id, color):
     complete_job(order_id, color)
 
 
-def handle_tray_conveyor(loop, box_api, order_id, section, skip_if_done=False):
+def handle_tray_conveyor(loop, box_api, order_id, section, skip_if_done=False, wait_tray_arm=False):
     """section: "0" (keycap_dispensed -> 키캡 로봇암 앞) / "1" (keycap_packed -> 보드 로봇암 앞)
     / "2" (board_packed -> 픽업대).
     skip_if_done: status 트리거용 - 이미 done 보고한 section이면 다시 안 돌림. 처리 기록(handled_status)이
     메모리에만 있어서 재시작하면 같은 status를 처음 본 걸로 판단하는데, 이미 다음 위치에 간 트레이를
     벨트가 또 밀면 끝을 넘어가거나 엉뚱한 곳에 멈춤. failed/기록 없음이면 그대로 돌림(꺼지기 전에 못 돌린 경우).
-    fault 해제 재시도는 skip_if_done=False - 실패 후 사람이 해결한 거라 무조건 다시 돌림."""
+    fault 해제 재시도는 skip_if_done=False - 실패 후 사람이 해결한 거라 무조건 다시 돌림.
+    wait_tray_arm: [11/10] section0 status 트리거용 - 트레이 팔이 빈 트레이를 놓고 빠졌다는 보고를 확인한 뒤 돌림.
+    반환 False = 이번엔 처리하지 않음(트레이 팔 실패 - 처리 기록을 남기지 말고 다음 스냅샷에서 다시 볼 것)."""
     if skip_if_done and fetch_conveyor_section_result(order_id, section) == "done":
         log("CONV", f"{order_id}: section{section} 이미 done 보고됨 (재시작 복구) - 구동 생략")
-        return
+        return True
+    if wait_tray_arm and tray_arm_expected():
+        _hb("busy", f"{order_id} 컨베이어 section{section} - 트레이 팔 완료 대기")
+        try:
+            tray = wait_tray_arm_done(loop, order_id)
+        finally:
+            _hb("idle")
+        if tray == "failed":
+            # 트레이 팔이 failed로 보고함 -> 플랫폼 fault tray_load_failed. 벨트를 돌리면 트레이 없이 키캡이 놓임.
+            # 사람이 고치고 fault를 풀면 게이트웨이가 다시 놓고 done을 보냄 -> 그때 스냅샷에서 다시 여기로 옴
+            log("CONV", f"!! {order_id}: 트레이 팔이 실패 보고(failed) - section{section} 안 돌림 (tray_load_failed 해제 뒤 다시 봄)")
+            return False
+        if tray == "timeout":
+            # 게이트웨이는 켜져 있는데 이 주문의 트레이 보고가 없음 (트레이 팔이 멈췄거나, 게이트웨이를 주문 도중에 다시 켬).
+            # 팔이 벨트 위에 있거나 트레이가 없을 수 있어서 돌리지 않고 failed -> fault. 트레이·팔을 확인하고 풀면 그때 돌림
+            log("CONV", f"!! {order_id}: 트레이 팔 완료 보고가 {TRAY_ARM_WAIT_SEC:g}초 동안 없음 - section{section} 안 돌리고 failed 보고 "
+                        f"(벨트 위 트레이·트레이 팔 확인 후 fault 해제)")
+            report_conveyor_tray(order_id, section, "failed")
+            return True
+        if tray == "unknown":
+            log("CONV", f"!! {order_id}: Mobius에서 트레이 팔 보고를 못 읽음 - 확인 없이 section{section} 구동 (예전 동작)")
     run_time = {"0": TRAY_CONVEYOR_RUN_TIME_SECTION0, "1": TRAY_CONVEYOR_RUN_TIME_SECTION1,
                 "2": TRAY_CONVEYOR_RUN_TIME_SECTION2}[section]
     _hb("busy", f"{order_id} 컨베이어 section{section}")
@@ -1313,6 +1395,7 @@ def handle_tray_conveyor(loop, box_api, order_id, section, skip_if_done=False):
     finally:
         _hb("idle")
     report_conveyor_tray(order_id, section, "done" if success else "failed")
+    return True
 
 
 # ---- 게이트: 기다리던 주문이 pickup_reached(이후) 됐는지 확인 ----
@@ -1573,8 +1656,9 @@ def handle_snapshot(loop, arm_api, box_api, data):
 
         elif status == STATUS_CONVEYOR_0:
             if handled_status.get(order_id) != status:
-                handle_tray_conveyor(loop, box_api, order_id, "0", skip_if_done=True)
-                handled_status[order_id] = status
+                # [11/10] 트레이 팔 완료 보고를 확인하고 돌림. 트레이 팔 실패(False)면 기록하지 않음 -> fault 해제 뒤 다시
+                if handle_tray_conveyor(loop, box_api, order_id, "0", skip_if_done=True, wait_tray_arm=True) is not False:
+                    handled_status[order_id] = status
 
         elif status == STATUS_CONVEYOR_1:
             if handled_status.get(order_id) != status:
