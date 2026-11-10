@@ -1049,9 +1049,25 @@ def _show_camera_window(frame):
         log("CAM", f"창 표시 실패(헤드리스 환경일 수 있음): {e}")
 
 
+CAMERA_SWITCH_KEY = "cfg:board_camera"   # [11/11] 상태판 '카메라 확인' 버튼 - "off"면 카메라 확인 생략 (성공 처리)
+
+
+def camera_check_on():
+    """[11/11] 상태판에서 끄면 Redis cfg:board_camera = "off". 못 읽으면 켬으로 봄 (확인을 건너뛰지 않는 쪽)"""
+    try:
+        import redis as _redis
+        r = _redis.Redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
+                                  decode_responses=True, socket_timeout=2)
+        return r.get(CAMERA_SWITCH_KEY) != "off"
+    except Exception:
+        return True
+
+
 def verify_board_on_tray(expected_color):
     if REHEARSAL:
         return True, expected_color, "리허설 - 카메라 확인 생략"
+    if not camera_check_on():
+        return True, expected_color, "카메라 확인 꺼짐 (상태판) - 확인 생략, 성공 처리"
     frame = _capture_frame()
     if frame is None:
         return False, None, "카메라 프레임 획득 실패"

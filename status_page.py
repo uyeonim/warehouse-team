@@ -78,6 +78,18 @@ def _ir_states():
     return {k: v != "off" for k, v in zip(keys, values)}
 
 
+CAMERA_SWITCH_KEY = "cfg:board_camera"   # [11/11] 보드 main 카메라 확인 켜기/끄기 (board/main_board_robot_arm.py 같은 키)
+
+
+def _camera_on():
+    """[11/11] 보드 카메라 확인 켜짐 True / 꺼짐 False. 못 읽으면 True (보드 main도 못 읽으면 켬으로 봄)"""
+    try:
+        r = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=2)
+        return r.get(CAMERA_SWITCH_KEY) != "off"
+    except Exception:
+        return True
+
+
 # [11/10] 아두이노 4대 연결 확인. 펌웨어가 2분마다 자기 핑 토픽(sjuiot/warehouse/ping/{보드})에 보내는 걸
 # 같이 들음 (펌웨어 수정 없음). 듣기만 하고 아무것도 안 보내서 아두이노의 자기 핑 확인에는 영향 없음
 BOARDS = [board for board, *_ in RACK]
@@ -646,6 +658,7 @@ button:focus-visible, summary:focus-visible { outline:3px solid var(--go); outli
 .irbtn.off { background:var(--caution-wash); color:var(--ink); box-shadow:inset 0 0 0 2px var(--caution); }
 .irbtn:disabled { opacity:.5; cursor:default; }
 .cell.iroff { box-shadow:inset 0 0 0 2px var(--caution); }
+.irs.cams { grid-template-columns:minmax(0, 1fr); }   /* [11/11] 카메라 확인 버튼 1개 */
 
 /* 아래 - 확인할 것·최근 작업 | 카메라 */
 .lower { display:grid; grid-template-columns:minmax(0, 1.35fr) minmax(0, 1fr); gap:22px; align-items:start; }
@@ -812,7 +825,22 @@ JS = """
 })();
 (function(){
   // [11/10] 센서 판정 켜기/끄기 - 확인 창에서 "확인"을 눌러야 보냄
-  document.querySelectorAll('.irbtn').forEach(function(b){
+  document.querySelectorAll('.cambtn').forEach(function(b){   // [11/11] 보드 카메라 확인 켜기/끄기
+    b.addEventListener('click', function(){
+      var on = b.getAttribute('data-on') === '1';
+      clearTimeout(window.__refresh);
+      var msg = on ? '보드 카메라 확인을 끌까요?\\n끄면 보드를 놓은 뒤 카메라로 확인하지 않고 성공으로 보고합니다.'
+                   : '보드 카메라 확인을 다시 켤까요?\\n다음 보드부터 카메라로 색·놓임을 확인합니다.';
+      if (!window.confirm(msg)) { window.__refresh = setTimeout(function(){ location.reload(); }, 3000); return; }
+      b.disabled = true; b.textContent = '보내는 중';
+      fetch('/camera-set', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                             body: JSON.stringify({ on: !on }) })
+        .then(function(r){ return r.json().then(function(j){ return { ok: r.ok, j: j }; }); })
+        .then(function(x){ if (!x.ok) window.alert('못 바꿈: ' + (x.j.error || JSON.stringify(x.j))); location.reload(); })
+        .catch(function(err){ window.alert('못 바꿈: ' + err); location.reload(); });
+    });
+  });
+  document.querySelectorAll('.irbtn:not(.cambtn)').forEach(function(b){
     b.addEventListener('click', function(){
       var rail = b.getAttribute('data-rail'), on = b.getAttribute('data-on') === '1';
       clearTimeout(window.__refresh);
@@ -885,6 +913,7 @@ def _render_stock(rails):
     rail_cap, board_cap, tray_cap = totals["rail_cap"], totals["board_cap"], totals["tray"]
     irs = _ir_states()   # [11/10] 센서 판정 켜짐/꺼짐
     arduinos = _arduino_states()   # [11/10] 아두이노 연결
+    cam_on = _camera_on()   # [11/11] 보드 카메라 확인
 
     def cart_cap(key):
         return tray_cap if key == "tray" else (board_cap if key.startswith("board_") else rail_cap)
@@ -949,10 +978,15 @@ def _render_stock(rails):
             out.append("</section>")
         out.append("</div>")
         cap = board_cap if view == "cart" else totals.get("board", 0)
+        cam = ""
+        if view == "cart":   # [11/11] 보드 카메라 확인 켜기/끄기 (센서 판정 버튼과 같은 모양)
+            cam = ('<div class="irs cams"><span class="irs-t">카메라 확인 (보드 놓은 뒤)</span>'
+                   f'<button type="button" class="irbtn cambtn{"" if cam_on else " off"}" data-on="{1 if cam_on else 0}" '
+                   f'title="보드 카메라 확인 {"켜짐" if cam_on else "꺼짐"}">카메라 {"켬" if cam_on else "끔"}</button></div>')
         out.append('<div class="cards2"><section class="bd boardcard" aria-label="보드 스택"><div class="bd-head"><b>보드 스택</b>'
                    f'<span>{f"카트리지 {board_cap}개" if view == "cart" else f"전시 총량 {cap}개"}</span></div><div class="bcols">' +
                    "".join(f'<span class="cname"><span class="dot {c}"></span>{n}</span>' for c, n in RAIL_COLORS) +
-                   '</div><div class="brow">' + "".join(cell(f"board_{c}", view, cap) for c, _ in RAIL_COLORS) + "</div></section>"
+                   '</div><div class="brow">' + "".join(cell(f"board_{c}", view, cap) for c, _ in RAIL_COLORS) + "</div>" + cam + "</section>"
                    '<section class="bd boardcard traycard" aria-label="빈 트레이"><div class="bd-head"><b>빈 트레이</b>'
                    f'<span>{tray_cap}개 중</span></div><div class="bcols"><span class="cname">더미 3 × 5층</span></div>'
                    f'<div class="brow">{cell("tray", view, tray_cap)}</div></section></div>')
@@ -1034,6 +1068,8 @@ def _render(result, error):
     if ir_off:
         ir_issue = ("!!", 0, "카트리지 센서", f"{', '.join(ir_off)} 센서 판정 꺼짐 - 이 칸은 키캡이 안 나가도 성공으로 처리됨")
         warn = warn + [ir_issue]
+    if not _camera_on():   # [11/11]
+        warn = warn + [("!!", 0, "보드 카메라", "카메라 확인 꺼짐 - 보드를 놓은 뒤 확인 없이 성공으로 보고함")]
     lost = {b: a for b, (s, a) in _arduino_states(now).items() if s == "lost"}   # [11/10]
     ard_issue = None
     if lost:
@@ -1134,6 +1170,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/ir-set":   # [11/10]
             self._ir_set()
             return
+        if self.path == "/camera-set":   # [11/11]
+            self._camera_set()
+            return
         # 상태판 화면의 조작: 고장 칸 복구 -> 키캡 Flask /repair/<칸> (아두이노에 MQTT 복구 명령, 칸 상태만 되돌림)
         if self.path != "/repair":
             self.send_response(404)
@@ -1201,6 +1240,31 @@ class Handler(BaseHTTPRequestHandler):
                 code, body = 400, {"error": "요청 형식"}
             except Exception as e:
                 code, body = 502, {"error": f"키캡 Flask 응답 없음 ({type(e).__name__})"}
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _camera_set(self):
+        """[11/11] 보드 카메라 확인 켜기/끄기 -> Redis cfg:board_camera (보드 main이 보드마다 읽음, 같은 공유기에서만)"""
+        if not test_page.allowed(self):
+            code, body = 403, {"error": "같은 공유기에서만"}
+        else:
+            try:
+                length = min(int(self.headers.get("Content-Length") or 0), 1024)
+                on = json.loads(self.rfile.read(length) or b"{}").get("on")
+                if not isinstance(on, bool):
+                    code, body = 400, {"error": "on 값이 잘못됨"}
+                else:
+                    r = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=2)
+                    r.set(CAMERA_SWITCH_KEY, "on" if on else "off")
+                    code, body = 200, {"ok": True, "on": on}
+            except (ValueError, AttributeError):
+                code, body = 400, {"error": "요청 형식"}
+            except Exception as e:
+                code, body = 502, {"error": f"Redis 응답 없음 ({type(e).__name__})"}
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
