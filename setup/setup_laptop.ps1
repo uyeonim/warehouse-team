@@ -109,7 +109,7 @@ if ($desktop -notlike "$env:USERPROFILE*") { Todo "바로가기가 $desktop 에 
 
 # ---------------- 정리 ----------------
 Step '끝'
-if ($todo.Count -eq 0) { Write-Host '  자동 설정 끝. 노트북_이전_가이드.md 3장(확인)으로' -ForegroundColor Green }
+if ($todo.Count -eq 0) { Write-Host '  자동 설정 끝. check_all.bat 으로 확인하세요' -ForegroundColor Green }
 else {
     Write-Host "  남은 할 일 $($todo.Count)건 - 처리하고 이 스크립트를 다시 돌리면 됨:" -ForegroundColor Yellow
     $todo | ForEach-Object { Write-Host "   - $_" -ForegroundColor Yellow }

@@ -38,9 +38,11 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 ├─ start_all.bat / start_all.ps1   실행 스크립트 (서버 확인 → DobotLink → 로봇 프로그램 2개)
 ├─ status.bat                      상태판을 브라우저로 (바탕화면 '창고 점검')
 ├─ start_test.bat                  창고 시작 + 테스트 페이지(/test) 탭 (바탕화면 '창고 테스트')
+├─ stop_all.bat / stop_all.ps1    로봇 프로그램(게이트웨이·보드 main·가짜 Mobius) 정상 종료 (바탕화면 '창고 끄기')
+├─ fake_order.py                  Mobius가 없을 때 쓰는 가짜 Mobius (start_test.bat 에서 2번 선택하면 자동으로 뜸)
 ├─ test_page.py                    테스트 페이지 - 주문 스냅샷을 손으로 cnt_process에 올림 (같은 공유기에서만)
 ├─ reset_stock.bat                 재고·창고 풀 전부 초기화 (전시 총량표, 재부팅 필요 없음) - 평소엔 테스트 페이지 '우리 재고만 초기화' 버튼
-├─ setup_laptop.bat / setup/      새 노트북 한 번 설정 (관리자) + Redis 설정 원본 - 노트북_이전_가이드.md
+├─ setup_laptop.bat / setup/      새 노트북 한 번 설정 (관리자) + Redis 설정 원본
 ├─ service/                        서버 3개 Windows 서비스 등록/해제 (NSSM, 관리자)
 ├─ requirements.txt                공용 가상환경 (Python 3.9)
 ├─ board/                          보드 팔 + 트레이 벨트 + 보드 Flask   (.env.example)
@@ -52,7 +54,7 @@ Agentic Mini Keyboard Keyring Factory — 스마트 창고팀 (CO-SHOW 2026)
 
 ## 처음 설치 (창고 노트북 한 번)
 
-> **새 노트북으로 옮길 때는 `노트북_이전_가이드.md`** — 챙길 파일 3종 + `setup_laptop.bat`(아래 1·3·4번과 전원·바로가기를 자동으로) + 확인 순서.
+> **새 노트북에서는** `setup_laptop.bat`(관리자)이 아래 1·3·4번과 전원·바로가기를 자동으로 합니다. 끝나면 `check_all.bat`으로 확인하세요.
 > 폴더는 저장소 옆에 `redis\`(필수)·`nssm\`(선택)을 두는 구조 — 사용자 이름과 무관.
 
 1. Python 3.9 가상환경
