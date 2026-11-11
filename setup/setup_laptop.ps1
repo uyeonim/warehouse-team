@@ -96,7 +96,8 @@ $shell = New-Object -ComObject WScript.Shell
 $desktop = [Environment]::GetFolderPath('Desktop')
 foreach ($s in @(@{ Name = '창고 시작'; Bat = 'start_all.bat' },
                  @{ Name = '창고 점검'; Bat = 'status.bat' },
-                 @{ Name = '창고 테스트'; Bat = 'start_test.bat' })) {   # 리허설(start_rehearsal.bat)·재고 초기화(reset_stock.bat, 테스트 페이지 버튼으로 대신)는 바로가기 안 만듦
+                 @{ Name = '창고 테스트'; Bat = 'start_test.bat' },
+                 @{ Name = '창고 끄기'; Bat = 'stop_all.bat' })) {   # 리허설(start_rehearsal.bat)·재고 초기화(reset_stock.bat, 테스트 페이지 버튼으로 대신)는 바로가기 안 만듦
     $lnk = $shell.CreateShortcut((Join-Path $desktop "$($s.Name).lnk"))
     $lnk.TargetPath = Join-Path $Repo $s.Bat
     $lnk.WorkingDirectory = $Repo

@@ -538,7 +538,7 @@ body {
   font-size:16px; line-height:1.5; -webkit-text-size-adjust:100%;
   padding:20px max(16px, env(safe-area-inset-right, 0px)) 36px max(16px, env(safe-area-inset-left, 0px));
 }
-.wrap { max-width:1120px; margin:0 auto; display:flex; flex-direction:column; gap:22px; }
+.wrap { max-width:1600px; margin:0 auto; display:flex; flex-direction:column; gap:22px; }
 .num { font-variant-numeric:tabular-nums; }
 h2 { font-size:16px; margin:0 0 8px; font-weight:800; }
 button:focus-visible, summary:focus-visible { outline:3px solid var(--go); outline-offset:2px; }
@@ -659,6 +659,18 @@ button:focus-visible, summary:focus-visible { outline:3px solid var(--go); outli
 .irbtn:disabled { opacity:.5; cursor:default; }
 .cell.iroff { box-shadow:inset 0 0 0 2px var(--caution); }
 .irs.cams { grid-template-columns:minmax(0, 1fr); }   /* [11/11] 카메라 확인 버튼 1개 */
+/* [11/11] 서보 영점 맞추기 (아래쪽 접이식) */
+.calib { background:var(--plate); border-radius:8px; padding:10px 14px; }
+.calib-body { display:flex; flex-direction:column; gap:10px; margin-top:8px; }
+.calib-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.calib-row label { font-size:13px; font-weight:700; color:var(--soft); display:flex; align-items:center; gap:6px; }
+.calib select { font:inherit; font-size:14px; padding:4px 6px; border-radius:4px; border:1px solid var(--rule);
+                background:var(--plate-2); color:var(--ink); }
+.cbtn { font:inherit; font-size:13px; font-weight:700; border:0; border-radius:4px; padding:6px 12px; min-height:34px;
+        cursor:pointer; background:var(--go-wash); color:var(--go); }
+.cbtn.end { background:var(--caution-wash); color:var(--ink); box-shadow:inset 0 0 0 2px var(--caution); }
+.cbtn:disabled { opacity:.5; cursor:default; }
+#calibMsg.live { color:var(--ink); font-weight:700; }
 
 /* 아래 - 확인할 것·최근 작업 | 카메라 */
 .lower { display:grid; grid-template-columns:minmax(0, 1.35fr) minmax(0, 1fr); gap:22px; align-items:start; }
@@ -856,7 +868,75 @@ JS = """
     });
   });
 })();
+(function(){
+  // [11/11] 서보 영점 맞추기 - 칸을 열어 두는 동안은 자동 새로 고침을 멈추고, 60초 카운트다운을 보여 줌
+  var d = document.getElementById('calib'); if (!d) return;
+  var msg = document.getElementById('calibMsg'), tick = null, left = 0, what = '';
+  function show(t, live){ msg.textContent = t; msg.className = 'legend' + (live ? ' live' : ''); }
+  function stop(){ if (tick) { clearInterval(tick); tick = null; } }
+  function count(){
+    stop(); left = 60;
+    tick = setInterval(function(){
+      left -= 1;
+      if (left <= 0) { stop(); show(what + ' - 60초가 지나 아두이노가 자동으로 풀었습니다.'); return; }
+      show(what + ' - 자동 해제까지 ' + left + '초 (작업이 끝나면 "끝"을 누르세요)', true);
+    }, 1000);
+    show(what + ' - 자동 해제까지 60초', true);
+  }
+  d.addEventListener('toggle', function(){
+    if (d.open) clearTimeout(window.__refresh);
+    else window.__refresh = setTimeout(function(){ location.reload(); }, 3000);
+  });
+  var PN = { home: '140도(대기)', push: '40도(배출)', off: '끝(힘 빼기)' };
+  d.querySelectorAll('.cbtn').forEach(function(b){
+    b.addEventListener('click', function(){
+      var pos = b.getAttribute('data-pos'), all = b.getAttribute('data-all') === '1';
+      var sel = document.getElementById('calibRail'), bsel = document.getElementById('calibBoard');
+      var rail = all ? 'ALL' : sel.value;
+      var board = all ? bsel.value : sel.options[sel.selectedIndex].getAttribute('data-board');
+      var name = all ? board + ' 보드 전체' : rail;
+      if (pos !== 'off' && !window.confirm(name + ' 서보를 ' + PN[pos] + '로 붙잡습니다.\\n' +
+          '작업 동안 이 보드(' + board + ') 배출이 멈춥니다. 60초 안에 "끝"을 누르세요.')) return;
+      var all_b = d.querySelectorAll('.cbtn'); all_b.forEach(function(x){ x.disabled = true; });
+      fetch('/calib-set', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ rail: rail, board: board, pos: pos }) })
+        .then(function(r){ return r.json().then(function(j){ return { ok: r.ok, j: j }; }); })
+        .then(function(x){
+          all_b.forEach(function(y){ y.disabled = false; });
+          if (!x.ok) { show('영점 명령 실패: ' + (x.j.error || JSON.stringify(x.j))); return; }
+          what = name + ' ' + PN[pos];
+          if (pos === 'off') { stop(); show(name + ' 끝 명령을 보냈습니다 - 힘을 빼고 배출을 재개합니다.'); }
+          else count();
+        })
+        .catch(function(err){ all_b.forEach(function(y){ y.disabled = false; }); show('영점 명령 실패: ' + err); });
+    });
+  });
+})();
 """
+
+
+def _render_calib():
+    """[11/11] 서보 영점 맞추기 - 혼을 다시 끼울 때 서보를 140도(대기)/40도(배출)로 힘 준 채 붙잡음.
+    아두이노가 마지막 명령 60초 뒤 자동으로 풀고, 작업 중엔 그 보드 배출이 멈춤 (배출 중이면 아두이노가 거절)"""
+    opts = "".join(
+        f'<optgroup label="{b}">' + "".join(
+            f'<option value="{letter}_{c}" data-board="{b}">{letter}_{c} ({name})</option>'
+            for _, letter in KEYCAP_ROWS if _ == b for c, name in RAIL_COLORS) + '</optgroup>'
+        for b in BOARDS)
+    boards = "".join(f'<option value="{b}">{b}</option>' for b in BOARDS)
+    return (
+        '<details id="calib" class="calib"><summary>서보 영점 맞추기</summary><div class="calib-body">'
+        '<p class="legend">혼을 다시 끼울 때 서보를 힘 준 채 붙잡습니다. <b>주문이 없을 때</b> 하세요 - 작업 동안 그 보드 배출이 멈추고, '
+        '배출 중인 보드는 아두이노가 거절합니다. 마지막 명령 60초 뒤 자동으로 풀립니다 (재고·칸 상태는 안 바뀜). '
+        '이 칸을 여는 동안은 화면이 자동으로 새로 고쳐지지 않습니다.</p>'
+        f'<div class="calib-row"><label>칸 <select id="calibRail">{opts}</select></label>'
+        '<button type="button" class="cbtn" data-pos="home">140° 대기</button>'
+        '<button type="button" class="cbtn" data-pos="push">40° 배출</button>'
+        '<button type="button" class="cbtn end" data-pos="off">끝 (힘 빼기)</button></div>'
+        f'<div class="calib-row"><label>보드 전체 <select id="calibBoard">{boards}</select></label>'
+        '<button type="button" class="cbtn" data-all="1" data-pos="home">전체 140°</button>'
+        '<button type="button" class="cbtn end" data-all="1" data-pos="off">전체 끝</button></div>'
+        '<p id="calibMsg" class="legend" aria-live="polite"></p></div></details>')
 
 
 def _render_line(facts, rails, process, now):
@@ -1123,9 +1203,10 @@ def _render(result, error):
     for _, _, where, msg in ok:
         parts.append(f'<li><span class="where">{e(_section_short(where))}</span>{e(msg)}</li>')
     parts.append('</ul></details>')
+    parts.append(_render_calib())
     err = f" 마지막 점검에서 오류가 났습니다: {e(error)}" if error else ""
     parts.append(f'<footer>{PAGE_REFRESH_SEC}초마다 새로 고칩니다. 조작은 원격 데스크톱으로, 위험하면 로봇 전원 스위치를 끕니다.'
-                 f' 이 화면에서 할 수 있는 조작은 고장 칸 복구, 재고 숫자 맞추기, 센서 판정 켜기/끄기뿐입니다.{err}</footer>')
+                 f' 이 화면에서 할 수 있는 조작은 고장 칸 복구, 재고 숫자 맞추기, 센서 판정 켜기/끄기, 서보 영점 맞추기뿐입니다.{err}</footer>')
     parts.append(f'</main><script>{JS}</script></body></html>')
     return "".join(parts)
 
@@ -1172,6 +1253,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/camera-set":   # [11/11]
             self._camera_set()
+            return
+        if self.path == "/calib-set":   # [11/11] 서보 영점 맞추기
+            self._calib_set()
             return
         # 상태판 화면의 조작: 고장 칸 복구 -> 키캡 Flask /repair/<칸> (아두이노에 MQTT 복구 명령, 칸 상태만 되돌림)
         if self.path != "/repair":
@@ -1235,6 +1319,38 @@ class Handler(BaseHTTPRequestHandler):
                     code, body = 400, {"error": "칸 또는 on 값이 잘못됨"}
                 else:
                     r = requests.post(f"{KEYCAP_FLASK_URL}/ir/{rail}", json={"on": on}, timeout=8)
+                    code, body = r.status_code, r.json()
+            except (ValueError, AttributeError):
+                code, body = 400, {"error": "요청 형식"}
+            except Exception as e:
+                code, body = 502, {"error": f"키캡 Flask 응답 없음 ({type(e).__name__})"}
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _calib_set(self):
+        """[11/11] 서보 영점 맞추기 -> 키캡 Flask /calib/<칸 또는 ALL> (같은 공유기에서만).
+        body {rail: "E_r" | "ALL", board: "EI"(ALL일 때), pos: "home"|"push"|"off"}"""
+        if not test_page.allowed(self):
+            code, body = 403, {"error": "같은 공유기에서만"}
+        else:
+            try:
+                length = min(int(self.headers.get("Content-Length") or 0), 1024)
+                req = json.loads(self.rfile.read(length) or b"{}")
+                rail, board, pos = req.get("rail"), req.get("board"), req.get("pos")
+                valid = {f"{letter}_{c}" for _, letter in KEYCAP_ROWS for c, _ in RAIL_COLORS}
+                if pos not in ("home", "push", "off"):
+                    code, body = 400, {"error": "pos는 home / push / off"}
+                elif rail == "ALL" and board not in BOARDS:
+                    code, body = 400, {"error": "보드(EI/NS/TF/PJ)가 필요함"}
+                elif rail != "ALL" and rail not in valid:
+                    code, body = 400, {"error": "없는 칸"}
+                else:
+                    payload = {"pos": pos, **({"board": board} if rail == "ALL" else {})}
+                    r = requests.post(f"{KEYCAP_FLASK_URL}/calib/{rail}", json=payload, timeout=8)
                     code, body = r.status_code, r.json()
             except (ValueError, AttributeError):
                 code, body = 400, {"error": "요청 형식"}

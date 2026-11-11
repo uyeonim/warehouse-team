@@ -1014,6 +1014,30 @@ def repair_rail(rail):
     return jsonify({"result": "sent" if ok else "mqtt_fail", "cmd": cmd}), (200 if ok else 502)
 
 
+@app.route("/calib/<rail>", methods=["POST"])
+def calib_rail(rail):
+    """서보 영점 맞추기 (펌웨어 firmware_1111~) - body {"pos": "home"|"push"|"off"}.
+    home=140도 / push=40도로 힘 준 채 붙잡음, off=힘 빼고 그 보드 배출 재개 (마지막 명령 60초 뒤 자동 off).
+    rail = "E_r" 등 한 칸, 또는 "ALL" + board(EI/NS/TF/PJ).
+    retain 없이 보냄 (retain이면 아두이노가 재접속할 때마다 서보가 다시 움직임). 재고·칸 상태·Mobius는 안 건드림"""
+    data = request.get_json(force=True, silent=True) or {}
+    pos = data.get("pos")
+    if pos not in ("home", "push", "off"):
+        return jsonify({"error": "pos는 home / push / off"}), 400
+    if rail == "ALL":
+        board = request.args.get("board") or data.get("board")
+        if board not in BOARD_LETTERS:
+            return jsonify({"error": f"ALL은 board({'/'.join(BOARD_LETTERS)})가 필요함"}), 400
+        cmd = {"cmd": "CALIB", "rail": "ALL", "board": board, "pos": pos}
+    elif rail in _all_keycap_letter_colors():
+        cmd = {"cmd": "CALIB", "rail": rail, "pos": pos}
+    else:
+        return jsonify({"error": f"없는 칸: {rail}"}), 400
+    ok = publish(REPAIR_TOPIC, json.dumps(cmd), retain=False)
+    logger.info(f"[calib] 영점 명령 {'전송' if ok else '실패'}: {cmd}")
+    return jsonify({"result": "sent" if ok else "mqtt_fail", "cmd": cmd}), (200 if ok else 502)
+
+
 # ============================================================
 # [11/10] 레일별 IR 센서 판정 켜기/끄기 (상태판 -> 여기 -> MQTT retain -> 아두이노, 재부팅 없이)
 #  - Redis ir:{칸} = "on"/"off" (키가 없으면 켬)

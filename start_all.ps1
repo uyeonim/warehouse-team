@@ -12,7 +12,11 @@
 #   보고는 실제로 나감. 실물 없이 전시장 통신 전체 시험용. DobotLink 안 켬
 # -StatusOnly (status.bat, 바탕화면 '창고 점검'): 상태판만 띄우고 브라우저로 열기
 # -Test (start_test.bat, 바탕화면 '창고 테스트'): 창고 시작과 같고, 브라우저에 테스트 페이지(/test) 탭도 같이 열기
-param([switch]$Rehearsal, [switch]$StatusOnly, [switch]$Test)
+# -Fake (start_test.bat 에서 "2) 가짜 Mobius" 고르면): Mobius 가 꺼져 있을 때 - fake_order.py(가짜 Mobius + 주문 메뉴)를 먼저 띄우고
+#   보드 main·게이트웨이가 그쪽(127.0.0.1:7579)을 보게 함. 환경 변수는 이 창에서 띄운 창에만 적용되고 .env 는 안 건드림
+#   (게이트웨이는 .env.local 을 덮어쓰며 읽어서 환경 변수로는 안 먹음 -> MOBIUS_URL 만 바꾼 .env.fake 를 만들어 --env 로 넘김)
+#   이미 실제 모드로 켜져 있는 main·게이트웨이가 있으면 시작하지 않음 (창고 끄기 먼저)
+param([switch]$Rehearsal, [switch]$StatusOnly, [switch]$Test, [switch]$Fake)
 $ErrorActionPreference = 'Stop'
 $Root       = $PSScriptRoot                                  # 저장소 루트
 $Python     = Join-Path $Root 'venv\Scripts\python.exe'       # 공용 가상환경 (Python 3.9, requirements.txt)
@@ -27,6 +31,7 @@ $DobotLink  = Join-Path $env:LOCALAPPDATA 'Programs\DobotLink\DobotLink.exe'
 # 리허설 스위치는 환경 변수로 로봇 프로그램 창에 물려줌 (새 창은 이 창의 환경 변수를 이어받음)
 if ($Rehearsal) { $env:WAREHOUSE_REHEARSAL = '1'; $Tag = '[리허설] ' }
 else { Remove-Item Env:WAREHOUSE_REHEARSAL -ErrorAction SilentlyContinue; $Tag = '' }
+if ($Fake) { $Tag = "$Tag[가짜Mobius] " }
 
 function Step($msg) { Write-Host "[start_all] $msg" }
 function Fail($msg) {
@@ -83,21 +88,70 @@ if ($StatusOnly) {
     exit 0
 }
 
+# ---------------- 가짜 Mobius 모드: 보드 Flask 를 가짜 쪽으로 다시 띄움 ----------------
+# 로봇 프로그램의 보고(done/failed)는 보드 Flask(5000)가 받아서 Mobius 로 올림. Flask 가 진짜 Mobius 를 보고 있으면
+# 보고가 502 로 실패하고(게이트웨이가 같은 보고를 계속 재시도) 다음 단계로 못 넘어감 -> Flask 도 가짜 Mobius 를 보게 함.
+# Flask 는 창으로 띄운 것만 다시 띄울 수 있음 (Windows 서비스면 관리자 권한이 필요해서 안 건드림). 재고는 Redis 에 있어서 안 사라짐
+$FakeUrl = 'http://127.0.0.1:7579'
+$FakeFlaskEnv = "`$env:COSS_BASE_URL='$FakeUrl/Mobius'; `$env:AE_NAME='ae_fake'; "
+if ($Fake) {
+    $already = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
+        Where-Object { $_.CommandLine -match 'local_gateway\.py' }
+    if ((Test-Port 5001) -or $already) {
+        Fail '보드 main 또는 게이트웨이가 이미 켜져 있음 (실제 Mobius 를 보는 중일 수 있음) - 바탕화면 "창고 끄기" 후 다시 시작'
+    }
+    # 키캡 Flask(5002)도 같음: 주문 알림을 받아 MQTT 로 아두이노(카트리지 배출)에 넘기고, 아두이노 보고를 Mobius 로 올림
+    foreach ($f in @(@{ Port = 5000; Svc = 'warehouse-board-flask'; Label = '보드 Flask' },
+                     @{ Port = 5002; Svc = 'warehouse-keycap-flask'; Label = '키캡 Flask' })) {
+        if (-not (Test-Port $f.Port)) { continue }
+        if (Get-Service $f.Svc -ErrorAction SilentlyContinue) {
+            Write-Host "[start_all] $($f.Label) 가 서비스라 가짜 Mobius 로 못 돌림 - 보고·아두이노 배출이 안 될 수 있음" -ForegroundColor Yellow
+            continue
+        }
+        $owners = @(Get-NetTCPConnection -LocalPort $f.Port -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
+        Step "$($f.Label)(PID $($owners -join ',')) 를 가짜 Mobius 로 다시 띄움"
+        foreach ($o in $owners) { Stop-Process -Id $o -Force -ErrorAction SilentlyContinue }
+        for ($i = 0; $i -lt 20 -and (Test-Port $f.Port); $i++) { Start-Sleep -Milliseconds 500 }
+    }
+}
+
 # ---------------- 서버 ----------------
 Ensure-Server 'Redis' 6379 'warehouse-redis' {
     if (-not (Test-Path $RedisConf)) { Fail "Redis 설정 파일 없음: $RedisConf" }
     Start-Window 'Redis' $RedisDir "& '$(Join-Path $RedisDir 'redis-server.exe')' '$RedisConf'"
 }
 Ensure-Server '보드 Flask' 5000 'warehouse-board-flask' {
-    Start-Window 'Flask' $BoardDir "& '$Python' app.py"
+    $envPrefix = if ($Fake) { $FakeFlaskEnv } else { '' }   # 가짜 Mobius 모드면 보고를 가짜 쪽으로
+    Start-Window 'Flask' $BoardDir "${envPrefix}& '$Python' app.py"
 }
 Ensure-Server '키캡 Flask' 5002 'warehouse-keycap-flask' {
     if (-not (Test-Path $Waitress)) { Fail "키캡 Flask 실행 파일 없음: $Waitress" }
-    Start-Window '키캡 Flask' $KeycapDir "& '$Waitress' --listen=0.0.0.0:5002 app:app"
+    $envPrefix = if ($Fake) { $FakeFlaskEnv } else { '' }   # 가짜 Mobius 모드면 주문 읽기·아두이노 보고를 가짜 쪽으로
+    Start-Window '키캡 Flask' $KeycapDir "${envPrefix}& '$Waitress' --listen=0.0.0.0:5002 app:app"
 }
 # 상태판 (읽기 전용 웹, http://<노트북 IP>:5080) - 로봇 안 움직임
 Ensure-Server '상태판' 5080 'warehouse-status-page' {
     Start-Window '상태판' $Root "& '$Python' status_page.py"
+}
+
+# ---------------- 가짜 Mobius (-Fake) ----------------
+if ($Fake) {
+    if (-not (Test-Port 7579)) {
+        Start-Window '가짜 Mobius 주문' $Root "& '$Python' fake_order.py"
+        if (-not (Wait-Port 7579 15)) { Fail '가짜 Mobius(7579)가 안 뜸 - "가짜 Mobius 주문" 탭의 에러 확인' }
+    }
+    Step "가짜 Mobius 실행 중 ($FakeUrl) - 주문은 그 탭의 메뉴에서 (1 새 주문 -> s 보내기)"
+    # 보드 main: 환경 변수가 .env 보다 우선 (load_dotenv 가 덮어쓰지 않음)
+    $env:COSS_BASE_URL = $FakeUrl; $env:AE_NAME = 'Mobius/ae_fake'; $env:ORIGIN = 'fake'
+    # 게이트웨이: .env.local 을 복사해 MOBIUS_URL 만 바꿈 (.env.* 는 git 에서 제외돼 있음)
+    $GatewayEnvFake = Join-Path $GatewayDir '.env.fake'
+    if (Test-Path $GatewayEnv) {
+        $lines = [IO.File]::ReadAllLines($GatewayEnv, [Text.Encoding]::UTF8) |
+            ForEach-Object { if ($_ -match '^\s*MOBIUS_URL\s*=') { "MOBIUS_URL=$FakeUrl" } else { $_ } }
+        [IO.File]::WriteAllLines($GatewayEnvFake, $lines, (New-Object Text.UTF8Encoding($false)))
+        $GatewayEnv = $GatewayEnvFake
+    }
+    Write-Host '[start_all] 가짜 Mobius 모드 - 실제 플랫폼 주문은 받지 않음. 보고는 보드 Flask 로만 나감' -ForegroundColor Yellow
 }
 
 # ---------------- 로봇 ----------------
@@ -118,7 +172,9 @@ if (-not $Rehearsal) { Step '주의: DobotLab 창에서 로봇을 연결하지 �
 if (Test-Port 5001) {
     Step '보드 main 이미 실행 중 (5001) - 건너뜀 (리허설/실제 모드는 그 창 제목으로 확인)'
 } else {
-    Start-Window "${Tag}main" $BoardDir "& '$Python' main_board_robot_arm.py"
+    # 가짜 Mobius 모드는 환경 변수를 명령에 직접 넣음 (wt 가 기존 창에 탭을 붙이면 이 창의 환경 변수를 못 받을 수 있어서)
+    $envPrefix = if ($Fake) { "`$env:COSS_BASE_URL='$FakeUrl'; `$env:AE_NAME='Mobius/ae_fake'; `$env:ORIGIN='fake'; " } else { '' }
+    Start-Window "${Tag}main" $BoardDir "${envPrefix}& '$Python' main_board_robot_arm.py"
     if ($Rehearsal) { Step "${Tag}보드 main 실행됨" } else { Step '보드 main 실행됨 - 팔이 HOME으로 이동함' }
 }
 
@@ -130,10 +186,11 @@ if ($gatewayRunning) {
 } elseif (-not (Test-Path $GatewayEnv)) {
     Step "키캡·트레이 게이트웨이 준비 안 됨(.env.local 없음: $GatewayDir) - 건너뜀"
 } else {
-    Start-Window "${Tag}키캡·트레이 게이트웨이" $GatewayDir "& '$Python' local_gateway.py --env .env.local"
+    $gwEnvName = Split-Path $GatewayEnv -Leaf   # 가짜 Mobius 모드면 .env.fake
+    Start-Window "${Tag}키캡·트레이 게이트웨이" $GatewayDir "& '$Python' local_gateway.py --env $gwEnvName"
     Step "${Tag}키캡·트레이 게이트웨이 실행됨"
 }
 Step '로그: warehouse 터미널 창의 각 탭 / board\logs, keycap_tray\logs 폴더 / logs 폴더(서비스)'
 Start-Process $StatusUrl   # 상태판을 브라우저로
-if ($Test) { Start-Process "$StatusUrl/test" }   # 테스트 페이지 - 주문 스냅샷을 손으로 올림 (로봇이 실제로 움직임)
+if ($Test) { Start-Process "$StatusUrl/test" }   # 테스트 페이지 - 주문 스냅샷을 손으로 올림 (로봇이 실제로 움직임). 가짜 Mobius 가 떠 있으면 test_page.py 가 알아서 그쪽으로 올림
 Start-Sleep -Seconds 5

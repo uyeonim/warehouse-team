@@ -29,13 +29,38 @@ MAX_BODY = 64 * 1024
 KEYCAP_FLASK_URL = "http://127.0.0.1:5002"   # 우리 재고만 초기화 -> /reset/hard
 
 
+FAKE_MOBIUS = ("127.0.0.1", 7579)   # fake_order.py (start_test.bat 2번 "가짜 Mobius") 가 떠 있으면 주문을 거기로 올림
+_real_url = None
+
+
+def is_fake():
+    """가짜 Mobius 가 떠 있는가 (요청마다 확인 - 켜고 끄는 대로 따라감)"""
+    import socket
+    try:
+        with socket.create_connection(FAKE_MOBIUS, timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
 def comm():
-    """process_comm_test 모듈 (처음 쓸 때 import - board/.env를 읽고, 비어 있으면 RuntimeError)"""
-    global _comm
+    """process_comm_test 모듈 (처음 쓸 때 import - board/.env를 읽고, 비어 있으면 RuntimeError).
+    가짜 Mobius 가 떠 있으면 읽기·보내기 주소를 그쪽으로 돌림 (없으면 원래 .env 의 Mobius)"""
+    global _comm, _real_url
     if _comm is None:
         import process_comm_test
         _comm = process_comm_test
+        _real_url = process_comm_test.CNT_PROCESS_URL
+    _comm.CNT_PROCESS_URL = f"http://{FAKE_MOBIUS[0]}:{FAKE_MOBIUS[1]}/Mobius/ae_fake/cnt_process" if is_fake() else _real_url
     return _comm
+
+
+def latest_snapshot(m):
+    """최신 스냅샷. 가짜 Mobius 는 주문이 하나도 안 올라온 처음엔 비어 있어서 seq 0 짜리로 대신함 (서버엔 안 올림)"""
+    con = m.fetch_latest()
+    if con is None and is_fake():
+        return {"seq": 0, "orders": {}}
+    return con
 
 
 def allowed(handler):
@@ -79,7 +104,7 @@ def handle(handler, method):
     if method == "GET" and path in ("/test", "/test/"):
         _reply(handler, 200, PAGE, "text/html; charset=utf-8")
     elif method == "GET" and path == "/test/latest":
-        con = m.fetch_latest()
+        con = latest_snapshot(m)
         if con is None:
             _reply(handler, 502, {"error": "플랫폼 서버(Mobius)에서 최신 주문을 못 읽었습니다. 네트워크를 확인하세요."})
         else:
@@ -143,7 +168,7 @@ def _send(handler, m):
     except ValueError:
         _reply(handler, 400, {"error": "요청 형식이 잘못됨"})
         return
-    latest = m.fetch_latest()
+    latest = latest_snapshot(m)
     if latest is None:   # 최신 seq를 모르면 안 보냄 (seq가 꼬이면 플랫폼·키캡 쪽이 무시하거나 중복 처리)
         _reply(handler, 502, {"error": "플랫폼 서버에서 최신 주문을 못 읽어서 보내지 않았습니다."})
         return
