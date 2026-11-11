@@ -690,7 +690,7 @@ def _fetch_tray_arm_report():
 
 def wait_tray_arm_done(loop, order_id):
     """트레이 팔이 이 주문의 빈 트레이를 벨트에 놓고 빠졌다는 보고(done)를 TRAY_ARM_WAIT_SEC까지 기다림.
-    반환: "done" / "failed"(트레이 팔이 실패 보고 - 끝까지 done이 안 옴) / "timeout"(이 주문 보고가 없음)
+    반환: "done" / "failed"(트레이 팔이 실패 보고 - 끝까지 done이 안 옴 -> 벨트 안 돌림) / "timeout"(이 주문 보고가 없음 -> 돌림)
           / "unknown"(Mobius를 한 번도 못 읽음).
     failed를 봐도 끝까지 기다림 - fault(tray_load_failed) 해제 직후엔 예전 failed가 남아 있고 곧 다시 놓은 done이 옴"""
     started = time.time()
@@ -1377,12 +1377,12 @@ def handle_tray_conveyor(loop, box_api, order_id, section, skip_if_done=False, w
             log("CONV", f"!! {order_id}: 트레이 팔이 실패 보고(failed) - section{section} 안 돌림 (tray_load_failed 해제 뒤 다시 봄)")
             return False
         if tray == "timeout":
-            # 게이트웨이는 켜져 있는데 이 주문의 트레이 보고가 없음 (트레이 팔이 멈췄거나, 게이트웨이를 주문 도중에 다시 켬).
-            # 팔이 벨트 위에 있거나 트레이가 없을 수 있어서 돌리지 않고 failed -> fault. 트레이·팔을 확인하고 풀면 그때 돌림
-            log("CONV", f"!! {order_id}: 트레이 팔 완료 보고가 {TRAY_ARM_WAIT_SEC:g}초 동안 없음 - section{section} 안 돌리고 failed 보고 "
-                        f"(벨트 위 트레이·트레이 팔 확인 후 fault 해제)")
-            report_conveyor_tray(order_id, section, "failed")
-            return True
+            # 게이트웨이는 켜져 있는데 이 주문의 트레이 보고가 없음 (게이트웨이를 주문 도중에 다시 켰거나 멈춤).
+            # 그냥 돌림(예전 동작). 안 돌리면 트레이가 벨트에 놓여 있어도 투입 자리에 남고, 플랫폼은 키캡 벨트 보고만으로
+            # keycap_reached 로 넘겨서 키캡이 빈 자리에 놓임. section0 failed 를 보고해도 플랫폼이 fault 로 받는지 확인 안 됨
+            # (10/8 기록: section0 failed 에 fault 가 안 붙음). 막는 건 트레이 팔이 failed 라고 분명히 보고했을 때뿐
+            log("CONV", f"!! {order_id}: 트레이 팔 완료 보고가 {TRAY_ARM_WAIT_SEC:g}초 동안 없음 - 확인 없이 section{section} 구동 "
+                        f"(벨트 위 트레이·트레이 팔·게이트웨이 탭 확인)")
         if tray == "unknown":
             log("CONV", f"!! {order_id}: Mobius에서 트레이 팔 보고를 못 읽음 - 확인 없이 section{section} 구동 (예전 동작)")
     run_time = {"0": TRAY_CONVEYOR_RUN_TIME_SECTION0, "1": TRAY_CONVEYOR_RUN_TIME_SECTION1,
