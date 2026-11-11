@@ -76,7 +76,7 @@ else:
 REPORT_ROOT = os.environ.get("REPORT_ROOT", "").strip("/")
 REACT_ASSIGNED = _flag("REACT_ASSIGNED")
 # [11/11] 트레이 실패 fault 가 풀린 뒤의 처리 (다시 올리기 / 놓았으면 개수 빼기). 0 이면 예전 동작 그대로
-#   (.env.local TRAY_FAULT_FIX, 기본 1. dobot_control.py 도 같은 값을 읽음. 설명: 수정_요약.md)
+#   (.env.local TRAY_FAULT_FIX, 기본 1. dobot_control.py 도 같은 값을 읽음. 설명: keycap_tray/참고사항.md)
 TRAY_FAULT_FIX = _flag("TRAY_FAULT_FIX", "1")
 FAKE_UNBUILT = _flag("FAKE_UNBUILT", "0" if PROFILE == "local" else "1")  # 아래 장비별 설정을 비워두면 이 값을 따름
 FAKE_TRAY_CONVEYOR = _flag("FAKE_TRAY_CONVEYOR", "1" if FAKE_UNBUILT else "0")
