@@ -16,6 +16,8 @@ pose_tray.json
                                    (3) 맨 위층 좌표 [x, y, z, r] 하나 (아래층은 pitch 만큼 z 만 낮게 - 예전 방식)
   "pitch": 28.9                    한 층 높이(mm). 좌표가 하나뿐인 더미의 아래층 z 계산용
                                    (2026-11-08 실측: 5층 z 104.6 ~ 1층 z -11 → 115.6 / 4 = 28.9)
+  "place_r": {"1": R, "2": R, "3": R}   (11/12) 벨트에 놓을 때의 R 을 더미(세트)별로. 그 더미의 모든 층이 같은 R.
+                                   없는 더미는 place_slots[1] 의 R 을 씀. tray_R_tunning.py 가 더미별로 맞춰서 저장
   "travel_z": 125                  JUMP 로 옮길 때 이 높이까지 올라가서 이동 (집으러 갈 때·들고 갈 때·빠질 때 모두)
                                    기본 20mm 만 들면 벨트(낮은 곳)에서 출발할 때 5층 트레이 옆면을 침.
                                    150 은 329mm 벨트 자리 쪽에서 0x12 로 거부, 125 는 성공 (2026-11-08)
@@ -70,8 +72,24 @@ def _load_layout():
     return stacks
 
 
+def _load_place_r():
+    """{더미 번호(문자열): 놓는 R} - 파일에 place_r 이 없으면 빈 dict"""
+    try:
+        with open(POSE_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+        return {str(k): float(v) for k, v in (saved.get("place_r") or {}).items()}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
 STACKS = _load_layout()
 TOTAL = len(STACKS) * FLOORS
+PLACE_R = _load_place_r()
+
+
+def place_r(stack_no, default):
+    """그 더미에서 집은 트레이를 벨트에 놓을 때의 R (더미별로 따로 맞춘 값이 없으면 default)"""
+    return PLACE_R.get(str(stack_no), default)
 
 
 def travel_z():

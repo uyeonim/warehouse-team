@@ -196,6 +196,16 @@ for _name, _cfg in {**SETS, "tray": TRAY}.items():  # 실물에서 찍은 좌표
 if tray_stock.enabled() and not TRAY["pickup_slots"][1]:  # 더미만 찍었어도 트레이 팔을 쓰는 것으로 봄
     TRAY["pickup_slots"][1] = tray_stock.STACKS[-1][0]   # 처음 집는 곳 = 더미 맨 뒤(3) 맨 위 (11/12 순서)
 TRAY["travel_z"] = tray_stock.travel_z()
+_PLACE_BASE = TRAY["place_slots"][1]   # pose_tray.json 의 놓는 곳 (R 은 더미별로 tray_stock.place_r 이 바꿔 씀)
+
+
+def apply_place_r(stack_no):
+    """집을 더미가 정해지면 벨트에 놓는 R 도 그 더미 것으로 (x·y·z 는 그대로). 더미별 값이 없으면 기본 R"""
+    if not _PLACE_BASE:
+        return
+    r = tray_stock.place_r(stack_no, _PLACE_BASE[3])
+    TRAY["place_slots"][1] = (_PLACE_BASE[0], _PLACE_BASE[1], _PLACE_BASE[2], r)
+    return r
 
 
 def log(tag, msg):
@@ -821,7 +831,9 @@ def run_tray_arm(order_id):
         if count <= 0:
             raise tray_stock.TrayEmpty(tray_stock.describe(count))
         stack_no, floor, TRAY["pickup_slots"][1] = tray_stock.pick_pose(count)
-        log(TRAY["port"], f"빈 트레이 {count}/{tray_stock.TOTAL} 남음 → 더미{stack_no} {floor}층 집기")
+        place_r = apply_place_r(stack_no)
+        log(TRAY["port"], f"빈 트레이 {count}/{tray_stock.TOTAL} 남음 → 더미{stack_no} {floor}층 집기"
+                          + (f" (놓는 R {place_r:.1f})" if place_r is not None else ""))
     if not (TRAY["pickup_slots"][1] and TRAY["place_slots"][1]):
         log(TRAY["port"], "트레이 좌표가 아직 없음 (pose_tray.json) → 실패 처리")
         return False

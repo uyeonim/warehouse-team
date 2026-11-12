@@ -134,17 +134,20 @@ def _stock_reset(handler):
         _reply(handler, 502, {"error": f"키캡 Flask 오류 {r.status_code}: {body}"})
 
 
-def _check_order(m, oid, o):
-    """주문 하나 검사 + fault_section 채우기. 문제가 있으면 문구, 없으면 None"""
+def _check_order(m, oid, o, partial=False):
+    """주문 하나 검사 + fault_section 채우기. 문제가 있으면 문구, 없으면 None
+    partial=True: 플랫폼이 이미 올린 주문인데 보드·키캡 정보가 처음부터 없는 것 (플랫폼 쪽 시험 주문 등).
+      이 페이지에서는 단계·fault 만 고치므로 그것만 검사 - 안 그러면 이런 주문이 목록에 하나만 있어도 모든 보내기가 막힘 (11/12)"""
     if not isinstance(oid, str) or not oid or not isinstance(o, dict):
         return "주문 형식이 잘못됨"
-    if o.get("board") not in m.BOARD_CODE:
-        return f"{oid}: 보드 색이 잘못됨"
-    keycap, colors = o.get("keycap"), o.get("colors")
-    if not (isinstance(keycap, str) and len(keycap) == 4 and all(keycap[i] in m.KEYCAP_AXES[i] for i in range(4))):
-        return f"{oid}: 키캡은 EI/SN/TF/JP 순서 4글자"
-    if not (isinstance(colors, list) and len(colors) == 4 and all(c in m.CODE_BOARD for c in colors)):
-        return f"{oid}: 칸 색은 r/y/g/b 4개"
+    if not partial:
+        if o.get("board") not in m.BOARD_CODE:
+            return f"{oid}: 보드 색이 잘못됨"
+        keycap, colors = o.get("keycap"), o.get("colors")
+        if not (isinstance(keycap, str) and len(keycap) == 4 and all(keycap[i] in m.KEYCAP_AXES[i] for i in range(4))):
+            return f"{oid}: 키캡은 EI/SN/TF/JP 순서 4글자"
+        if not (isinstance(colors, list) and len(colors) == 4 and all(c in m.CODE_BOARD for c in colors)):
+            return f"{oid}: 칸 색은 r/y/g/b 4개"
     if o.get("status") not in m.STATUSES:
         return f"{oid}: 없는 단계 {o.get('status')}"
     fault = o.get("fault")
@@ -186,8 +189,11 @@ def _send(handler, m):
         if not isinstance(orders, dict) or not orders:
             _reply(handler, 400, {"error": "주문이 없습니다. 빈 목록은 하드리셋 버튼으로만 보냅니다."})
             return
+        existing = latest.get("orders") if isinstance(latest.get("orders"), dict) else {}
         for oid, o in orders.items():
-            problem = _check_order(m, oid, o)
+            was = existing.get(oid)
+            partial = isinstance(was, dict) and was.get("board") not in m.BOARD_CODE   # 플랫폼이 보드 정보 없이 올린 기존 주문
+            problem = _check_order(m, oid, o, partial=partial)
             if problem:
                 _reply(handler, 400, {"error": problem})
                 return
