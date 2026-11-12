@@ -3,14 +3,17 @@
 빈 트레이 더미 재고 — 남은 개수로 다음에 집을 더미·층을 계산 (board/board_config.py compute_pick_pose 와 같은 방식)
 
 배치: 더미 여러 개(pose_tray.json "stacks", 1·2·3 순서) × 한 더미 FLOORS(5)층
-집는 순서: 층별로 — 맨 위층을 더미 1→2→3 으로 하나씩 걷고, 다 걷으면 다음 층
-  예) 15개(3더미×5층): 15 → 더미1 5층, 14 → 더미2 5층, 13 → 더미3 5층, 12 → 더미1 4층 ... 1 → 더미3 1층
+집는 순서: 층별로 — 맨 위층을 더미 3→2→1 로 하나씩 걷고, 다 걷으면 다음 층 (11/12 변경: 더미3부터 - 다른 더미에 안 부딪히게)
+  예) 15개(3더미×5층): 15 → 더미3 5층, 14 → 더미2 5층, 13 → 더미1 5층, 12 → 더미3 4층 ... 1 → 더미1 1층
   그래서 사람이 채울 때도 이 순서대로 남아 있어야 함 (중간에 빼거나 끼우면 개수를 다시 맞출 것)
 그리퍼에 센서가 없어서 "집기 자리 도착 + 그리퍼 명령 응답 + 벨트에 놓고 빠짐" 이면 하나 쓴 것으로 셈
 
 pose_tray.json
-  "stacks": [더미1, 더미2, 더미3]   더미 = 맨 위층 좌표 [x, y, z, r] 하나
-                                   또는 위층부터 층마다 찍은 좌표 [[x,y,z,r] × FLOORS] (찍은 값 그대로 씀)
+  "stacks": [더미1, 더미2, 더미3]   더미 = 아래 셋 중 하나
+                                   (1) [[5층 x,y,z,r], [4층 x,y,z,r]] — 두 점의 차이(4층-5층)를 층마다 더해서 3·2·1층 계산 (11/12 방식,
+                                       더미마다 x·y·z·r 차이를 따로 씀 - 기울어지거나 높이가 달라도 반영됨)
+                                   (2) 위층부터 층마다 찍은 좌표 [[x,y,z,r] × FLOORS] (찍은 값 그대로 씀)
+                                   (3) 맨 위층 좌표 [x, y, z, r] 하나 (아래층은 pitch 만큼 z 만 낮게 - 예전 방식)
   "pitch": 28.9                    한 층 높이(mm). 좌표가 하나뿐인 더미의 아래층 z 계산용
                                    (2026-11-08 실측: 5층 z 104.6 ~ 1층 z -11 → 115.6 / 4 = 28.9)
   "travel_z": 125                  JUMP 로 옮길 때 이 높이까지 올라가서 이동 (집으러 갈 때·들고 갈 때·빠질 때 모두)
@@ -51,10 +54,16 @@ def _load_layout():
     pitch = float(saved.get("pitch", DEFAULT_PITCH))
     stacks = []
     for stack in saved.get("stacks") or []:
-        if stack and isinstance(stack[0], (list, tuple)):  # 층마다 찍은 좌표
-            if len(stack) != FLOORS:
-                raise ValueError(f"pose_tray.json stacks: 층마다 찍으려면 {FLOORS}개 (지금 {len(stack)}개)")
-            stacks.append([tuple(map(float, p)) for p in stack])
+        if stack and isinstance(stack[0], (list, tuple)):
+            pts = [tuple(map(float, p)) for p in stack]
+            if len(pts) == 2:  # 5층·4층 두 점 -> 그 차이를 층마다 더해서 아래층 계산
+                top, second = pts
+                d = tuple(b - a for a, b in zip(top, second))
+                stacks.append([tuple(round(a + k * di, 1) for a, di in zip(top, d)) for k in range(FLOORS)])
+            elif len(pts) == FLOORS:  # 층마다 찍은 좌표
+                stacks.append(pts)
+            else:
+                raise ValueError(f"pose_tray.json stacks: 두 점(5층·4층) 또는 {FLOORS}개 (지금 {len(pts)}개)")
         else:  # 맨 위층 하나 → 아래층은 pitch 만큼씩 낮게
             x, y, z, r = map(float, stack)
             stacks.append([(x, y, round(z - k * pitch, 1), r) for k in range(FLOORS)])
@@ -84,9 +93,9 @@ def pick_pose(count):
     if not 1 <= count <= TOTAL:
         raise ValueError(f"트레이 개수 {count} 가 1~{TOTAL} 밖")
     emptied = TOTAL - count
-    stack_no = emptied % len(STACKS)
+    stack_idx = len(STACKS) - 1 - emptied % len(STACKS)   # 층마다 더미 3→2→1 순서 (11/12)
     floor = FLOORS - emptied // len(STACKS)
-    return stack_no + 1, floor, STACKS[stack_no][FLOORS - floor]
+    return stack_idx + 1, floor, STACKS[stack_idx][FLOORS - floor]
 
 
 KEYCAP_FLASK_URL = os.environ.get("KEYCAP_FLASK_URL", "http://127.0.0.1:5002").rstrip("/")

@@ -194,7 +194,7 @@ if LAYOUT == "design":
 for _name, _cfg in {**SETS, "tray": TRAY}.items():  # 실물에서 찍은 좌표가 있으면 그게 최우선
     load_poses(_cfg, _name)
 if tray_stock.enabled() and not TRAY["pickup_slots"][1]:  # 더미만 찍었어도 트레이 팔을 쓰는 것으로 봄
-    TRAY["pickup_slots"][1] = tray_stock.STACKS[0][0]
+    TRAY["pickup_slots"][1] = tray_stock.STACKS[-1][0]   # 처음 집는 곳 = 더미 맨 뒤(3) 맨 위 (11/12 순서)
 TRAY["travel_z"] = tray_stock.travel_z()
 
 
@@ -424,6 +424,51 @@ async def belt_set(arm_api, box_api, cfg):
     return {no: conveyor_ok for no in numbers}
 
 
+async def lower_if_too_high(arm_api, port, margin=10.0):
+    """팔이 JUMP 한계 높이(JUMP_Z_LIMIT 150) 근처나 위에 떠 있으면 JUMP 가 정점을 못 잡아 0x12 로 무시됨
+    (2026-11-12: 더미를 다시 쌓으려고 팔을 손으로 z 158 까지 올려 둔 채 시작한 경우).
+    JUMP 하기 전에 같은 x·y 에서 직선(MOVL)으로 (한계 - margin) 높이까지 먼저 내림. 낮을 때는 아무것도 안 함."""
+    pose = await safe_call(arm_api.GetPose(portName=port, isQueued=False))
+    if not (isinstance(pose, dict) and "z" in pose):
+        return
+    limit = JUMP_Z_LIMIT - margin
+    if pose["z"] <= limit:
+        return
+    log(port, f"  팔이 z={pose['z']:.1f} 로 JUMP 한계({JUMP_Z_LIMIT:.0f}) 근처보다 높음 → z={limit:.0f} 까지 직선으로 먼저 내림")
+    _, ok, _ = await move_to(arm_api, port, (pose["x"], pose["y"], limit, pose["r"]), mode=PTP_MODE_MOVL, fallback=False)
+    log(port, f"  먼저 내림: {ok}")
+
+
+async def recover_by_homing(arm_api, port, cfg, target):
+    """팔이 반경 REACH_MIN(230mm) 안쪽의 낮은 자리에 서 있으면 위로 들 수 없어서(0x12) JUMP 가 전부 무시됨
+    (2026-11-12: 좌표를 손으로 찍다가 팔을 그 자리에 두고 간 경우 등). 홈 복귀(SetHOMECmd) 후 target 위로 MOVJ 로 비킴
+    - demo.py home 과 같은 순서. 팔이 홈 위치로 직접 움직이니, 이 함수가 불리면 로그에 크게 남김
+    반환: 비키기까지 성공했는지"""
+    log(port, f"  !! 팔이 반경 {REACH_MIN:.0f}mm 안쪽에 서 있어 위로 들 수 없음(0x12) → 홈 복귀 후 다시 시도 (팔이 홈 위치로 움직임)")
+    await clear_alarms_now(arm_api, port, "홈 복귀 전")
+    res = await safe_call(arm_api.SetHOMECmd(portName=port, isQueued=False), 60)
+    log(port, f"  홈 명령: {res}")
+    last, still_since, start = None, None, time.time()
+    while time.time() - start < 60:  # 멈출 때까지 (최대 60초)
+        await asyncio.sleep(0.5)
+        now = await safe_call(arm_api.GetPose(portName=port, isQueued=False))
+        if not (isinstance(now, dict) and "x" in now):
+            continue
+        if last is not None and _same_pose(now, last):
+            still_since = still_since or time.time()
+            if time.time() - still_since >= 1.5:
+                break
+        else:
+            still_since = None
+        last = now
+    await clear_alarms_now(arm_api, port, "홈 복귀 뒤")
+    x, y, z, r = target
+    away = (x, y, z + cfg.get("away_lift_z", LIFT_Z_OFFSET), r)
+    _, ok, pose = await move_to(arm_api, port, away, mode=PTP_MODE_MOVJ, fallback=False)
+    log(port, f"  홈 복귀 뒤 집는 자리 위로 비킴: {ok}" + ("" if ok else f" (현재 좌표: {pose})"))
+    return ok
+
+
 async def arm_set(arm_api, cfg, zone=None, on_result=None):
     """세트 1개의 로봇팔: 키캡 2개를 벨트에서 집어 놓는 곳에 놓음. 반환: {keycap번호: bool}
     zone: 두 세트를 같이 돌릴 때 공유하는 트레이 자리 (new_place_zone()). 없으면 차례 없이 혼자 동작.
@@ -452,10 +497,18 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
         # 단, 앞에서 트레이 자리를 못 빠졌으면 엉뚱한 곳에 있으므로 직선(MOVL) 말고 JUMP 로 (2026-11-02 시연: 직선 이동이 관절 한계에 걸림)
         pick_mode = PTP_MODE_MOVL if i > 0 and left else PTP_MODE_JUMP
         if pick_mode == PTP_MODE_JUMP:
+            await lower_if_too_high(arm_api, port)
             await use_travel_height(arm_api, port, cfg, cfg['pickup_slots'][slot_no])
         # 트레이 팔은 MOVJ 재시도 안 함 — 들지 않고 관절째 돌아서 더미·놓은 트레이를 침 (2026-11-08)
         moved, pick_arrived, pose = await move_to(arm_api, port, cfg['pickup_slots'][slot_no], mode=pick_mode,
                                                   fallback=not cfg.get("travel_z"))
+        # [11/12] 못 갔는데 팔이 반경 230mm 안쪽에 서 있으면 들어 올릴 수 없는 자리 -> 홈 복귀 후 한 번만 다시
+        if (not pick_arrived and pick_mode == PTP_MODE_JUMP and isinstance(pose, dict) and "x" in pose
+                and math.hypot(pose["x"], pose["y"]) < REACH_MIN):
+            if await recover_by_homing(arm_api, port, cfg, cfg['pickup_slots'][slot_no]):
+                await use_travel_height(arm_api, port, cfg, cfg['pickup_slots'][slot_no])
+                moved, pick_arrived, pose = await move_to(arm_api, port, cfg['pickup_slots'][slot_no], mode=pick_mode,
+                                                          fallback=not cfg.get("travel_z"))
         log(port, f"  슬롯 이동 명령: {moved}")
         log(port, f"  슬롯 실제 도착: {pick_arrived} (현재 좌표: {pose})")
         if pick_arrived and zone and zone["blocked_by"] == port:

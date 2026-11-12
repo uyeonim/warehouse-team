@@ -187,15 +187,18 @@ def main():
 
     new ={"pickup_slots": dict(cfg["pickup_slots"]), "place_slots": dict(cfg["place_slots"])}
     points = TRAY_POINTS if set_key == "tray" else POINTS
-    # 트레이 더미(pose_tray.json stacks)를 쓰는 중이면 더미마다 맨 위(5층) 손잡이 + 놓는 곳을 찍음.
-    # 아래층은 tray_stock.py 가 pitch 로 계산. (예전엔 집는 곳 하나만 찍고 파일을 통째로 새로 써서
-    # stacks·pitch·travel_z 가 지워졌음 → 15개 기능이 꺼짐, 2026-11-10)
+    # 트레이 더미(pose_tray.json stacks)를 쓰는 중이면 순서: 더미 1·2·3 의 5층 → 더미 1·2·3 의 4층 → 놓는 곳 (11/12).
+    # 3·2·1층은 tray_stock.py 가 (4층 - 5층) 차이를 더미마다 따로 더해서 계산. (예전엔 집는 곳 하나만 찍고 파일을 통째로
+    # 새로 써서 stacks·pitch·travel_z 가 지워졌음 → 15개 기능이 꺼짐, 2026-11-10)
     stacks = dc.tray_stock.STACKS if set_key == "tray" else []
     if stacks:
         floors = dc.tray_stock.FLOORS
         new["stacks"] = {i + 1: stack[0] for i, stack in enumerate(stacks)}
-        points = [("stacks", i + 1, f"더미{i + 1} 맨 위({floors}층) 손잡이 — {floors}개 다 쌓은 상태에서")
-                  for i in range(len(stacks))] + [TRAY_POINTS[1]]
+        new["stacks4"] = {i + 1: stack[1] for i, stack in enumerate(stacks)}
+        points = ([("stacks", i + 1, f"더미{i + 1} 맨 위({floors}층) 손잡이 — {floors}개 다 쌓은 상태에서")
+                   for i in range(len(stacks))] +
+                  [("stacks4", i + 1, f"더미{i + 1} {floors - 1}층 손잡이 — 맨 위 트레이를 치우고 {floors - 1}개 남은 상태에서")
+                   for i in range(len(stacks))] + [TRAY_POINTS[1]])
     before = {g: dict(d) for g, d in new.items()}
     try:
         for group, slot, label in points:
@@ -225,9 +228,18 @@ def main():
     except (OSError, ValueError):
         saved = {}
     if stacks:
-        for i in range(len(stacks)):  # 새로 찍은 더미만 바꿈 (건너뛴 더미는 층마다 찍어 둔 값이 있어도 그대로)
-            if new["stacks"][i + 1] != before["stacks"][i + 1]:
-                saved["stacks"][i] = list(new["stacks"][i + 1])
+        for i in range(len(stacks)):  # 새로 찍은 더미만 바꿈 (건너뛴 더미는 그대로)
+            top, second = new["stacks"][i + 1], new["stacks4"][i + 1]
+            top_changed = top != before["stacks"][i + 1]
+            second_changed = second != before["stacks4"][i + 1]
+            if not top_changed and not second_changed:
+                continue
+            if top_changed and not second_changed:  # 5층만 새로 찍음 -> 4층은 예전 차이를 그대로 적용
+                old_top, old_second = before["stacks"][i + 1], before["stacks4"][i + 1]
+                second = tuple(round(a + (s - o), 1) for a, s, o in zip(top, old_second, old_top))
+                new["stacks4"][i + 1] = second
+                print(f"  (더미{i + 1} 4층은 안 찍어서 예전 차이로 계산: {second})")
+            saved["stacks"][i] = [list(top), list(second)]
         new["pickup_slots"][1] = new["stacks"][1]  # 더미를 쓸 때 집는 곳은 매번 남은 개수로 정함. 여기는 더미1 맨 위로 맞춰만 둠
     for group in ("pickup_slots", "place_slots"):
         saved[group] = {str(k): v for k, v in new[group].items()}
@@ -238,10 +250,16 @@ def main():
     with open(path, "w", encoding="utf-8") as f:
         json.dump(saved, f, indent=2, ensure_ascii=False)
     print(f"\n===== {set_key} 새 좌표 (저장: {os.path.basename(path)}) =====")
-    for group in (("stacks", "place_slots") if stacks else ("pickup_slots", "place_slots")):
+    for group in (("stacks", "stacks4", "place_slots") if stacks else ("pickup_slots", "place_slots")):
         for slot in sorted(new[group]):
             mark = "" if new[group][slot] == before[group][slot] else "   ← 바뀜"
             print(f"  {group}[{slot}] = {new[group][slot]}{mark}")
+    if stacks:
+        print("\n  더미별 층당 차이 (4층 - 5층 = x, y, z, r). z 는 -25 ~ -33 쯤, x·y·r 은 0 에 가까워야 정상")
+        for i in range(len(stacks)):
+            d = tuple(round(b - a, 1) for a, b in zip(new["stacks"][i + 1], new["stacks4"][i + 1]))
+            warn = "" if -40 <= d[2] <= -20 else "   !! z 차이가 이상함 - 5층·4층을 제대로 찍었는지 확인"
+            print(f"    더미{i + 1}: {d}{warn}")
 
 
 if __name__ == "__main__":
