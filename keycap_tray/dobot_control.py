@@ -165,6 +165,9 @@ TRAY = {
     "label": "빈 트레이",  # 로그에 키캡 대신 찍을 이름
     # 놓은 뒤 방금 집은 자리 위로 빠지는 높이. 50이면 5층(z 약 105)에서 z 155 → JUMP 한계(zLimit 150) 넘음 (2026-11-08)
     "away_lift_z": 20.0,
+    # [11/14] 일이 끝나면 쉬는 자리 (x, y, z, r). 없으면(None) 마지막에 빠진 자리(집는 자리 위)에 그대로 서 있음.
+    # read_pose.py tray 로 찍으면 pose_tray.json "home" 에 저장됨
+    "home": None,
 }
 
 
@@ -186,6 +189,8 @@ def load_poses(cfg, name):
         for slot, pose in (saved.get(group) or {}).items():
             if pose:
                 cfg[group][int(slot)] = tuple(pose)
+    if saved.get("home"):   # 쉬는 자리 (트레이 팔)
+        cfg["home"] = tuple(saved["home"])
     return cfg
 
 
@@ -314,6 +319,40 @@ async def set_jump_height(arm_api, port, height):
 
 TRAVEL_MIN_LIFT = 10.0  # 목표가 이미 travel_z 근처일 때도 이만큼은 들고 감
 
+# [11/14] 멀리 갈수록 팔을 높이 못 듦 - 관절3 하한(-10°, 알람 0x45)에 걸려 계획 단계에서 0x12 로 거부됨.
+# 실측: 반경 342mm·z 129 까지는 감, z 148 정점은 반경 327mm 까지만 (더미3 5층 반경 346mm 에서 148 정점이 0x12 로 막혔음)
+# 팔 길이·공구 오프셋은 실측 관절각(반경 303~342mm 3점)에 맞춘 근사라 오차 ±5mm 정도 -> 관절3 에 여유(J3_MARGIN_DEG)를 둠
+ARM_L1, ARM_L2 = 135.0, 147.0     # 위팔·아래팔 (mm)
+ARM_TOOL_REACH, ARM_Z0 = 102.0, 14.0   # 공구까지 수평 거리 / 높이 보정 (mm)
+J3_MIN_DEG, J3_MARGIN_DEG = -10.0, 4.0
+
+
+def _j3_at(reach, z):
+    """반경 reach, 높이 z 에 팔을 뻗었을 때의 관절3 각도(도). 못 닿으면 None."""
+    rr, zz = reach - ARM_TOOL_REACH, z - ARM_Z0
+    d = math.hypot(rr, zz)
+    if d > ARM_L1 + ARM_L2 or d < 1.0:
+        return None
+    a = math.atan2(rr, zz)
+    b = math.acos(max(-1.0, min(1.0, (ARM_L1 ** 2 + d * d - ARM_L2 ** 2) / (2 * ARM_L1 * d))))
+    for s in (1, -1):
+        j2 = a + s * b
+        j3 = math.degrees(math.atan2(-(zz - ARM_L1 * math.cos(j2)), rr - ARM_L1 * math.sin(j2)))
+        if j3 >= -30 and -10 <= math.degrees(j2) <= 85:   # 실제로 쓰는 팔꿈치 방향
+            return j3
+    return None
+
+
+def max_z_at_reach(reach):
+    """그 반경에서 JUMP 정점(들어올림)으로 쓸 수 있는 가장 높은 z (관절3 하한 + 여유). 어디서도 안 되면 None."""
+    z = JUMP_Z_LIMIT
+    while z > -20:
+        j3 = _j3_at(reach, z)
+        if j3 is not None and j3 >= J3_MIN_DEG + J3_MARGIN_DEG:
+            return z
+        z -= 1.0
+    return None
+
 
 async def use_travel_height(arm_api, port, cfg, target, min_lift=TRAVEL_MIN_LIFT):
     """travel_z 가 있는 팔(트레이 팔)은 target 으로 가는 JUMP 의 정점을 travel_z 로.
@@ -325,7 +364,50 @@ async def use_travel_height(arm_api, port, cfg, target, min_lift=TRAVEL_MIN_LIFT
         return
     pose = await safe_call(arm_api.GetPose(portName=port, isQueued=False))
     z = pose["z"] if isinstance(pose, dict) else travel_z
-    await set_jump_height(arm_api, port, max(min_lift, travel_z - max(z, target[2])))
+    # [11/14] 출발·도착 중 먼 쪽 반경에서 닿는 높이까지만 정점을 올림 (멀리 있는 더미3 는 148 까지 못 듦 -> 0x12)
+    far = math.hypot(target[0], target[1])
+    if isinstance(pose, dict) and "x" in pose:
+        far = max(far, math.hypot(pose["x"], pose["y"]))
+    apex = travel_z
+    limit = max_z_at_reach(far)
+    if limit is not None and limit < travel_z:
+        apex = limit
+        log(port, f"  반경 {far:.0f}mm 에서는 {travel_z:.0f} 까지 못 들어서 JUMP 정점 {apex:.0f} 로 낮춤")
+    await set_jump_height(arm_api, port, max(min_lift, apex - max(z, target[2])))
+
+
+async def go_to_home(arm_api, port, cfg, home):
+    """쉬는 자리(HOME)로 - 먼저 같은 자리에서 곧장 위로 들고 → 그 높이로 옆으로 이동 → HOME 높이로 오르내림.
+    [11/14] 관절 이동(MOVJ)으로 바로 가면 경로가 낮게 휘어서 쌓아 둔 트레이를 쳐서 무너뜨렸음.
+    HOME 이 z 150(JUMP 한계) 근처·위여도 되게 JUMP 대신 직선(MOVL) 세 번으로 나눔.
+    들어올리는 높이 = travel_z(148) 와 그 반경에서 닿는 높이 중 낮은 쪽. 반환: (도착 여부, 현재 좌표)"""
+    pose = await safe_call(arm_api.GetPose(portName=port, isQueued=False))
+    hx, hy, hz, hr = home
+    if not (isinstance(pose, dict) and "x" in pose):
+        _, ok, pose = await move_to(arm_api, port, home, mode=PTP_MODE_MOVJ, fallback=False)
+        return ok, pose
+    far = max(math.hypot(pose["x"], pose["y"]), math.hypot(hx, hy))
+    lift_z = cfg.get("travel_z") or JUMP_Z_LIMIT - 2
+    limit = max_z_at_reach(far)
+    if limit is not None:
+        lift_z = min(lift_z, limit)
+    lift_z = max(lift_z, pose["z"])   # 이미 더 높으면 내리지 않음
+    cur = (pose["x"], pose["y"], pose["z"], pose["r"])
+    if lift_z - cur[2] > 1.0:   # 1) 제자리에서 위로
+        _, ok, p = await move_to(arm_api, port, (cur[0], cur[1], lift_z, cur[3]), mode=PTP_MODE_MOVL, fallback=False)
+        log(port, f"  HOME 가기 전 위로 들기 (z {cur[2]:.0f} → {lift_z:.0f}): {ok}")
+        if not ok:
+            return False, p
+    # 2) 그 높이 그대로 HOME 의 x·y 위로
+    _, ok, p = await move_to(arm_api, port, (hx, hy, lift_z, hr), mode=PTP_MODE_MOVL, fallback=False)
+    log(port, f"  HOME 위로 이동 (z {lift_z:.0f}): {ok}")
+    if not ok:
+        return False, p
+    # 3) HOME 높이로
+    if abs(hz - lift_z) > 1.0:
+        _, ok, p = await move_to(arm_api, port, home, mode=PTP_MODE_MOVL, fallback=False)
+        return ok, p
+    return True, p
 
 
 async def wait_until_arrived(arm_api, port, target_pose, tolerance=3.0, timeout=8.0):
@@ -437,17 +519,26 @@ async def belt_set(arm_api, box_api, cfg):
     return {no: conveyor_ok for no in numbers}
 
 
-async def lower_if_too_high(arm_api, port, margin=10.0):
+async def lower_if_too_high(arm_api, port, margin=10.0, target=None):
     """팔이 JUMP 한계 높이(JUMP_Z_LIMIT 150) 근처나 위에 떠 있으면 JUMP 가 정점을 못 잡아 0x12 로 무시됨
     (2026-11-12: 더미를 다시 쌓으려고 팔을 손으로 z 158 까지 올려 둔 채 시작한 경우).
-    JUMP 하기 전에 같은 x·y 에서 직선(MOVL)으로 (한계 - margin) 높이까지 먼저 내림. 낮을 때는 아무것도 안 함."""
+    JUMP 하기 전에 같은 x·y 에서 직선(MOVL)으로 (한계 - margin) 높이까지 먼저 내림. 낮을 때는 아무것도 안 함.
+    target 을 주면(트레이 팔) 먼 반경에서 닿는 높이(max_z_at_reach)도 한계로 봄 - [11/14] 더미3 5층 반경 346mm 에서
+    팔이 z 129 에 떠 있으면 JUMP 정점이 139 가 되어 닿지 않아 0x12 로 무시됐음."""
     pose = await safe_call(arm_api.GetPose(portName=port, isQueued=False))
     if not (isinstance(pose, dict) and "z" in pose):
         return
     limit = JUMP_Z_LIMIT - margin
+    why = f"JUMP 한계({JUMP_Z_LIMIT:.0f}) 근처보다 높음"
+    if target is not None and "x" in pose:
+        far = max(math.hypot(target[0], target[1]), math.hypot(pose["x"], pose["y"]))
+        reach_z = max_z_at_reach(far)
+        if reach_z is not None and reach_z - 11.0 < limit:   # 11mm 는 JUMP 로 들어올릴 여유 (min_lift 10 + 1)
+            limit = reach_z - 11.0
+            why = f"반경 {far:.0f}mm 에서 JUMP 정점을 못 잡는 높이"
     if pose["z"] <= limit:
         return
-    log(port, f"  팔이 z={pose['z']:.1f} 로 JUMP 한계({JUMP_Z_LIMIT:.0f}) 근처보다 높음 → z={limit:.0f} 까지 직선으로 먼저 내림")
+    log(port, f"  팔이 z={pose['z']:.1f} 로 {why} → z={limit:.0f} 까지 직선으로 먼저 내림")
     _, ok, _ = await move_to(arm_api, port, (pose["x"], pose["y"], limit, pose["r"]), mode=PTP_MODE_MOVL, fallback=False)
     log(port, f"  먼저 내림: {ok}")
 
@@ -510,7 +601,7 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
         # 단, 앞에서 트레이 자리를 못 빠졌으면 엉뚱한 곳에 있으므로 직선(MOVL) 말고 JUMP 로 (2026-11-02 시연: 직선 이동이 관절 한계에 걸림)
         pick_mode = PTP_MODE_MOVL if i > 0 and left else PTP_MODE_JUMP
         if pick_mode == PTP_MODE_JUMP:
-            await lower_if_too_high(arm_api, port)
+            await lower_if_too_high(arm_api, port, target=cfg['pickup_slots'][slot_no] if cfg.get("travel_z") else None)
             await use_travel_height(arm_api, port, cfg, cfg['pickup_slots'][slot_no])
         # 트레이 팔은 MOVJ 재시도 안 함 — 들지 않고 관절째 돌아서 더미·놓은 트레이를 침 (2026-11-08)
         moved, pick_arrived, pose = await move_to(arm_api, port, cfg['pickup_slots'][slot_no], mode=pick_mode,
@@ -609,6 +700,11 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
         if not zone and i < len(keycaps) - 1:
             await asyncio.sleep(INTER_KEYCAP_DELAY)  # 한 세트만 돌릴 때는 원래처럼 쉬었다가
 
+    # [11/14] 트레이 팔: 다 성공했으면 정해 둔 쉬는 자리(HOME)로 (결과는 이미 보고했으므로 기다리는 쪽은 안 막음)
+    home = cfg.get("home")
+    if home and cfg.get("travel_z") and results and all(results.values()):
+        at_home, pose = await go_to_home(arm_api, port, cfg, home)
+        log(port, f"  쉬는 자리(HOME)로 이동: {at_home}" + ("" if at_home else f" (현재 좌표: {pose})"))
     await gripper(arm_api, port, on=False)
     await safe_call(arm_api.SetEndEffectorGripper(portName=port, enable=False, on=False, isQueued=False))
     if cfg.get("travel_z") or cfg.get("pick_lift_z"):

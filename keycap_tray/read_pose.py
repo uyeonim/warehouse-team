@@ -199,6 +199,9 @@ def main():
                    for i in range(len(stacks))] +
                   [("stacks4", i + 1, f"더미{i + 1} {floors - 1}층 손잡이 — 맨 위 트레이를 치우고 {floors - 1}개 남은 상태에서")
                    for i in range(len(stacks))] + [TRAY_POINTS[1]])
+    if set_key == "tray":   # [11/14] 트레이 팔 쉬는 자리 (일 끝나면 가 있을 곳) - 건너뛰면(s) 안 정함/기존 유지
+        new["home"] = {1: cfg.get("home")}
+        points = list(points) + [("home", 1, "트레이 팔 쉬는 자리(HOME) — 일 끝나고 가 있을 빈 곳, 트레이·더미에서 떨어진 높은 곳")]
     before = {g: dict(d) for g, d in new.items()}
     try:
         for group, slot, label in points:
@@ -243,6 +246,8 @@ def main():
         new["pickup_slots"][1] = new["stacks"][1]  # 더미를 쓸 때 집는 곳은 매번 남은 개수로 정함. 여기는 더미1 맨 위로 맞춰만 둠
     for group in ("pickup_slots", "place_slots"):
         saved[group] = {str(k): v for k, v in new[group].items()}
+    if set_key == "tray" and new["home"][1]:
+        saved["home"] = list(new["home"][1])
     if os.path.exists(path):   # [11/11] 덮어쓰기 전에 예전 파일 백업 (pose_<이름>.json.bak-날짜시간, git 무시)
         backup = path + time.strftime(".bak-%Y%m%d-%H%M%S")
         shutil.copy2(path, backup)
@@ -250,7 +255,8 @@ def main():
     with open(path, "w", encoding="utf-8") as f:
         json.dump(saved, f, indent=2, ensure_ascii=False)
     print(f"\n===== {set_key} 새 좌표 (저장: {os.path.basename(path)}) =====")
-    for group in (("stacks", "stacks4", "place_slots") if stacks else ("pickup_slots", "place_slots")):
+    for group in ((("stacks", "stacks4", "place_slots") if stacks else ("pickup_slots", "place_slots"))
+                  + (("home",) if set_key == "tray" else ())):
         for slot in sorted(new[group]):
             mark = "" if new[group][slot] == before[group][slot] else "   ← 바뀜"
             print(f"  {group}[{slot}] = {new[group][slot]}{mark}")
