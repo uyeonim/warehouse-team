@@ -186,6 +186,8 @@ def _send(handler, m):
         what = "하드리셋 (orders 비움)"
     else:
         orders = req.get("orders")
+        if isinstance(orders, dict):   # 주문이 아닌 값({"open": true} 등)은 빼고 보냄 - 있으면 우리 게이트웨이·보드 main 이 스냅샷 전체를 "형식 이상"으로 무시함 (11/13)
+            orders = {k: v for k, v in orders.items() if isinstance(v, dict)}
         if not isinstance(orders, dict) or not orders:
             _reply(handler, 400, {"error": "주문이 없습니다. 빈 목록은 하드리셋 버튼으로만 보냅니다."})
             return
@@ -413,8 +415,11 @@ function load(){
     if (!x.ok) { document.getElementById("baseinfo").innerHTML = '<span class="err">' + esc(x.j.error || "읽기 실패") + "</span>"; return; }
     FLOW = x.j.flow; ALL = x.j.statuses; FAULTS = x.j.faults;
     var con = x.j.con || {};
-    base = {seq: con.seq, orders: con.orders || {}};
-    document.getElementById("baseinfo").textContent = "플랫폼 최신 스냅샷 seq " + con.seq + " (" + x.j.read_at + " 읽음)";
+    var raw = con.orders || {}, clean = {}, junk = [];   // 주문이 아닌 값(예: "open": true)은 목록에서 빼고 보내지도 않음 (11/13)
+    Object.keys(raw).forEach(function(k){ var v = raw[k]; if (v && typeof v === "object" && !Array.isArray(v)) clean[k] = v; else junk.push(k); });
+    base = {seq: con.seq, orders: clean};
+    document.getElementById("baseinfo").textContent = "플랫폼 최신 스냅샷 seq " + con.seq + " (" + x.j.read_at + " 읽음)"
+      + (junk.length ? " · 주문이 아닌 값 무시: " + junk.join(", ") : "");
     draft = clone(base.orders); krest = []; brest = []; if (sel && !draft[sel]) sel = null;
     draw();
   }).catch(function(e){ document.getElementById("baseinfo").innerHTML = '<span class="err">읽기 실패: ' + esc(e) + "</span>"; });

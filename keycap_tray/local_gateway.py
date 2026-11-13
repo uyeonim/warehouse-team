@@ -130,6 +130,13 @@ def run():
                     time.sleep(period)
             if waited:
                 print('[시작 대기] Mobius 연결됨 - 시작')
+            # [11/13] 형식이 이상한 스냅샷(예: orders 안에 {"open": true} 처럼 주문이 아닌 값)이 최신이면 예전엔 여기서 ValueError 로
+            # 게이트웨이가 켜지자마자 죽었음. 주기 조회·알림 경로처럼 무시하고 시작 기준 없이 시작 (다음 정상 스냅샷부터 반응)
+            if initial is not None:
+                _orders = initial.get('orders') if isinstance(initial, dict) else None
+                if not isinstance(_orders, dict) or not all(isinstance(o, dict) for o in _orders.values()):
+                    print(f'[시작] 최신 스냅샷 형식이 이상해서 시작 기준으로 안 씀 (플랫폼 쪽 값): {str(initial)[:200]}')
+                    initial = None
             if initial is not None:
                 def reported(path, order_id):
                     """Mobius 에 이 주문의 우리 보고(그 단계 컨테이너 최신 CIN)가 있는지. 못 읽으면 None"""

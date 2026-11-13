@@ -10,7 +10,7 @@
 
 ■ 단계별 호출 (주문 status → 함수)
   assigned         → run_tray_arm         빈 트레이를 집어 트레이 벨트 투입 자리에 놓음 (약 12초)
-  keycap_dispensed → run_keycap_conveyor  두 세트 벨트 60mm/s · 10초 (약 11초)
+  keycap_dispensed → run_keycap_conveyor  두 세트 벨트 70mm/s · 13초 (약 14초)
   keycap_reached   → run_keycap_arms      키캡 4개를 트레이에 놓으며 하나씩 바로 보고 (2026-11-02 실측 43초)
 
 ■ 좌표 — 우선순위: 코드 SETS(10/8 시험 배치) → LAYOUT=design 이면 pose_<이름>_design.json(도면 추정)
@@ -62,8 +62,8 @@ PTP_MODE_MOVJ = 1   # 관절 이동 — move_to 의 마지막 재시도용
 PTP_MODE_MOVL = 2  # 직선 이동 (같은 x·y 에서 바로 위로 들기 / 바로 아래로 내리기)
 # ※ 2026-09-18 실측: 로봇이 아직 움직이는 중(도착 3mm 전)에 다음 명령을 보내면 무시됨
 #   → wait_until_arrived 가 완전히 멈춘 것까지 확인. 트레이 → 벨트처럼 멀리 갈 때는 JUMP.
-CONVEYOR_SPEED = 60       # mm/s, 양쪽 공통 (2026-10-08: 가림막으로 끝막이를 세워 50 → 60)
-CONVEYOR_RUN_TIME = 10.0  # 초, 양쪽 공통. 가림막이 키캡을 멈춰 세우므로 시간은 넉넉히만 주면 됨
+CONVEYOR_SPEED = 70       # mm/s, 양쪽 공통 (2026-11-12: 60 → 70. 10-08: 가림막으로 끝막이를 세워 50 → 60)
+CONVEYOR_RUN_TIME = 13.0  # 초, 양쪽 공통 (2026-11-12: 10 → 13). 가림막이 키캡을 멈춰 세우므로 시간은 넉넉히만 주면 됨
 RELEASE_SETTLE_DELAY = 0.5
 MOVE_SETTLE_DELAY = 0.5
 GRIP_SETTLE_DELAY = 0.5
@@ -130,6 +130,8 @@ SETS = {
         # 놓은 뒤 다음 집는 자리 위로 빠지는 높이. 기본 50이면 재조립 뒤 집는 z 98 → z 148, 슬롯2(반경 208mm)에서
         # 0x12 목표점이 관절 한계 밖 (점프·MOVJ 둘 다, 2026-11-11 19:20). 트레이 팔과 같이 20 으로
         "away_lift_z": 5.0,   # [임시] 슬롯2 위에서 높이 들면 더 범위 밖(0x12) → 집는 높이 바로 위로만. 슬롯2 다시 찍은 뒤 20 으로
+        # 벨트에서 키캡을 집은 뒤 트레이로 가는 JUMP 의 들어올림 높이 (mm). 정점 = 집은 높이 + 이 값. 기본 20 보다 낮게 (2026-11-13)
+        "pick_lift_z": 15.0,
     },
     "set2": {
         "port": _port("SET2", "COM7"),
@@ -146,6 +148,7 @@ SETS = {
         },
         "keycaps": [("3번 키캡(TF)", 1, 3), ("4번 키캡(PJ)", 2, 4)],
         "away_lift_z": 5.0,   # [임시] set1 과 같은 이유 (슬롯2 반경 222mm)
+        "pick_lift_z": 15.0,  # set1 과 같음 - 집은 뒤 z 15mm 만 올라감 (2026-11-13)
     },
 }
 
@@ -547,8 +550,12 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
                 # 키캡을 들고 가는 구간은 JUMP 만 (MOVJ 로 바꾸면 경로가 달라 엉뚱한 곳에서 놓게 됨)
                 # 트레이 팔: 옆 더미 위를 넘어가게. 5층에서 20mm 만 들면 아래 트레이에 살짝 닿음 → 최소 30mm (2026-11-08)
                 await use_travel_height(arm_api, port, cfg, cfg['place_slots'][slot_no], min_lift=30.0)
+                if cfg.get("pick_lift_z") and not cfg.get("travel_z"):
+                    await set_jump_height(arm_api, port, cfg["pick_lift_z"])   # 집은 뒤 z 15mm 만 올라감 (정점 = 집은 높이 + 15)
                 moved, place_arrived, pose = await move_to(arm_api, port, cfg['place_slots'][slot_no],
                                                            fallback=False)
+                if cfg.get("pick_lift_z") and not cfg.get("travel_z"):
+                    await set_jump_height(arm_api, port, JUMP_HEIGHT)   # 다른 이동(되돌리기·빠지기)은 기본 높이로
                 log(port, f"  place 이동 명령: {moved}")
                 log(port, f"  place 실제 도착: {place_arrived} (현재 좌표: {pose})")
                 if not place_arrived:
@@ -604,7 +611,7 @@ async def arm_set(arm_api, cfg, zone=None, on_result=None):
 
     await gripper(arm_api, port, on=False)
     await safe_call(arm_api.SetEndEffectorGripper(portName=port, enable=False, on=False, isQueued=False))
-    if cfg.get("travel_z"):
+    if cfg.get("travel_z") or cfg.get("pick_lift_z"):
         await set_jump_height(arm_api, port, JUMP_HEIGHT)  # 다른 프로그램(DobotLab 등)이 쓰는 기본값으로 되돌림
     await clear_alarms_now(arm_api, port, "단계 끝 정리")  # 그리퍼 여닫을 때 생기는 잔류 알람까지 정리
 
@@ -813,7 +820,7 @@ def disconnect():
 
 
 def run_keycap_conveyor(order_id):
-    """keycap_dispensed 때 호출. 두 세트 벨트만 돌리고 결과 {1~4: bool} 반환 (약 11초)."""
+    """keycap_dispensed 때 호출. 두 세트 벨트만 돌리고 결과 {1~4: bool} 반환 (약 14초)."""
     ensure_connected(SETS)
     return _loop.run_until_complete(all_belts(_arm_api, _box_api))
 

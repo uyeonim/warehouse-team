@@ -193,6 +193,17 @@ _lock = threading.Lock()
 _latest = None         # check_all.run_checks() 결과
 _error = None
 _process = None        # 최신 cnt_process con (dict) - 못 읽으면 None
+
+
+def _clean_process(con):
+    """cnt_process 값에서 orders 안의 '주문이 아닌 값'을 뺌.
+    [11/13] 플랫폼이 "orders": {"open": true} 처럼 올린 적이 있어서, 그대로 두면 아래 코드들이 주문마다 .get() 을 부르다
+    "'bool' object has no attribute 'get'" 으로 죽어 상태판이 "Mobius 접속 실패"로 보였음"""
+    if not isinstance(con, dict):
+        return None
+    orders = con.get("orders")
+    clean = {k: v for k, v in orders.items() if isinstance(v, dict)} if isinstance(orders, dict) else {}
+    return dict(con, orders=clean)
 _stage_seen = {}       # (주문, status) -> 처음 본 시각. 칩의 "N초"와 오래 머묾(노랑) 판정용
 
 
@@ -220,9 +231,10 @@ def _process_loop():
                        "X-M2M-Origin": env.get("ORIGIN") or ""}
             con = requests.get(url, headers=headers, timeout=3).json()["m2m:cin"]["con"]
             con = json.loads(con) if isinstance(con, str) else con
+            con = _clean_process(con)
             now = time.time()
             with _lock:
-                _process = con if isinstance(con, dict) else None
+                _process = con
                 live = set()
                 for oid, o in ((_process or {}).get("orders") or {}).items():
                     key = (oid, o.get("status"))

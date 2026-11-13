@@ -3,7 +3,10 @@
 트레이 컨베이어 단독 구동 테스트 - 로봇암은 안 움직임.
 메인과 같은 방식으로 STP1 + STP2(벨트 2개)를 동시에 켜고, 지정 시간 뒤 정지.
 
-사용: python tools/board_conveyor_test.py [초|sw] [속도mm/s]
+사용: python tools/board_conveyor_test.py [초|sw|s0|s1|s2] [속도mm/s] [back]
+  python tools/board_conveyor_test.py s1           -> section1 을 board_config 에 적힌 시간·속도로 (실제 주문 때와 똑같이 한 번)
+  python tools/board_conveyor_test.py s0 / s2      -> section0 / section2 (s0 = 키캡 팔 앞, s1 = 보드 팔 앞, s2 = 픽업대)
+  python tools/board_conveyor_test.py 5 70 back    -> 5초, 70mm/s, 반대 방향 (트레이를 되돌릴 때. 마지막에 back)
   python tools/board_conveyor_test.py          -> 스톱워치: Enter로 출발, 트레이가 자리에 오면 Enter로 정지 -> 걸린 시간 출력
                                                   (여러 구간 연달아 재고 q로 끝내면 전부 다시 출력)
   python tools/board_conveyor_test.py 5        -> 5초
@@ -106,9 +109,23 @@ async def main(arm_api, box_api, run_time, speed_mm_s):
         await safe_call(arm_api.DisconnectDobot(portName=DOBOT_PORT))
 
 
+SECTION_TIMES = {"s0": TRAY_CONVEYOR_RUN_TIME_SECTION0, "s1": TRAY_CONVEYOR_RUN_TIME_SECTION1,
+                 "s2": TRAY_CONVEYOR_RUN_TIME_SECTION2}
+
+
 if __name__ == "__main__":
-    run_time = None if len(sys.argv) < 2 or sys.argv[1].lower() == "sw" else float(sys.argv[1])  # None = 스톱워치
-    speed = float(sys.argv[2]) if len(sys.argv) > 2 else TRAY_CONVEYOR_SPEED_MM_S
+    argv = [a for a in sys.argv[1:] if a.lower() != "back"]
+    reverse = len(argv) != len(sys.argv) - 1
+    first = argv[0].lower().replace("section", "s") if argv else "sw"
+    if first in SECTION_TIMES:
+        run_time = SECTION_TIMES[first]
+        print(f"[CONV] {first} 설정 시간 {run_time}초로 구동")
+    else:
+        run_time = None if first == "sw" else float(argv[0])  # None = 스톱워치
+    speed = float(argv[1]) if len(argv) > 1 else TRAY_CONVEYOR_SPEED_MM_S
+    if reverse:
+        speed = -speed
+        print("[CONV] 반대 방향")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     # DobotlinkAdapter는 루프가 돌기 전에 만들어야 함 (내부에서 run_until_complete 호출)

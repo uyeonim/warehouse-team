@@ -223,4 +223,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as e:
+        if "게이트웨이" not in str(e):
+            raise
+        print("\n!! 창고 프로그램(게이트웨이)이 켜져 있어서 로봇을 쓸 수 없습니다 (같은 팔·벨트를 같이 못 씀).")
+        print("   바탕화면 '창고 끄기'를 누른 뒤 다시 실행하세요.")
+        raise SystemExit(1)

@@ -124,8 +124,14 @@ def check_platform(envs):
             mobius_ok = isinstance(con, dict)
             facts["mobius"] = mobius_ok
             if mobius_ok:
-                orders = {oid: o.get("status") for oid, o in con.get("orders", {}).items()}
-                report("OK", f"Mobius 응답 - cnt_process seq={con.get('seq')}, 진행 중 주문 {orders or '없음'}")
+                raw = con.get("orders")
+                raw = raw if isinstance(raw, dict) else {}
+                # [11/13] 플랫폼이 "orders": {"open": true} 처럼 주문이 아닌 값을 올린 적이 있음 - o.get() 에서 죽어
+                # "Mobius 접속 실패"로 잘못 보였음. 주문(객체)만 세고 나머지는 알려만 줌
+                orders = {oid: o.get("status") for oid, o in raw.items() if isinstance(o, dict)}
+                junk = [oid for oid, o in raw.items() if not isinstance(o, dict)]
+                report("OK", f"Mobius 응답 - cnt_process seq={con.get('seq')}, 진행 중 주문 {orders or '없음'}"
+                       + (f" (주문이 아닌 값 무시: {', '.join(map(str, junk))})" if junk else ""))
             else:
                 report("XX", f"Mobius cnt_process 읽기 실패 (HTTP {r.status_code})")
         except Exception as e:

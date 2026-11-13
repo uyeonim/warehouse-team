@@ -19,6 +19,9 @@
   pick 3 5             (트레이 팔) 더미3 5층에서 집기만 (위로 이동 -> 내려가 쥐기 -> 올라옴). 쥔 채로 둠
   put                  (트레이 팔) 쥐고 있는 트레이를 벨트 놓는 자리에 놓고 위로 올라옴
   open / close         그리퍼 열기 / 닫기(쥐기)
+  belt [초] [속도]     (키캡 팔 set1/set2) 그 세트의 벨트를 실제 운전과 같은 방향·속도로 돌리고 멈춤. 초 생략 = 실제 시간(CONVEYOR_RUN_TIME), 속도 생략 = 실제 속도
+  back [초] [속도]     같은데 반대 방향 (키캡을 되돌릴 때)
+  beltstop             벨트 바로 정지
   clear                알람 해제 (팔은 안 움직임)
   home                 원점 복귀 (팔이 홈 위치로 움직임, y/n 확인)
   q                    끝
@@ -99,7 +102,7 @@ async def go(arm_api, port, cfg, pose, mode, ask, label):
     return ok
 
 
-async def session(arm_api, port, cfg, ask=input):
+async def session(arm_api, port, cfg, ask=input, box_api=None):
     print(f"\n{port} 연결됨. 'pose' 로 좌표 보기, 'q' 로 끝. (팔이 실제로 움직이니 주변을 비우세요)")
     await show(arm_api, port)
     jump_cfg = cfg
@@ -195,6 +198,27 @@ async def session(arm_api, port, cfg, ask=input):
             elif cmd == "close":
                 if ask("  그리퍼를 닫습니다 (쥠). 괜찮습니까? (y/n): ").strip().lower() == "y":
                     print(f"  그리퍼 닫기: {await dc.gripper(arm_api, port, on=True)}")
+            elif cmd in ("belt", "back") and len(args) <= 2:
+                if box_api is None or "conveyor_index" not in cfg:
+                    print("  이 팔에는 컨베이어 명령이 없습니다 (키캡 팔 set1·set2 전용. 트레이 벨트는 보드 쪽 board_conveyor_test.py)")
+                    continue
+                sec = float(args[0]) if args else dc.CONVEYOR_RUN_TIME
+                base = float(args[1]) if len(args) > 1 else dc.CONVEYOR_SPEED
+                reverse = (cmd == "back") != cfg.get("conveyor_reverse", False)   # 세트마다 원래 방향이 달라서 실제 운전 기준으로 맞춤
+                if ask(f"  벨트(STEPPER{cfg['conveyor_index'] + 1})를 {sec:g}초 {'반대 방향' if cmd == 'back' else '정방향(실제 운전 방향)'}"
+                       f"으로 돌립니다 (속도 {base:g}mm/s, 약 {base * sec:.0f}mm). 벨트 위가 비어 있습니까? (y/n): ").strip().lower() != "y":
+                    print("  취소")
+                    continue
+                try:
+                    print(f"  시작: {await dc.conveyor(box_api, port, cfg['conveyor_index'], True, -base if reverse else base)}")
+                    await asyncio.sleep(sec)
+                finally:
+                    print(f"  정지: {await dc.conveyor(box_api, port, cfg['conveyor_index'], False, 0)}")
+            elif cmd == "beltstop":
+                if box_api is None or "conveyor_index" not in cfg:
+                    print("  이 팔에는 컨베이어가 없습니다")
+                    continue
+                print(f"  정지: {await dc.conveyor(box_api, port, cfg['conveyor_index'], False, 0)}")
             elif cmd == "clear":
                 await dc.clear_alarms_now(arm_api, port, "수동 해제")
                 print("  알람 해제함")
@@ -215,7 +239,7 @@ async def session(arm_api, port, cfg, ask=input):
                         last = now or last
                     print("  홈 복귀 끝")
             else:
-                print("  명령: pose  goto x y z r  dx/dy/dz/dr 값  out 값  slot 더미 층  place  cycle 더미 층  pick 더미 층  put  open  close  clear  home  q")
+                print("  명령: pose  goto x y z r  dx/dy/dz/dr 값  out 값  slot 더미 층  place  cycle 더미 층  pick 더미 층  put  belt/back [초]  beltstop  open  close  clear  home  q")
                 continue
         except (ValueError, IndexError, KeyError):
             print("  입력이 잘못됨 (예: goto 250 100 120 20 / dz 10 / slot 3 5)")
@@ -238,12 +262,21 @@ def main():
         arm_api = getattr(dobotlink, dc.NAMESPACE_ARM)
         print(f"{key} ({port}) 연결: {loop.run_until_complete(dc.safe_call(arm_api.ConnectDobot(portName=port)))}")
         try:
-            loop.run_until_complete(session(arm_api, port, cfg))
+            loop.run_until_complete(session(arm_api, port, cfg, box_api=getattr(dobotlink, dc.NAMESPACE_BOX)))
         except KeyboardInterrupt:
             print("\n중단 - 팔 상태를 확인하세요")
         finally:
+            if "conveyor_index" in cfg:  # Ctrl+C 로 벨트 도중 끊겨도 벨트는 세움
+                loop.run_until_complete(dc.conveyor(getattr(dobotlink, dc.NAMESPACE_BOX), port, cfg["conveyor_index"], False, 0))
             loop.run_until_complete(dc.safe_call(arm_api.DisconnectDobot(portName=port)))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as e:
+        if "게이트웨이" not in str(e):
+            raise
+        print("\n!! 창고 프로그램(게이트웨이)이 켜져 있어서 로봇을 쓸 수 없습니다 (같은 팔·벨트를 같이 못 씀).")
+        print("   바탕화면 '창고 끄기'를 누른 뒤 다시 실행하세요.")
+        raise SystemExit(1)
