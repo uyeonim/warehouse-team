@@ -755,7 +755,7 @@ const bool IR_ISR_OK[2][4] = {
   {true,  true,  false, false},   // LETTER_0 - r(D2),g(D3),b(D4),y(D5)
   {true,  false, true,  false}    // LETTER_1 - r(D6),g(D7),b(D8),y(D9)
 };
-#define IR_POLL_ONLY_MIN_BREAK_MS 3   // 인터럽트 없는 칸의 폴링 디바운스(ms). 인터럽트 있는 칸은 IR_MIN_BREAK_MS(5) 그대로
+#define IR_POLL_ONLY_MIN_BREAK_MS 1   // 인터럽트 없는 칸의 폴링 디바운스(ms). 인터럽트 있는 칸은 IR_MIN_BREAK_MS(5) 그대로
 
 // ---- [11/10] 레일별 센서 판정 켜기/끄기 (상태판 -> 키캡 Flask -> MQTT retain, 재부팅 없이 반영) ----
 // 실제 판정 여부 = IR_INSTALLED(배선됨) && irEnabled(설정 켬). 부팅 기본값은 전부 켬.
