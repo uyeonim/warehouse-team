@@ -746,6 +746,17 @@ const bool IR_INSTALLED[2][4] = {
   {true, true, true, true}    // LETTER_1 - r,g,b,y (핀 6,7,8,9)
 };
 
+// ---- [11/15] 핀별 인터럽트 지원 여부 (IR_Interrupt_Test 스케치로 UNO R4 WiFi 실측) ----
+// D2, D3, D6, D8 = 인터럽트 정상 / D4, D5, D7, D9 = 인터럽트 안 붙음 (폴링만 판정).
+// 인터럽트가 안 붙는 칸은 폴링이 유일한 판정 수단인데, loop()가 수십 ms 막히면 짧은 끊김을 놓쳐서
+// 오판정(disable)이 났음. 이 칸들만 폴링 디바운스를 낮춰서 놓칠 확률을 줄임.
+// 핀 배치(IR_PIN)를 바꾸면 이 표도 같이 바꿀 것.
+const bool IR_ISR_OK[2][4] = {
+  {true,  true,  false, false},   // LETTER_0 - r(D2),g(D3),b(D4),y(D5)
+  {true,  false, true,  false}    // LETTER_1 - r(D6),g(D7),b(D8),y(D9)
+};
+#define IR_POLL_ONLY_MIN_BREAK_MS 3   // 인터럽트 없는 칸의 폴링 디바운스(ms). 인터럽트 있는 칸은 IR_MIN_BREAK_MS(5) 그대로
+
 // ---- [11/10] 레일별 센서 판정 켜기/끄기 (상태판 -> 키캡 Flask -> MQTT retain, 재부팅 없이 반영) ----
 // 실제 판정 여부 = IR_INSTALLED(배선됨) && irEnabled(설정 켬). 부팅 기본값은 전부 켬.
 bool irEnabled[2][4] = { {true, true, true, true}, {true, true, true, true} };
@@ -2146,7 +2157,9 @@ void pollIrForCurrentJob() {
     //               // 끊김 시작
     unsigned long len = nowMs - irBreakStart;
     if (len > irMaxBreakMs) irMaxBreakMs = len;                 // [진단] 최대 끊김 기록
-    if (!irLatched && len >= IR_MIN_BREAK_MS) {
+    // [11/15] 인터럽트가 없는 칸은 폴링 디바운스를 낮춤 (loop()가 막혀 샘플이 몇 개뿐이어도 인정)
+    const unsigned long pollMinBreakMs = IR_ISR_OK[l][c] ? (unsigned long)IR_MIN_BREAK_MS : (unsigned long)IR_POLL_ONLY_MIN_BREAK_MS;
+    if (!irLatched && len >= pollMinBreakMs) {
       irLatched = true;
       irPollLatchMs = nowMs - irWindowStart;                                         // 디바운스 통과 - 유효 통과 확정
     }
