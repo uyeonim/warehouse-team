@@ -595,6 +595,48 @@
      내리면 "우리 레일은 disable 아니었음"으로 판단해 실패 주문을 재배출하지 않음
      (재배출이 필요하면 REPAIR 대신 플랫폼에서 fault를 해제할 것).
 
+  [2026-11-08 서보 발열 대응 - 대기/배출 각도 변경 + 평상시 서보 off + IR 감시 8초]
+   - 증상: 대기 중 일부 서보가 계속 미세하게 돌아가는 소리(헌팅)를 내며 뜨거워짐.
+     연장선을 빼도 동일, 크랭크를 빼면 발열 없음 -> 홈(165도)에서 크랭크/슬라이더가
+     기구에 걸려 서보가 계속 버티는 것이 원인. (노트북 USB로 로직 전원을 줄 때 나던
+     소리는 별개 원인으로, 아두이노를 어댑터 전원으로 바꿔 해소됨)
+   - SERVO_HOME_ANGLE 165 -> 140, PUSH_ANGLE 20 -> 40 (회전 폭 145도 -> 100도,
+     서보 안정 구간 안쪽으로 이동). 각도 테스트 코드로 배출 확인 후 확정.
+   - 평상시 서보 off: releaseServo()(PCA full OFF)로 신호를 끊어 힘을 뺌.
+     부팅 시 8개를 홈으로 보낸 뒤 RETURN_DELAY_MS 기다렸다가 전부 off,
+     배출 후엔 홈 복귀 명령 뒤 RETURN_DELAY_MS가 지나면(DS_WAIT_IR) off.
+     다음 배출은 DS_IDLE에서 moveServoAngle(홈)을 다시 보내고 RETURN_DELAY_MS
+     기다린 뒤 움직이므로, off 동안 슬라이더가 조금 밀려도 배출 동작은 정확함.
+   - IR_POLL_WINDOW_MS 7000 -> 8000 (판정 여유 1초 추가 - 배출 1건당 최소 8초).
+
+  [2026-11-10 상태판에서 레일별 IR 센서 판정 켜기/끄기 (재부팅 없이)]
+   - 배경: 일부 레일 센서가 불안정해서, 전시 중에 상태판에서 그 칸만 센서 판정을 끄고 운영할 수
+     있어야 함. 꺼진 칸은 IR_INSTALLED=false와 똑같이 "판정 없이 항상 성공" 처리.
+   - 토픽: sjuiot/warehouse/ir/{BOARD_NAME} (보드별, retain). 내용 = 이 보드 8칸 전체 상태
+       {"N_r": true, "N_g": false, ...}   true = 센서 판정 켬, false = 끔 (없는 칸은 그대로)
+     키캡 Flask(/ir/<칸>)가 Redis ir:{칸}에 저장하고 보드 전체 상태를 retain으로 발행함 ->
+     재부팅/재접속하면 브로커가 마지막 설정을 바로 다시 보내줘서 설정이 유지됨.
+     (REPAIR는 "명령"이라 retain 금지지만, 이건 "현재 설정"이라 retain이 맞음)
+   - irEnabled[2][4]: 실행 중 설정. 실제 판정 여부 = IR_INSTALLED(배선) && irEnabled(설정).
+     부팅 시 기본값은 전부 켬 -> retained 설정을 받으면 그대로 바뀜.
+   - 배출 중인 레일은 지금 사이클엔 시작할 때의 설정(curIrActive)을 그대로 쓰고, 바뀐 설정은
+     다음 배출부터 적용 (감시 도중에 켜지면 앞부분을 못 봐서 오판정하므로).
+   - 시리얼 "IR" 입력 시 8칸 센서 설정 출력. 구독 실패 확인에 이 토픽도 포함.
+
+  [2026-11-11 상태판에서 서보 영점 맞추기 (CALIB 명령)]
+   - 배경: 혼(horn)을 다시 끼울 때 서보를 대기 140도 / 배출 40도에 "힘을 준 채로" 붙잡아 둬야
+     각도를 맞출 수 있음. 평상시엔 힘을 빼두므로(11/08) 따로 붙잡는 명령이 필요함.
+   - 원격 REPAIR와 같은 토픽(sjuiot/warehouse/command, retain 없이)에 cmd만 다름:
+       {"cmd":"CALIB","rail":"N_r","pos":"home"}                 -> N_r를 140도로 보내고 힘 준 채 유지
+       {"cmd":"CALIB","rail":"N_r","pos":"push"}                 -> N_r를 40도로 보내고 힘 준 채 유지
+       {"cmd":"CALIB","rail":"N_r","pos":"off"}                  -> 영점 작업 끝 (힘 빼고 배출 재개)
+       {"cmd":"CALIB","rail":"ALL","board":"NS","pos":"home"}    -> 8개 전부 140도 (0.2초 간격으로 차례로)
+     (push/off도 ALL 가능. off는 칸을 지정해도 이 보드에서 붙잡고 있던 칸 전부를 놓고 끝냄)
+   - 안전: 배출 중(dsState != DS_IDLE)이면 거절. 영점 작업 중엔 이 보드 배출을 멈춤(주문은 큐에
+     그대로 대기). 마지막 명령 후 CALIB_TIMEOUT_MS(60초) 지나면 자동으로 힘 빼고 배출 재개.
+   - 재고 숫자/레일 상태(idle/disable)/서버 보고는 건드리지 않음. 모터 각도만 움직임.
+   - 시리얼도 같음: CALIB N_r HOME / CALIB N_r PUSH / CALIB N_r OFF / CALIB ALL HOME
+
   다른 3개 보드는 이 파일을 복사한 뒤 "보드별 설정" 블록만 아래 표대로
   바꿔서 각 보드에 업로드하면 됩니다. (지금 이 파일은 NS 보드용입니다)
 
@@ -658,15 +700,16 @@ const uint8_t IR_PIN[2][4] = {
 // ---- 서보 동작 파라미터 (실측 후 조정) ----
 #define SERVO_MIN_PULSE       150
 #define SERVO_MAX_PULSE       600
-#define SERVO_HOME_ANGLE      165   // 대기 각도 (170도에서 일부 서보가 끝단에서 떨어서 165로 하향 - Servo_Jitter_Test로 확인, 10/07 재시험에서도 165가 더 안정적)
-#define PUSH_ANGLE             20   // 배출(푸시) 각도 (10/07 실측 확정값) - 대기(165)에서 이 값까지 "감소"하며 이동함에 주의
-#define SWEEP_STEP_DELAY_MS    10   // 1도 이동마다 대기 (실측 확정값)
+#define SERVO_HOME_ANGLE      145   // [11/12] 140 -> 145. 구 주석: 대기 각도 (11/08: 165 -> 140, 165에서 크랭크가 기구에 걸려 서보가 버티며 발열)
+#define PUSH_ANGLE             40   // 배출(푸시) 각도 (11/08: 20 -> 40) - 대기(140)에서 이 값까지 "감소"하며 이동함에 주의
+#define SWEEP_STEP_DELAY_MS     7   // 1도 이동마다 대기 (11/11: 10 -> 7, 푸시 100도 이동 약 1.0초 -> 약 0.7초)
 #define RETURN_DELAY_MS       400   // 복귀 명령 후 실제 도달까지 대기
 #define DISPENSE_HOLD_MS      400   // 푸시 각도 도달 후 유지 시간
 #define IR_CHECK_DELAY_MS     200   // DS_RETURNING에서 DS_WAIT_IR로 넘어가기 전 최소 물리 정착 대기 (IR 감시 자체는 이미 모터 시작 시점부터 계속 진행 중)
 #define IR_DETECT_LEVEL       LOW   // 센서가 "감지됨(빔 끊김)"일 때 주는 레벨 (실측 후 조정)
 #define BREAKAWAY_KICK_DEG      4   // 스윕 시작 시 정지마찰을 넘기기 위한 초기 킥 각도 (대기->푸시 방향, 즉 감소 방향으로 킥)
 #define BREAKAWAY_SETTLE_MS    60   // 킥 이동 후 실제 도달까지 대기
+#define CALIB_TIMEOUT_MS   60000UL   // [11/11] 영점 맞추기: 마지막 명령 후 이 시간이 지나면 자동으로 힘 빼고 배출 재개
 #define SERVO_STARTUP_STAGGER_MS 200 // 부팅 시 서보를 한 채널씩 순서대로 홈으로 보낼 때 채널 사이 간격 (돌입전류 분산용, 8개 x 200ms = 약 1.6초)
 
 // ---- [브레이크빔(송신부/수신부 분리형) 센서 판정 파라미터] ----
@@ -680,8 +723,8 @@ const uint8_t IR_PIN[2][4] = {
 // 길이 - 실제 서보 동작 시퀀스(복귀대기+킥+스윕+홀드+복귀대기 ≈ 2.6~3초)를
 // 전부 덮고도 여유가 남도록 넉넉하게 잡음. 판정은 성공이든 실패든 이 윈도우가
 // 다 끝난 뒤에만 내려지므로, 센서가 배선된 레일은 배출 1건당 최소 이 시간만큼 걸림.
-#define IR_POLL_WINDOW_MS  7000   // 모터 시작 시각 기준 전체 감시 윈도우 (7초) - 10/07 확정
-#define IR_MIN_BREAK_MS      10   // 이 이상 연속으로 끊겨야 유효 통과로 인정(노이즈 필터). 10/07 반복 테스트에서 끊김이 대체로 20ms 이상이라 5 -> 10으로 상향. 시리얼 [IR] 진단의 "최대끊김" 값을 보고 조정할 것
+#define IR_POLL_WINDOW_MS  8000   // 모터 시작 시각 기준 전체 감시 윈도우 (11/08: 7초 -> 8초, 판정 여유 확보)
+#define IR_MIN_BREAK_MS       5   // [11/12] 10 -> 5: loop 개선으로 폴링이 촘촘해져 짧은 정상 통과(실측 최소 7ms)를 놓치지 않게 낮춤. 구 주석: 이 이상 연속으로 끊겨야 유효 통과로 인정(노이즈 필터). 10/07 반복 테스트에서 끊김이 대체로 20ms 이상이라 5 -> 10으로 상향. 시리얼 [IR] 진단의 "최대끊김" 값을 보고 조정할 것
 
 // ---- [IR 센서 장착 여부 토글 - 보드 전체] ----
 // 1 = 이 보드에 브레이크빔 IR 센서가 최소 1개 이상 배선됨 (판정 로직 컴파일 포함)
@@ -703,8 +746,20 @@ const bool IR_INSTALLED[2][4] = {
   {true, true, true, true}    // LETTER_1 - r,g,b,y (핀 6,7,8,9)
 };
 
+// ---- [11/10] 레일별 센서 판정 켜기/끄기 (상태판 -> 키캡 Flask -> MQTT retain, 재부팅 없이 반영) ----
+// 실제 판정 여부 = IR_INSTALLED(배선됨) && irEnabled(설정 켬). 부팅 기본값은 전부 켬.
+bool irEnabled[2][4] = { {true, true, true, true}, {true, true, true, true} };
+// 함수 대신 매크로 - 이 위치(RailStatus 등 타입 선언 전)에 함수를 두면 Arduino IDE 자동 프로토타입 위치가 앞당겨져 컴파일 에러
+#define IR_ACTIVE(l, c) (IR_INSTALLED[l][c] && irEnabled[l][c])
+// ---- [11/11] 영점 맞추기(CALIB) 상태 - true인 동안 이 보드 배출 멈춤 ----
+bool calibActive = false;
+unsigned long calibLastMs = 0;   // 마지막 CALIB 명령 시각 (CALIB_TIMEOUT_MS 기준)
+bool calibHeld[2][4] = { {false, false, false, false}, {false, false, false, false} };   // 힘 준 채 붙잡고 있는 칸
+
+bool curIrActive = false;   // 지금 배출 중인 job이 시작할 때의 판정 여부 (사이클 도중 설정이 바뀌어도 이 값 유지)
+
 // ---- 카트리지 최대 용량 (restock 시 이 값까지 채움, 전체 풀 부족하면 서버가 그보다 적게 응답) ----
-#define MAX_CAPACITY 40   // 11/09 실물 40개 (서버 RAIL_CAPACITY와 같게, 펌웨어에서는 안 씀)
+#define MAX_CAPACITY 30
 
 // ---- disable 사유 문자열 (report 시 reason 필드에 실려 나감) ----
 const char* REASON_CARTRIDGE_FAILED = "keycap_cartridge_failed"; // 끼임/서보모터 고장 (IR 판정 실패)
@@ -909,6 +964,12 @@ unsigned long irLastPollMs = 0;  // [진단] 직전 폴링 시각
 unsigned long irMaxGapMs   = 0;  // [진단] 폴링 사이 가장 긴 간격(ms) - 크면 loop()가 막혀서 감시를 놓쳤다는 뜻
 unsigned long irPollCount = 0;     // [진단] 이번 배출 동안 폴링한 횟수
 unsigned long irBrokenSamples = 0; // [진단] 그 중 "끊김"으로 읽힌 샘플 수
+// [11/11] 진단: 시간 기록 (전부 모터 시작 시각 irWindowStart 기준 ms)
+unsigned long irPushReachedMs = 0;   // 푸시 각도 도달 시각
+unsigned long irReturnCmdMs   = 0;   // 홈 복귀 명령 시각
+bool          irPollFirstSet  = false;
+unsigned long irPollFirstMs   = 0;   // 폴링이 처음 "끊김"을 본 시각
+unsigned long irPollLatchMs   = 0;   // 폴링이 유효 통과를 확정한 시각
 
 #if IR_SENSOR_INSTALLED
 // ---- 핀 변화 인터럽트로 끊김 시간 측정 ----
@@ -921,6 +982,14 @@ volatile int8_t        irIsrPin = -1;          // -1 = 감시 안 함
 volatile unsigned long irIsrBreakStartUs = 0;  // 지금 이어지는 끊김의 시작 시각(us), 0 = 안 끊김
 volatile unsigned long irIsrMaxUs = 0;         // 이번 배출에서 관측된 가장 긴 끊김(us)
 volatile bool          irIsrLatched = false;   // IR_MIN_BREAK_MS 이상 끊김이 한 번이라도 있었는지
+// [11/11] 끊김 구간별 기록 (시작 시각은 모터 시작 기준 ms, 길이는 us)
+#define IR_EV_MAX 8
+volatile unsigned long irEvStartMs[IR_EV_MAX];
+volatile unsigned long irEvLenUs[IR_EV_MAX];
+volatile uint8_t       irEvCount = 0;
+volatile unsigned long irIsrBreakStartMs = 0;   // 지금 이어지는 끊김의 시작 시각(모터 시작 기준 ms)
+volatile bool          irIsrLatchSet = false;
+volatile unsigned long irIsrLatchMs = 0;        // 유효 통과 확정 시각(끊김 시작 + 기준)
 
 void irIsr() {
   if (irIsrPin < 0) return;
@@ -928,12 +997,16 @@ void irIsr() {
   if (now == 0) now = 1;
   bool broken = (digitalRead(irIsrPin) == IR_DETECT_LEVEL);
   if (broken) {
-    if (irIsrBreakStartUs == 0) irIsrBreakStartUs = now;
+    if (irIsrBreakStartUs == 0) { irIsrBreakStartUs = now; irIsrBreakStartMs = millis() - irWindowStart; }
   } else if (irIsrBreakStartUs != 0) {
     unsigned long len = now - irIsrBreakStartUs;
     irIsrBreakStartUs = 0;
     if (len > irIsrMaxUs) irIsrMaxUs = len;
-    if (len >= (unsigned long)IR_MIN_BREAK_MS * 1000UL) irIsrLatched = true;
+    if (irEvCount < IR_EV_MAX) { irEvStartMs[irEvCount] = irIsrBreakStartMs; irEvLenUs[irEvCount] = len; irEvCount++; }
+    if (len >= (unsigned long)IR_MIN_BREAK_MS * 1000UL) {
+      irIsrLatched = true;
+      if (!irIsrLatchSet) { irIsrLatchSet = true; irIsrLatchMs = irIsrBreakStartMs + IR_MIN_BREAK_MS; }
+    }
   }
 }
 #endif
@@ -961,6 +1034,8 @@ const char* TOPIC_COMMAND     = "sjuiot/warehouse/command";  // [11/04] 원격 R
 #define PING_INTERVAL_MS      120000UL  // 이후 핑 주기 (2분)
 #define PING_TIMEOUT_MS       30000UL   // 이 안에 자기 핑이 안 돌아오면 구독이 죽은 것으로 판단
 char          topicPing[48];            // setup()에서 BOARD_NAME으로 만듦
+#define TOPIC_IR_PREFIX       "sjuiot/warehouse/ir/"   // [11/10] 보드별 센서 설정 (retain)
+char          topicIr[48];              // setup()에서 BOARD_NAME으로 만듦
 bool          pingPending = false;      // 핑을 보내고 아직 돌아오길 기다리는 중
 unsigned long pingSentMs = 0;           // 마지막 핑 보낸 시각
 unsigned long nextPingMs = 0;           // 다음 핑 보낼 시각
@@ -1005,6 +1080,7 @@ void runDispenseStateMachine();
 void pollIrForCurrentJob();
 bool checkPcaHealthy();
 void moveServoAngle(uint8_t channel, uint8_t angle);
+void releaseServo(uint8_t channel);
 void reportRailStatus(char letter, char color, RailStatus status, const String& orderId, const char* reason = "");
 void reportDispenseResult(const String& orderId, char letter, char color);
 int  letterSlot(char c);
@@ -1020,6 +1096,8 @@ void completeOnServer(const DispenseJob& job);
 void callRestock(int l, int c);
 void checkSerialCommand();
 void handleCommandMessage(byte* payload, unsigned int length);
+void handleIrConfig(byte* payload, unsigned int length);
+void printIrConfig();
 bool repairRail(int l, int c, const char* source);
 void repairAllRails(const char* source);
 bool restoreGateFromServer();
@@ -1027,6 +1105,9 @@ void lockGateOnServer(const String& orderId);
 void clearGateOnServer();
 void startConnectBlink();
 void updateStatusLed();
+void handleCalibCommand(const String& railStr, const String& posStr, bool targeted, const char* source);
+void calibEnd(const char* source);
+void checkCalibTimeout();
 
 // ============================== setup / loop ==============================
 void setup() {
@@ -1077,6 +1158,13 @@ void setup() {
       delay(SERVO_STARTUP_STAGGER_MS);
     }
   }
+  // [11/08] 홈 도달을 기다린 뒤 8개 전부 힘 빼기 (평상시 서보 off - 발열 방지)
+  delay(RETURN_DELAY_MS);
+  for (int l = 0; l < 2; l++) {
+    for (int c = 0; c < 4; c++) {
+      releaseServo(SERVO_CHANNEL[l][c]);
+    }
+  }
 
   // WiFi 연결 (최초 1회, 연결될 때까지 대기)
   Serial.print("[WiFi] 연결 시도: ");
@@ -1101,8 +1189,9 @@ void setup() {
   mqttClient.setBufferSize(4096); // 이보다 큰 메시지는 PubSubClient가 콜백 없이 조용히 버림 - 주문이 몰릴 때 대비해 여유 있게
   mqttClient.setCallback(mqttCallback);
 
-  // [11/04] 보드 전용 핑 토픽 (예: sjuiot/warehouse/ping/EI)
+  // [11/04] 보드 전용 핑 토픽 (예: sjuiot/warehouse/ping/NS)
   snprintf(topicPing, sizeof(topicPing), "%s%s", TOPIC_PING_PREFIX, BOARD_NAME);
+  snprintf(topicIr, sizeof(topicIr), "%s%s", TOPIC_IR_PREFIX, BOARD_NAME);   // [11/10]
 
   // [11/04] 서버(Redis)에서 재고/큐/게이트 복원 - 여기서 1차 시도하고, 실패한 항목은
   // loop()의 tryRestoreFromServer()가 RESTORE_RETRY_MS(5초)마다 재시도함.
@@ -1119,7 +1208,7 @@ void setup() {
   Serial.print("ms, 최소끊김="); Serial.print(IR_MIN_BREAK_MS);
   Serial.print("ms, IR센서=");   Serial.println(IR_SENSOR_INSTALLED ? "사용" : "없음(항상 성공 처리)");
   Serial.print("[설정] 핑 토픽="); Serial.println(topicPing);
-  Serial.println("[안내] 시리얼 명령: SETEMPTY N_r / REPAIR N_r / REPAIR ALL (테스트용)");
+  Serial.println("[안내] 시리얼 명령: SETEMPTY N_r / REPAIR N_r / REPAIR ALL / IR / CALIB N_r HOME|PUSH|OFF / CALIB ALL HOME (테스트용)");
   Serial.print("[안내] 원격 복구: ");
   Serial.print(TOPIC_COMMAND);
   Serial.print(" 에 {\"cmd\":\"REPAIR\",\"rail\":\"N_r\"} 또는 {\"cmd\":\"REPAIR\",\"rail\":\"ALL\",\"board\":\"");
@@ -1127,15 +1216,93 @@ void setup() {
   Serial.println("\"}");
 }
 
+// ---- [11/12] loop() 속도 개선 ----
+// 배경: 시리얼 진단에서 loop() 한 바퀴가 약 60ms로 측정됨(폴링 131회/8초, 최대간격 72~82ms).
+// 스윕이 "loop() 한 바퀴에 1도"씩이라 SWEEP_STEP_DELAY_MS(7ms)가 아무 의미 없이
+// 1도당 약 60ms -> 푸시 100도에 약 6초가 걸렸고, IR 폴링도 60ms 간격이라 짧은 끊김을 놓침.
+// 원인 추정: R4 WiFi는 WiFi.status() / client.connected() 호출마다 WiFi 모듈과 통신(수 ms~수십 ms)
+// 하는데, 이걸 매 바퀴 여러 번 부르고 있었음.
+// 대응: (1) WiFi/MQTT "연결됨" 확인 결과를 잠깐 캐시 (끊김은 캐시 안 하고 바로 재확인)
+//       (2) mqttClient.loop()는 MQTT_LOOP_MS 간격으로만 호출
+//       (3) LOOP_PROFILE=1이면 구간별 소요시간을 LOOP_PROFILE_PRINT_MS마다 시리얼로 출력
+#define WIFI_UP_CACHE_MS      1000UL
+#define MQTT_UP_CACHE_MS       200UL
+#define MQTT_LOOP_MS            30UL
+#define LOOP_PROFILE              1
+#define LOOP_PROFILE_PRINT_MS 20000UL
+
+unsigned long wifiUpAt = 0;
+unsigned long mqttUpAt = 0;
+
+bool wifiUp() {
+  unsigned long now = millis();
+  if (wifiUpAt != 0 && now - wifiUpAt < WIFI_UP_CACHE_MS) return true;
+  if (WiFi.status() == WL_CONNECTED) { wifiUpAt = now ? now : 1; return true; }
+  wifiUpAt = 0;
+  return false;
+}
+
+bool mqttUp() {
+  unsigned long now = millis();
+  if (mqttUpAt != 0 && now - mqttUpAt < MQTT_UP_CACHE_MS) return true;
+  if (mqttClient.connected()) { mqttUpAt = now ? now : 1; return true; }
+  mqttUpAt = 0;
+  return false;
+}
+
+#if LOOP_PROFILE
+unsigned long profUs[9] = {0,0,0,0,0,0,0,0,0};
+unsigned long profLoops = 0, profMaxLoopUs = 0, profLastPrint = 0, profLastLoopStart = 0;
+#define PSEC(i, call) { unsigned long _t = micros(); call; profUs[i] += micros() - _t; }
+#else
+#define PSEC(i, call) call
+#endif
+
 void loop() {
-  ensureWiFi();
-  tryRestoreFromServer();   // [11/04] 복원 안 끝난 항목만 5초마다 재시도 (다 끝났으면 바로 return)
-  ensureMQTT();             // [11/04] 복원이 다 끝나야 접속함
-  mqttClient.loop();
-  checkMqttEcho();          // [11/04] 구독이 살아있는지 자기 핑으로 확인
-  runDispenseStateMachine();
-  checkSerialCommand();
-  updateStatusLed();
+#if LOOP_PROFILE
+  unsigned long loopStart = micros();
+  if (profLastLoopStart != 0) {
+    unsigned long d = loopStart - profLastLoopStart;
+    if (d > profMaxLoopUs) profMaxLoopUs = d;
+  }
+  profLastLoopStart = loopStart;
+#endif
+  PSEC(0, ensureWiFi());
+  PSEC(1, tryRestoreFromServer());   // [11/04] 복원 안 끝난 항목만 5초마다 재시도 (다 끝났으면 바로 return)
+  PSEC(2, ensureMQTT());             // [11/04] 복원이 다 끝나야 접속함
+  {
+    static unsigned long lastMqttLoop = 0;
+    unsigned long nowMs = millis();
+    if (nowMs - lastMqttLoop >= MQTT_LOOP_MS) {
+      lastMqttLoop = nowMs;
+      PSEC(3, mqttClient.loop());
+    }
+  }
+  PSEC(4, checkMqttEcho());          // [11/04] 구독이 살아있는지 자기 핑으로 확인
+  PSEC(5, runDispenseStateMachine());
+  PSEC(6, checkSerialCommand());
+  PSEC(7, updateStatusLed());
+  PSEC(8, checkCalibTimeout());      // [11/11] 영점 작업 60초 지나면 자동 종료
+#if LOOP_PROFILE
+  profLoops++;
+  if (millis() - profLastPrint >= LOOP_PROFILE_PRINT_MS) {
+    if (profLastPrint != 0 && profLoops > 0) {
+      Serial.print("[LOOP] 바퀴당 평균(us): wifi="); Serial.print(profUs[0] / profLoops);
+      Serial.print(" 복원="); Serial.print(profUs[1] / profLoops);
+      Serial.print(" mqttConn="); Serial.print(profUs[2] / profLoops);
+      Serial.print(" mqttLoop="); Serial.print(profUs[3] / profLoops);
+      Serial.print(" 핑="); Serial.print(profUs[4] / profLoops);
+      Serial.print(" 배출="); Serial.print(profUs[5] / profLoops);
+      Serial.print(" 시리얼="); Serial.print(profUs[6] / profLoops);
+      Serial.print(" LED="); Serial.print(profUs[7] / profLoops);
+      Serial.print(" 영점="); Serial.print(profUs[8] / profLoops);
+      Serial.print(" | 바퀴수="); Serial.print(profLoops);
+      Serial.print(" 최대간격(ms)="); Serial.println(profMaxLoopUs / 1000.0, 1);
+    }
+    for (uint8_t i = 0; i < 9; i++) profUs[i] = 0;
+    profLoops = 0; profMaxLoopUs = 0; profLastPrint = millis();
+  }
+#endif
 }
 
 // ============================== WiFi / MQTT 연결 관리 (논블로킹) ==============================
@@ -1143,7 +1310,7 @@ unsigned long lastWifiAttempt = 0;
 const unsigned long WIFI_RETRY_MS = 5000;
 
 void ensureWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
+  if (wifiUp()) return;
   unsigned long now = millis();
   if (now - lastWifiAttempt < WIFI_RETRY_MS) return;
   lastWifiAttempt = now;
@@ -1155,9 +1322,9 @@ unsigned long lastMqttAttempt = 0;
 const unsigned long MQTT_RETRY_MS = 3000;
 
 void ensureMQTT() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (!wifiUp()) return;
   if (!serverRestored()) return;   // [11/04] 재고/큐/게이트 복원 전엔 주문을 받지 않음
-  if (mqttClient.connected()) return;
+  if (mqttUp()) return;
   unsigned long now = millis();
   if (now - lastMqttAttempt < MQTT_RETRY_MS) return;
   lastMqttAttempt = now;
@@ -1171,6 +1338,7 @@ void ensureMQTT() {
 // ensureMQTT()가 MQTT_RETRY_MS(3초)마다 접속+구독이 다 성공할 때까지 계속 재시도.
 // (예전엔 구독 실패를 확인하지 않아서 "연결됨(LED 켜짐) + 수신 불가" 상태로 굳었음 - 11/03)
 bool tryConnectMQTT() {
+  mqttUpAt = 0;
   Serial.print("[MQTT] 연결 시도... ");
   bool ok;
   if (strlen(MQTT_USER) == 0) {
@@ -1187,13 +1355,16 @@ bool tryConnectMQTT() {
   bool subProcess = mqttClient.subscribe(TOPIC_CNT_PROCESS, 1);
   bool subPing    = mqttClient.subscribe(topicPing, 0);
   bool subCommand = mqttClient.subscribe(TOPIC_COMMAND, 1);   // [11/04] 원격 REPAIR
-  if (!subProcess || !subPing || !subCommand) {
+  bool subIr      = mqttClient.subscribe(topicIr, 1);         // [11/10] 센서 설정 (retain - 구독하면 바로 옴)
+  if (!subProcess || !subPing || !subCommand || !subIr) {
     Serial.print("연결은 됐지만 구독 실패 (주문=");
     Serial.print(subProcess ? "OK" : "실패");
     Serial.print(", 핑=");
     Serial.print(subPing ? "OK" : "실패");
     Serial.print(", 명령=");
     Serial.print(subCommand ? "OK" : "실패");
+    Serial.print(", 센서설정=");
+    Serial.print(subIr ? "OK" : "실패");
     Serial.println(") - 끊고 재시도");
     mqttClient.disconnect();
     return false;
@@ -1213,7 +1384,7 @@ bool tryConnectMQTT() {
 // 정상일 땐 절대 끊지 않음. 끊는 건 배출 사이클 중이 아닐 때(DS_IDLE)만 -
 // 배출 중이면 사이클이 끝난 뒤 다음 loop()에서 판단함.
 void checkMqttEcho() {
-  if (!mqttClient.connected()) { pingPending = false; return; }
+  if (!mqttUp()) { pingPending = false; return; }
   unsigned long now = millis();
 
   if (pingPending) {
@@ -1260,7 +1431,7 @@ void updateStatusLed() {
     }
     return;
   }
-  bool connected = mqttClient.connected();
+  bool connected = mqttUp();
   if (connected != ledState) {
     ledState = connected;
     digitalWrite(STATUS_LED_PIN, ledState ? HIGH : LOW);
@@ -1279,6 +1450,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 
   // [11/04] 원격 REPAIR 명령
+  // [11/10] 센서 판정 설정 (보드별 retain)
+  if (strcmp(topic, topicIr) == 0) {
+    handleIrConfig(payload, length);
+    return;
+  }
+
   if (strcmp(topic, TOPIC_COMMAND) == 0) {
     handleCommandMessage(payload, length);
     return;
@@ -1470,7 +1647,7 @@ void handleRestockField(JsonArray restock) {
   bool presentNow[2][4] = { {false,false,false,false}, {false,false,false,false} };
 
   for (JsonVariant item : restock) {
-    String rc = item.as<String>(); // 예: "E_r"
+    String rc = item.as<String>(); // 예: "N_r"
     if (rc.length() < 3) continue;
     char letter = rc.charAt(0);
     char color  = rc.charAt(2);
@@ -1724,6 +1901,8 @@ void runDispenseStateMachine() {
     }
     if (pcaDriverFailed) return; // 드라이버 고장 중엔 새 배출 시작 안 함 (큐의 job은 그대로 대기)
 
+    if (calibActive) return; // [11/11] 영점 맞추는 중 - 손 다치지 않게 배출 멈춤 (큐의 job은 그대로 대기)
+
     if (!gateOpen) return; // 직전 주문이 pickup_reached(이후) 되기 전까지 다음 배출 금지
 
     DispenseJob job;
@@ -1747,6 +1926,7 @@ void runDispenseStateMachine() {
 
     // IR 감시 윈도우 시작 - 지금 이 순간(모터가 움직이기 시작하는 시점)부터
     // IR_POLL_WINDOW_MS 동안 계속 폴링함 (위 pollIrForCurrentJob() 호출로 진행됨)
+    curIrActive = IR_ACTIVE(l, c);   // [11/10] 이번 배출은 시작 시점 설정으로 끝까지
     irWindowStart = millis();
     irBreakStart = 0;
     irLatched = false;
@@ -1755,16 +1935,22 @@ void runDispenseStateMachine() {
     irLastPollMs = millis();
     irPollCount = 0;
     irBrokenSamples = 0;
+    irPushReachedMs = 0; irReturnCmdMs = 0;
+    irPollFirstSet = false; irPollFirstMs = 0; irPollLatchMs = 0;
 #if IR_SENSOR_INSTALLED
     noInterrupts();
     irIsrBreakStartUs = 0;
     irIsrMaxUs = 0;
     irIsrLatched = false;
-    irIsrPin = IR_INSTALLED[l][c] ? (int8_t)IR_PIN[l][c] : (int8_t)-1;
+    irEvCount = 0; irIsrBreakStartMs = 0; irIsrLatchSet = false; irIsrLatchMs = 0;
+    irIsrPin = curIrActive ? (int8_t)IR_PIN[l][c] : (int8_t)-1;
     interrupts();
 #endif
 
     Serial.println("[배출] 시작 " + letterColorKey(l, c) + " order=" + job.orderId);
+    Serial.print("[IR] 감시 시작: 부팅 후 "); Serial.print(irWindowStart);
+    Serial.print("ms (이후 시각은 모터 시작 기준), 감시창 "); Serial.print(IR_POLL_WINDOW_MS);
+    Serial.print("ms, IR "); Serial.println(curIrActive ? "사용" : "꺼짐/미배선");
     moveServoAngle(SERVO_CHANNEL[l][c], SERVO_HOME_ANGLE);
     dsTimer = millis();
     dsState = DS_HOMING;
@@ -1777,7 +1963,7 @@ void runDispenseStateMachine() {
     int l = letterSlot(currentJob.letter);
     int c = colorSlot(currentJob.color);
 
-    sweepAngle = SERVO_HOME_ANGLE - BREAKAWAY_KICK_DEG; // 방향 반전: 대기(165)->푸시(20)는 감소 방향이라 킥도 뺌
+    sweepAngle = SERVO_HOME_ANGLE - BREAKAWAY_KICK_DEG; // 방향 반전: 대기(140)->푸시(40)는 감소 방향이라 킥도 뺌
     moveServoAngle(SERVO_CHANNEL[l][c], sweepAngle);
     dsTimer = millis();
     dsState = DS_BREAKAWAY_WAIT;
@@ -1802,6 +1988,7 @@ void runDispenseStateMachine() {
     moveServoAngle(SERVO_CHANNEL[l][c], sweepAngle);
 
     if (sweepAngle <= PUSH_ANGLE) {
+      irPushReachedMs = millis() - irWindowStart;
       dsTimer = millis();
       dsState = DS_HOLDING;
     }
@@ -1814,6 +2001,7 @@ void runDispenseStateMachine() {
     int l = letterSlot(currentJob.letter);
     int c = colorSlot(currentJob.color);
     moveServoAngle(SERVO_CHANNEL[l][c], SERVO_HOME_ANGLE);
+    irReturnCmdMs = millis() - irWindowStart;
     dsTimer = millis();
     dsState = DS_RETURNING;
     return;
@@ -1833,17 +2021,30 @@ void runDispenseStateMachine() {
     int c = colorSlot(currentJob.color);
     bool success = true; // 기본값: 센서 미배선 레일은 판정 없이 즉시 성공 처리
 
+    // [11/08] 홈 복귀 명령(DS_HOLDING에서 dsTimer 기록) 후 RETURN_DELAY_MS가 지나
+    // 서보가 홈에 도착한 뒤에만 판정/힘 빼기로 넘어감
+    if (millis() - dsTimer < RETURN_DELAY_MS) return;
+
 #if IR_SENSOR_INSTALLED
-    if (IR_INSTALLED[l][c]) {
+    if (curIrActive) {   // [11/10] IR_INSTALLED -> 시작 시점 설정(배선 && 켜짐)
       // 폴링 자체는 위쪽 pollIrForCurrentJob()이 모터 시작 시점(irWindowStart)
       // 부터 매 loop()마다 계속 해왔음. 여기서는 그 전체 감시 윈도우
       // (IR_POLL_WINDOW_MS)가 다 지났는지만 확인하고, 다 지났으면 그때까지
       // 쌓인 irLatched 값으로 최종 판정함.
       if (millis() - irWindowStart < IR_POLL_WINDOW_MS) return;  // 윈도우 안 끝났으면 다음 loop()에서 계속 대기
 
+      uint8_t evN; unsigned long evS[IR_EV_MAX], evL[IR_EV_MAX];
+      bool stillBroken, isrLatchSetCopy; unsigned long stillStartMs, stillLenUs, isrLatchMsCopy;
       noInterrupts();
       bool isrLatchedCopy = irIsrLatched;
       unsigned long isrMaxUsCopy = irIsrMaxUs;
+      evN = irEvCount;
+      for (uint8_t i = 0; i < evN; i++) { evS[i] = irEvStartMs[i]; evL[i] = irEvLenUs[i]; }
+      stillBroken = (irIsrBreakStartUs != 0);
+      stillStartMs = irIsrBreakStartMs;
+      stillLenUs = stillBroken ? (micros() - irIsrBreakStartUs) : 0;
+      isrLatchSetCopy = irIsrLatchSet;
+      isrLatchMsCopy = irIsrLatchMs;
       irIsrPin = -1;  // 이 배출의 감시 종료
       interrupts();
 
@@ -1860,9 +2061,40 @@ void runDispenseStateMachine() {
       Serial.print(" | 인터럽트: 최대끊김(us)="); Serial.print(isrMaxUsCopy);
       Serial.print(" | 기준(ms)="); Serial.print(IR_MIN_BREAK_MS);
       Serial.print(" | 판정="); Serial.println(success ? "통과" : "실패");
+
+      // [11/11] 시간 진단 (전부 모터 시작 기준 ms)
+      Serial.print("[IR] 타임라인: 푸시도달 "); Serial.print(irPushReachedMs);
+      Serial.print("ms / 홈복귀명령 "); Serial.print(irReturnCmdMs);
+      Serial.print("ms / 판정 "); Serial.print(millis() - irWindowStart); Serial.println("ms");
+      if (evN == 0 && !stillBroken) {
+        Serial.println("[IR] 끊김 없음 (인터럽트 기준) - 핀 변화 자체가 없음: 배선/레벨/핀 번호 확인");
+      }
+      for (uint8_t i = 0; i < evN; i++) {
+        Serial.print("[IR] 끊김 #"); Serial.print(i + 1);
+        Serial.print(": 시작 "); Serial.print(evS[i]);
+        Serial.print("ms, 길이 "); Serial.print(evL[i] / 1000.0, 1);
+        Serial.print("ms -> "); Serial.println(evL[i] >= (unsigned long)IR_MIN_BREAK_MS * 1000UL ? "유효" : "짧아서 무시");
+      }
+      if (stillBroken) {
+        Serial.print("[IR] 감시 끝까지 빔이 끊긴 상태: 시작 "); Serial.print(stillStartMs);
+        Serial.print("ms, 지금까지 "); Serial.print(stillLenUs / 1000.0, 1); Serial.println("ms");
+      }
+      if (irPollFirstSet) {
+        Serial.print("[IR] 폴링이 처음 끊김을 본 시각 "); Serial.print(irPollFirstMs); Serial.println("ms");
+      }
+      {
+        bool haveL = false; unsigned long lm = 0;
+        if (irLatched) { lm = irPollLatchMs; haveL = true; }
+        if (isrLatchSetCopy && (!haveL || isrLatchMsCopy < lm)) { lm = isrLatchMsCopy; haveL = true; }
+        if (haveL) { Serial.print("[IR] 통과 확정 시각 "); Serial.print(lm); Serial.println("ms (모터 시작 후)"); }
+        else Serial.println("[IR] 통과 확정 없음");
+      }
     }
-    // IR_INSTALLED[l][c]==false인 레일: 폴링 없이 위의 기본값(success=true) 그대로 즉시 판정
+    // 센서 미배선/꺼진 레일: 폴링 없이 위의 기본값(success=true) 그대로 즉시 판정
 #endif
+
+    // [11/08] 홈 복귀 끝 -> 평상시 off (서버 보고가 최대 8초씩 걸리므로 그 전에 먼저 뺌)
+    releaseServo(SERVO_CHANNEL[l][c]);
 
     if (success) {
       if (rail[l][c].count > 0) rail[l][c].count--;
@@ -1897,7 +2129,7 @@ void pollIrForCurrentJob() {
   int l = letterSlot(currentJob.letter);
   int c = colorSlot(currentJob.color);
   if (l < 0 || c < 0) return;
-  if (!IR_INSTALLED[l][c]) return; // 이 레일은 센서 미배선 - 폴링할 것 없음
+  if (!curIrActive) return; // 이 레일은 센서 미배선이거나 꺼짐 - 폴링할 것 없음
 
   unsigned long nowMs = millis();
   if (nowMs - irLastPollMs > irMaxGapMs) irMaxGapMs = nowMs - irLastPollMs;
@@ -1907,11 +2139,16 @@ void pollIrForCurrentJob() {
   irPollCount++;
   if (broken) irBrokenSamples++;
   if (broken) {
-    if (irBreakStart == 0) irBreakStart = nowMs;               // 끊김 시작
+    if (irBreakStart == 0) {
+      irBreakStart = nowMs;
+      if (!irPollFirstSet) { irPollFirstSet = true; irPollFirstMs = nowMs - irWindowStart; }
+    }
+    //               // 끊김 시작
     unsigned long len = nowMs - irBreakStart;
     if (len > irMaxBreakMs) irMaxBreakMs = len;                 // [진단] 최대 끊김 기록
     if (!irLatched && len >= IR_MIN_BREAK_MS) {
-      irLatched = true;                                         // 디바운스 통과 - 유효 통과 확정
+      irLatched = true;
+      irPollLatchMs = nowMs - irWindowStart;                                         // 디바운스 통과 - 유효 통과 확정
     }
   } else {
     irBreakStart = 0;  // 끊김 해제 - 다음 끊김 구간을 새로 잴 준비 (이미 래치됐으면 irLatched는 안 건드림)
@@ -1923,6 +2160,12 @@ void pollIrForCurrentJob() {
 void moveServoAngle(uint8_t channel, uint8_t angle) {
   uint16_t pulse = map(angle, 0, 180, SERVO_MIN_PULSE, SERVO_MAX_PULSE);
   pwm.setPWM(channel, 0, pulse);
+}
+
+// [11/08] 서보 힘 빼기 - 평상시엔 off, 배출할 때만 신호를 줌 (홈에서 버티며 발열하던 문제 대응)
+// 다음 배출 시 DS_IDLE에서 moveServoAngle(홈)을 다시 보내므로 자동으로 다시 잡힘.
+void releaseServo(uint8_t channel) {
+  pwm.setPWM(channel, 0, 4096);  // full OFF: 펄스 끊김 -> 서보 토크 해제
 }
 
 // ---- PCA9685가 I2C로 정상 응답하는지 확인 (헬스체크) ----
@@ -2363,7 +2606,7 @@ void repairAllRails(const char* source) {
 }
 
 // ---- [11/04] MQTT 원격 명령 처리 (sjuiot/warehouse/command) ----
-// 형식: {"cmd": "REPAIR", "rail": "E_r"} / {"cmd": "REPAIR", "rail": "ALL", "board": "EI"}
+// 형식: {"cmd": "REPAIR", "rail": "N_r"} / {"cmd": "REPAIR", "rail": "ALL", "board": "NS"}
 // - board가 있으면 내 보드일 때만 처리, 없으면 rail로만 판단
 // - rail이 내 담당이 아니면 조용히 무시 (4대가 같은 토픽을 받음)
 // - REPAIR 외의 cmd는 무시 (SETEMPTY 등은 원격으로 열지 않음)
@@ -2385,6 +2628,13 @@ void handleCommandMessage(byte* payload, unsigned int length) {
   railStr.trim();
   cmd.toUpperCase();
 
+  if (cmd == "CALIB") {   // [11/11] 영점 맞추기
+    String posStr = String((const char*)(doc["pos"] | ""));
+    posStr.trim();
+    handleCalibCommand(railStr, posStr, board[0] != '\0', "MQTT명령");
+    return;
+  }
+
   if (cmd != "REPAIR") {
     if (board[0] != '\0') {  // 나를 콕 집어 보낸 명령인데 모르는 cmd면 로그만 남김
       Serial.println("[MQTT명령] 알 수 없는 cmd: " + cmd);
@@ -2401,7 +2651,7 @@ void handleCommandMessage(byte* payload, unsigned int length) {
   }
 
   if (railStr.length() < 3 || railStr.charAt(1) != '_') {
-    if (board[0] != '\0') Serial.println("[MQTT명령] rail 형식 오류: " + railStr + " (예: E_r)");
+    if (board[0] != '\0') Serial.println("[MQTT명령] rail 형식 오류: " + railStr + " (예: N_r)");
     return;
   }
   int l = letterSlot(railStr.charAt(0));
@@ -2413,9 +2663,206 @@ void handleCommandMessage(byte* payload, unsigned int length) {
   repairRail(l, c, "MQTT명령");
 }
 
+// ============================== [11/10] 센서 판정 설정 (MQTT retain) ==============================
+// 형식: {"N_r": true, "N_g": false, ...} - 이 보드 칸만 반영, 없는 칸/다른 보드 칸은 무시.
+// 배출 중인 칸은 curIrActive로 이번 사이클이 보호되므로 바로 바꿔도 됨 (다음 배출부터 적용).
+void handleIrConfig(byte* payload, unsigned int length) {
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    Serial.print("[센서설정] JSON 파싱 실패: ");
+    Serial.println(err.c_str());
+    return;
+  }
+  bool changed = false;
+  for (int l = 0; l < 2; l++) {
+    for (int c = 0; c < 4; c++) {
+      String key = letterColorKey(l, c);
+      if (!doc[key].is<bool>()) continue;
+      bool on = doc[key].as<bool>();
+      if (irEnabled[l][c] != on) {
+        irEnabled[l][c] = on;
+        changed = true;
+        Serial.println("[센서설정] " + key + " 센서 판정 " + (on ? "켬" : "끔 (판정 없이 항상 성공 처리)") +
+                       ((dsState != DS_IDLE && letterSlot(currentJob.letter) == l && colorSlot(currentJob.color) == c)
+                          ? " - 지금 배출 중이라 다음 배출부터 적용" : ""));
+      }
+    }
+  }
+  if (changed) printIrConfig();
+}
+
+void printIrConfig() {
+  Serial.print("[센서설정] ");
+  for (int l = 0; l < 2; l++) {
+    for (int c = 0; c < 4; c++) {
+      Serial.print(letterColorKey(l, c));
+      Serial.print(!IR_INSTALLED[l][c] ? "=미배선 " : (irEnabled[l][c] ? "=켬 " : "=끔 "));
+    }
+  }
+  Serial.println();
+}
+
+// ============================== [11/11] 영점 맞추기 (CALIB) ==============================
+// home = SERVO_HOME_ANGLE(140), push = PUSH_ANGLE(40)으로 보내고 힘 준 채 유지 (혼 다시 끼우기용).
+// off = 붙잡던 칸 전부 힘 빼고 배출 재개. rail은 "N_r" 같은 한 칸 또는 "ALL".
+// targeted: 이 보드를 콕 집은 명령인지 (MQTT board 지정 / 시리얼). 아니면 남의 칸이어도 조용히 무시.
+void handleCalibCommand(const String& railStr, const String& posStr, bool targeted, const char* source) {
+  String pos = posStr;
+  pos.toLowerCase();
+  bool all = railStr.equalsIgnoreCase("ALL");
+  int l = -1, c = -1;
+  if (!all) {
+    if (railStr.length() < 3 || railStr.charAt(1) != '_') {
+      if (targeted) Serial.println("[" + String(source) + "] CALIB 칸 형식 오류: " + railStr + " (예: N_r 또는 ALL)");
+      return;
+    }
+    l = letterSlot(railStr.charAt(0));
+    c = colorSlot(railStr.charAt(2));
+    if (l < 0 || c < 0) {
+      if (targeted) Serial.println("[" + String(source) + "] " + railStr + " 는 이 보드(" + String(BOARD_NAME) + ") 담당 레일이 아님");
+      return;  // 4대가 같은 토픽을 받으므로 다른 보드 칸이면 정상적으로 무시
+    }
+  }
+
+  if (pos == "off") {
+    calibEnd(source);
+    return;
+  }
+
+  int angle;
+  if (pos == "home")      angle = SERVO_HOME_ANGLE;
+  else if (pos == "push") angle = PUSH_ANGLE;
+  else {
+    // [11/12] 숫자(0~180)면 그 각도로 이동: 예) CALIB N_r 90 / ANGLE ALL 120
+    bool numeric = (pos.length() > 0 && pos.length() <= 3);
+    for (unsigned int i = 0; i < pos.length(); i++) if (!isDigit(pos.charAt(i))) numeric = false;
+    int a = numeric ? pos.toInt() : -1;
+    if (a < 0 || a > 180) {
+      Serial.println("[" + String(source) + "] CALIB pos 오류: " + posStr + " (home / push / off / 0~180 숫자)");
+      return;
+    }
+    angle = a;
+  }
+
+  if (dsState != DS_IDLE) {
+    Serial.println("[" + String(source) + "] CALIB 거절 - 지금 배출 중 (" + letterColorKey(letterSlot(currentJob.letter), colorSlot(currentJob.color)) + "), 끝난 뒤 다시 보낼 것");
+    return;
+  }
+
+  calibActive = true;
+  calibLastMs = millis();
+  if (all) {
+    for (int ll = 0; ll < 2; ll++) {
+      for (int cc = 0; cc < 4; cc++) {
+        moveServoAngle(SERVO_CHANNEL[ll][cc], angle);
+        calibHeld[ll][cc] = true;
+        delay(SERVO_STARTUP_STAGGER_MS);   // 부팅 때처럼 한 개씩 (돌입전류 분산)
+      }
+    }
+  } else {
+    moveServoAngle(SERVO_CHANNEL[l][c], angle);
+    calibHeld[l][c] = true;
+  }
+  Serial.println("[" + String(source) + "] CALIB " + (all ? String("ALL") : letterColorKey(l, c)) + " -> " + String(angle) +
+                 "도로 이동, 힘 준 채 유지 (배출 멈춤, OFF 또는 " + String(CALIB_TIMEOUT_MS / 1000) + "초 뒤 자동 해제)");
+}
+
+// 영점 작업 끝: 붙잡던 칸 전부 힘 빼고 배출 재개
+void calibEnd(const char* source) {
+  if (!calibActive) {
+    Serial.println("[" + String(source) + "] CALIB OFF - 영점 작업 중이 아님 (그대로)");
+    return;
+  }
+  for (int l = 0; l < 2; l++) {
+    for (int c = 0; c < 4; c++) {
+      if (calibHeld[l][c]) {
+        releaseServo(SERVO_CHANNEL[l][c]);
+        calibHeld[l][c] = false;
+      }
+    }
+  }
+  calibActive = false;
+  Serial.println("[" + String(source) + "] CALIB 끝 - 힘 빼고 배출 재개");
+}
+
+// loop()마다: 마지막 CALIB 명령 후 CALIB_TIMEOUT_MS가 지나면 자동 종료 (OFF를 깜빡해도 발열/배출 정지 방지)
+void checkCalibTimeout() {
+  if (!calibActive) return;
+  if (millis() - calibLastMs < CALIB_TIMEOUT_MS) return;
+  calibEnd("자동해제");
+}
+
+// ============================== [11/12] IRCHECK - 8칸 센서 한 번에 점검 ==============================
+// 시리얼 명령:
+//   IRCHECK       : 1초 동안 8칸을 동시에 측정해서 칸별 상태(정상/계속 끊김/불안정) 출력.
+//                   측정 중 빔을 가리지 말고 그대로 둘 것. 배출 중(DS_IDLE 아님)엔 안 함.
+//   IRCHECK LIVE  : 실시간 모드(최대 120초). 빔을 하나씩 손으로 가려보며 어느 칸이 반응하는지 확인.
+//                   상태가 바뀔 때마다 + 1초마다 8칸 전체를 한 줄로 출력. 아무 글자나 보내면 종료.
+String irCheckLabel(uint8_t i) { return letterColorKey(i / 4, i % 4); }
+
+bool irCheckBroken(uint8_t i) {
+  return digitalRead(IR_PIN[i / 4][i % 4]) == IR_DETECT_LEVEL;
+}
+
+void irCheckSnapshot() {
+  const unsigned long durMs = 1000;
+  unsigned long n = 0, brk[8], chg[8];
+  bool last[8];
+  for (uint8_t i = 0; i < 8; i++) { brk[i] = 0; chg[i] = 0; last[i] = irCheckBroken(i); }
+  Serial.println("[IRCHECK] " + String(durMs) + "ms 동안 8칸 동시 측정 - 빔을 가리지 말고 그대로 두세요");
+  unsigned long t0 = millis();
+  while (millis() - t0 < durMs) {
+    for (uint8_t i = 0; i < 8; i++) {
+      bool b = irCheckBroken(i);
+      if (b) brk[i]++;
+      if (b != last[i]) { chg[i]++; last[i] = b; }
+    }
+    n++;
+  }
+  for (uint8_t i = 0; i < 8; i++) {
+    Serial.print("  "); Serial.print(irCheckLabel(i));
+    Serial.print(" (D"); Serial.print(IR_PIN[i / 4][i % 4]); Serial.print("): ");
+    unsigned long pct = n ? (brk[i] * 100UL / n) : 0;
+    if (chg[i] == 0 && brk[i] == 0)        Serial.print("정상 (빔 연결)");
+    else if (chg[i] == 0 && brk[i] == n)   Serial.print("이상: 계속 끊김 (정렬/전원/배선 확인)");
+    else { Serial.print("불안정: 끊김 "); Serial.print(pct); Serial.print("%, 변화 "); Serial.print(chg[i]); Serial.print("회"); }
+    Serial.print("  [IR 사용 "); Serial.print(IR_INSTALLED[i / 4][i % 4] ? "예" : "아니오"); Serial.println("]");
+  }
+  Serial.println("[IRCHECK] 끝 (샘플 " + String(n) + "회)");
+}
+
+void irCheckLive() {
+  Serial.println("[IRCHECK LIVE] 빔을 하나씩 가려보세요. 아무 글자나 보내면 종료 (최대 120초)");
+  while (Serial.available()) Serial.read();
+  bool prev[8];
+  for (uint8_t i = 0; i < 8; i++) prev[i] = irCheckBroken(i);
+  unsigned long start = millis(), lastPrint = 0;
+  bool first = true;
+  while (millis() - start < 120000UL) {
+    mqttClient.loop();   // 이 모드 중에도 MQTT 연결 유지
+    bool changed = false;
+    bool cur[8];
+    for (uint8_t i = 0; i < 8; i++) { cur[i] = irCheckBroken(i); if (cur[i] != prev[i]) changed = true; }
+    if (first || changed || millis() - lastPrint >= 1000) {
+      first = false;
+      lastPrint = millis();
+      Serial.print(changed ? ">> " : "   ");
+      for (uint8_t i = 0; i < 8; i++) {
+        Serial.print(irCheckLabel(i)); Serial.print(cur[i] ? ":끊김 " : ":OK ");
+        prev[i] = cur[i];
+        if (i == 3) Serial.print("| ");
+      }
+      Serial.println();
+    }
+    if (Serial.available()) { while (Serial.available()) Serial.read(); break; }
+  }
+  Serial.println("[IRCHECK LIVE] 종료");
+}
+
 // ============================== 시리얼 테스트 명령 ==============================
-// SETEMPTY E_r  : 해당 레일을 강제로 count=0/empty로 만듦 (restock 흐름 테스트용)
-// REPAIR E_r    : disable 상태인 레일을 idle로 복구 (count는 그대로 유지)
+// SETEMPTY N_r  : 해당 레일을 강제로 count=0/empty로 만듦 (restock 흐름 테스트용)
+// REPAIR N_r    : disable 상태인 레일을 idle로 복구 (count는 그대로 유지)
 // REPAIR ALL    : disable 레일 전부 복구 + driver 고장 배출 금지 해제
 //                 (PCA 고장 당시 대기 주문이 없어 플랫폼에 내릴 fault가 없을 때 사용)
 // [11/04] REPAIR 처리는 repairRail()/repairAllRails()로 옮김 (MQTT 원격 명령과 공용)
@@ -2430,6 +2877,27 @@ void checkSerialCommand() {
   String arg = (sp < 0) ? "" : line.substring(sp + 1);
   arg.trim();
 
+  if (cmd == "CALIB" || cmd == "calib" || cmd == "ANGLE" || cmd == "angle") {   // [11/11] (ANGLE는 [11/12] 별칭: ANGLE N_r 90) CALIB N_r HOME / CALIB ALL PUSH / CALIB N_r OFF
+    int sp2 = arg.indexOf(' ');
+    String railArg = (sp2 < 0) ? arg : arg.substring(0, sp2);
+    String posArg  = (sp2 < 0) ? "" : arg.substring(sp2 + 1);
+    railArg.trim();
+    posArg.trim();
+    handleCalibCommand(railArg, posArg, true, "명령");
+    return;
+  }
+
+  if (cmd == "IRCHECK" || cmd == "ircheck") {   // [11/12] 8칸 센서 한 번에 점검
+    if (dsState != DS_IDLE) { Serial.println("[IRCHECK] 배출 중에는 할 수 없음 - 끝난 뒤 다시"); return; }
+    if (arg == "LIVE" || arg == "live") irCheckLive(); else irCheckSnapshot();
+    return;
+  }
+
+  if (cmd == "IR" || cmd == "ir") {   // [11/10] 센서 판정 설정 보기 (바꾸기는 상태판에서)
+    printIrConfig();
+    return;
+  }
+
   if (cmd == "REPAIR" && (arg == "ALL" || arg == "all")) {
     repairAllRails("명령");
     return;
@@ -2437,7 +2905,7 @@ void checkSerialCommand() {
 
   if (cmd == "SETEMPTY" || cmd == "REPAIR") {
     if (arg.length() < 3 || arg.charAt(1) != '_') {
-      Serial.println("[명령] 형식: " + cmd + " E_r (글자_색상)");
+      Serial.println("[명령] 형식: " + cmd + " N_r (글자_색상)");
       return;
     }
     char letter = arg.charAt(0);
